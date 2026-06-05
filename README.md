@@ -1,6 +1,9 @@
-# rsinfer
+# SafetyRAISE-LMEngine
 
-用 Rust 从零写的极简大模型推理引擎，纯 CPU，专门适配微调的 **Qwen3-4B-Thinking** 模型。
+[![CI](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+用 Rust 从零写的极简大模型推理引擎（crate 名 `rsinfer`），纯 CPU，专门适配微调的 **Qwen3-4B-Thinking** 模型，服务于 SafetyRAISE 系统。
 
 定位是学习/练手项目：把 Transformer 推理的每一环（权重加载、张量算子、注意力、KV cache、采样、生成循环）都用可读的 Rust 实现一遍。要追求生产级速度请用 llama.cpp。
 

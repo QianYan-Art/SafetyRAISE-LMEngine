@@ -3,6 +3,7 @@
 //! 提供张量数据结构、基础操作和数学算子。
 
 mod dtypes;
+#[allow(clippy::module_inception)]
 mod tensor;
 mod ops;
 

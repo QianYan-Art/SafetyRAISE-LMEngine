@@ -84,32 +84,6 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn new(
-        q_proj: Linear,
-        k_proj: Linear,
-        v_proj: Linear,
-        o_proj: Linear,
-        q_norm: RmsNorm,
-        k_norm: RmsNorm,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rope_theta: f32,
-    ) -> Self {
-        Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            rope_theta,
-        }
-    }
-
     /// 前向传播
     ///
     /// hidden_states: [seq_len, hidden_size]
@@ -278,18 +252,18 @@ pub fn build_transformer_block(
     let eps = config.rms_norm_eps;
     let linear = |suffix: &str| -> Result<Linear> { Ok(Linear::new(get(suffix)?, None)) };
 
-    let attention = Attention::new(
-        linear("self_attn.q_proj.weight")?,
-        linear("self_attn.k_proj.weight")?,
-        linear("self_attn.v_proj.weight")?,
-        linear("self_attn.o_proj.weight")?,
-        RmsNorm::new(get("self_attn.q_norm.weight")?, eps),
-        RmsNorm::new(get("self_attn.k_norm.weight")?, eps),
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim(),
-        config.rope_theta,
-    );
+    let attention = Attention {
+        q_proj: linear("self_attn.q_proj.weight")?,
+        k_proj: linear("self_attn.k_proj.weight")?,
+        v_proj: linear("self_attn.v_proj.weight")?,
+        o_proj: linear("self_attn.o_proj.weight")?,
+        q_norm: RmsNorm::new(get("self_attn.q_norm.weight")?, eps),
+        k_norm: RmsNorm::new(get("self_attn.k_norm.weight")?, eps),
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim(),
+        rope_theta: config.rope_theta,
+    };
 
     let mlp = Mlp::new(
         linear("mlp.gate_proj.weight")?,

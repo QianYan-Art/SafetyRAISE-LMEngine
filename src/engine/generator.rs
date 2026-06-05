@@ -83,13 +83,13 @@ impl Generator {
 
         let logits = self.model.forward(&input_ids, &mut kv_cache, 0)?;
         let mut next = self.sampler.sample(&logits.to_1d()?);
-        let mut position = input_ids.len();
+        let prompt_len = input_ids.len();
 
         // 逐 token 解码会截断多字节字符，故每步解码整段、只刷出已完整的新增后缀。
         let mut tokens: Vec<u32> = Vec::with_capacity(self.config.max_tokens);
         let mut printed = 0usize;
 
-        for _ in 0..self.config.max_tokens {
+        for step in 0..self.config.max_tokens {
             if self.config.stop_tokens.contains(&next) {
                 break;
             }
@@ -101,9 +101,8 @@ impl Generator {
                 printed = text.len();
             }
 
-            let logits = self.model.forward(&[next], &mut kv_cache, position)?;
+            let logits = self.model.forward(&[next], &mut kv_cache, prompt_len + step)?;
             next = self.sampler.sample(&logits.to_1d()?);
-            position += 1;
         }
 
         let text = self.decode(&tokens)?;

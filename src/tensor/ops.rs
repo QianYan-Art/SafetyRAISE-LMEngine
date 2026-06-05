@@ -86,23 +86,16 @@ pub fn linear_forward_f16(
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
-    let n = a.len();
-    let chunks = n / LANES;
     let mut acc = [0f32; LANES];
-    for c in 0..chunks {
-        let base = c * LANES;
-        for l in 0..LANES {
-            acc[l] += a[base + l] * b[base + l];
+    let mut ca = a.chunks_exact(LANES);
+    let mut cb = b.chunks_exact(LANES);
+    for (xs, ys) in ca.by_ref().zip(cb.by_ref()) {
+        for ((acc, &x), &y) in acc.iter_mut().zip(xs).zip(ys) {
+            *acc += x * y;
         }
     }
-    let mut sum = 0f32;
-    for l in 0..LANES {
-        sum += acc[l];
-    }
-    for i in (chunks * LANES)..n {
-        sum += a[i] * b[i];
-    }
-    sum
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(&x, &y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
 }
 
 /// Softmax 操作
