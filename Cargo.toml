@@ -2,7 +2,9 @@
 name = "rsinfer"
 version = "0.1.0"
 edition = "2021"
-description = "A minimal LLM inference engine written in Rust"
+description = "A minimal LLM inference engine written in Rust (SafetyRAISE-LMEngine)"
+license = "Apache-2.0"
+repository = "https://github.com/QianYan-Art/SafetyRAISE-LMEngine"
 
 [dependencies]
 ndarray = "0.16"

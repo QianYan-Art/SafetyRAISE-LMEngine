@@ -34,6 +34,16 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 
 交互命令：`reset` 清空历史，`exit`/`quit` 退出。
 
+### 修改模型路径
+
+命令行用 `--model-path` 指定模型目录即可。若用双击的 `启动对话.bat`，里面的路径是写死的，换机器或换模型时用记事本改这一行：
+
+```bat
+"%~dp0target\release\rsinfer.exe" --model-path "你的模型目录" --chat -i -n 1024
+```
+
+模型目录需包含 `config.json`、`tokenizer.json` 和 `model.safetensors`（或分片 + index.json）。
+
 ### 主要参数
 
 | 参数 | 说明 | 默认 |
@@ -66,3 +76,7 @@ src/
 - 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
 - KV cache 用简单拼接（短序列下非瓶颈）。
 - 不支持 GPU；要 GPU 推理请用 llama.cpp + 量化 GGUF。
+
+## 许可证
+
+[Apache-2.0](LICENSE)
