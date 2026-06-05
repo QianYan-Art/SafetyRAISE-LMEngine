@@ -1,0 +1,68 @@
+# rsinfer
+
+用 Rust 从零写的极简大模型推理引擎，纯 CPU，专门适配微调的 **Qwen3-4B-Thinking** 模型。
+
+定位是学习/练手项目：把 Transformer 推理的每一环（权重加载、张量算子、注意力、KV cache、采样、生成循环）都用可读的 Rust 实现一遍。要追求生产级速度请用 llama.cpp。
+
+## 支持的模型
+
+HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。已验证：微调版 Qwen3-4B-Thinking-2507。
+
+关键架构特性均已实现：GQA、Qwen3 的 QK-Norm、RoPE、SwiGLU、RMSNorm、权重绑定（tie embeddings）、f16 权重存储。
+
+## 构建
+
+```powershell
+cargo build --release
+```
+
+`.cargo/config.toml` 已开启 `target-cpu=native`（AVX2/FMA），二进制仅保证在本机架构上运行。
+
+## 使用
+
+单次生成：
+
+```powershell
+cargo run --release -- --model-path <模型目录> --chat -p "用一句话介绍杭州。"
+```
+
+交互式多轮对话（保留历史）：
+
+```powershell
+cargo run --release -- --model-path <模型目录> --chat --interactive
+```
+
+交互命令：`reset` 清空历史，`exit`/`quit` 退出。
+
+### 主要参数
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--model-path` | 模型目录 | 必填 |
+| `-p, --prompt` | 提示词，省略则进交互模式 | — |
+| `--chat` | 套用 Qwen3 chat 模板 | 关 |
+| `--system` | system 提示词（chat 模式） | — |
+| `-n, --max-tokens` | 最大生成长度 | 256 |
+| `-t, --temperature` | 温度，0 为贪心 | 0.6 |
+| `--top-p` / `--top-k` | 核采样 / top-k | 0.95 / 20 |
+| `-i, --interactive` | 交互模式 | 关 |
+| `-v, --verbose` | 打印 prompt 与耗时 | 关 |
+
+采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
+
+## 代码结构
+
+```
+src/
+├── tensor/    张量与数学算子 (matmul, rmsnorm, rope, attention, silu)
+├── model/     config 解析 / safetensors 加载 / Transformer 层 / 模型组装
+├── engine/    KV cache / 采样器 / 生成循环
+└── main.rs    CLI 与交互式对话
+```
+
+## 已知限制与后续方向
+
+- 纯 CPU、f32 计算（权重以 f16 存储省内存带宽），4B 模型约 2–3 tokens/s。
+- 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
+- KV cache 用简单拼接（短序列下非瓶颈）。
+- 不支持 GPU；要 GPU 推理请用 llama.cpp + 量化 GGUF。
