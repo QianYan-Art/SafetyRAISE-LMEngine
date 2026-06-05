@@ -25,24 +25,21 @@ impl DType {
 
 /// 将 f16 字节切片转换为 f32 向量
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let f16_slice = unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / 2)
-    };
+    let f16_slice =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / 2) };
     f16_slice.iter().map(|x| x.to_f32()).collect()
 }
 
 /// 将 bf16 字节切片转换为 f32 向量
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let bf16_slice = unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const bf16, bytes.len() / 2)
-    };
+    let bf16_slice =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const bf16, bytes.len() / 2) };
     bf16_slice.iter().map(|x| x.to_f32()).collect()
 }
 
 /// 将 f32 字节切片转换为 f32 向量
 pub fn f32_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let f32_slice = unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
-    };
+    let f32_slice =
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
     f32_slice.to_vec()
 }

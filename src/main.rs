@@ -1,10 +1,10 @@
 //! rsinfer CLI：命令行与交互式对话入口。
 
-use std::io::{self, Write, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use rsinfer::engine::{Generator, Sampler, GreedySampler, CombinedSampler};
+use rsinfer::engine::{CombinedSampler, Generator, GreedySampler, Sampler};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -77,7 +77,10 @@ fn answer_only(full: &str) -> &str {
 }
 
 fn unescape(s: &str) -> String {
-    s.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r").replace("\\\\", "\\")
+    s.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\\\", "\\")
 }
 
 fn main() -> rsinfer::Result<()> {
@@ -91,15 +94,27 @@ fn main() -> rsinfer::Result<()> {
     let sampler: Box<dyn Sampler> = if args.temperature <= 0.0 {
         Box::new(GreedySampler)
     } else {
-        Box::new(CombinedSampler::new(args.temperature, args.top_k, args.top_p))
+        Box::new(CombinedSampler::new(
+            args.temperature,
+            args.top_k,
+            args.top_p,
+        ))
     };
-    let generator = generator.with_sampler(sampler).with_max_tokens(args.max_tokens);
+    let generator = generator
+        .with_sampler(sampler)
+        .with_max_tokens(args.max_tokens);
 
     match (args.interactive, &args.prompt) {
         (false, Some(prompt)) => {
             let prompt = unescape(prompt);
             let final_prompt = if args.chat {
-                render_chat(args.system.as_deref(), &[Message { role: "user", content: prompt }])
+                render_chat(
+                    args.system.as_deref(),
+                    &[Message {
+                        role: "user",
+                        content: prompt,
+                    }],
+                )
             } else {
                 prompt
             };
@@ -110,7 +125,11 @@ fn main() -> rsinfer::Result<()> {
     Ok(())
 }
 
-fn generate_and_print(generator: &Generator, prompt: &str, verbose: bool) -> rsinfer::Result<String> {
+fn generate_and_print(
+    generator: &Generator,
+    prompt: &str,
+    verbose: bool,
+) -> rsinfer::Result<String> {
     if verbose {
         println!("=== 输入 prompt ===\n{prompt}\n=== 开始生成 ===");
     }
@@ -121,12 +140,20 @@ fn generate_and_print(generator: &Generator, prompt: &str, verbose: bool) -> rsi
     })?;
     println!();
     if verbose {
-        println!("\n--- 生成完成 (耗时: {:.2}s) ---", start.elapsed().as_secs_f32());
+        println!(
+            "\n--- 生成完成 (耗时: {:.2}s) ---",
+            start.elapsed().as_secs_f32()
+        );
     }
     Ok(full)
 }
 
-fn run_interactive(generator: &Generator, use_chat: bool, system: Option<&str>, verbose: bool) -> rsinfer::Result<()> {
+fn run_interactive(
+    generator: &Generator,
+    use_chat: bool,
+    system: Option<&str>,
+    verbose: bool,
+) -> rsinfer::Result<()> {
     println!("\n=== rsinfer 交互式模式 ===");
     if use_chat {
         println!("Chat 模式 (Qwen3 模板, thinking 强制开启, 保留多轮历史)");
@@ -162,7 +189,10 @@ fn run_interactive(generator: &Generator, use_chat: bool, system: Option<&str>, 
         }
 
         let prompt = if use_chat {
-            history.push(Message { role: "user", content: input.to_string() });
+            history.push(Message {
+                role: "user",
+                content: input.to_string(),
+            });
             render_chat(system, &history)
         } else {
             input.to_string()
@@ -173,7 +203,10 @@ fn run_interactive(generator: &Generator, use_chat: bool, system: Option<&str>, 
         let full = generate_and_print(generator, &prompt, verbose)?;
 
         if use_chat {
-            history.push(Message { role: "assistant", content: answer_only(&full).to_string() });
+            history.push(Message {
+                role: "assistant",
+                content: answer_only(&full).to_string(),
+            });
         }
         println!();
     }

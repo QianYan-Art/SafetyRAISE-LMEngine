@@ -2,14 +2,14 @@
 
 use std::path::Path;
 
-use ndarray::{Array2, s};
+use ndarray::{s, Array2};
 
-use crate::error::{Result, RsinferError};
-use crate::tensor::Tensor;
-use crate::model::config::Qwen3Config;
-use crate::model::weights::{WeightMap, load_weights, get_weight};
-use crate::model::layers::{TransformerBlock, RmsNorm, Linear, build_transformer_block};
 use crate::engine::KVCache;
+use crate::error::{Result, RsinferError};
+use crate::model::config::Qwen3Config;
+use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
+use crate::model::weights::{get_weight, load_weights, WeightMap};
+use crate::tensor::Tensor;
 
 pub struct Qwen3Model {
     pub config: Qwen3Config,
@@ -35,19 +35,30 @@ impl Qwen3Model {
             layers.push(build_transformer_block(weights, config, layer_idx)?);
         }
 
-        let norm = RmsNorm::new(get_weight(weights, "model.norm.weight")?.clone(), config.rms_norm_eps);
+        let norm = RmsNorm::new(
+            get_weight(weights, "model.norm.weight")?.clone(),
+            config.rms_norm_eps,
+        );
 
         // tie_word_embeddings 时 lm_head 复用 embedding 权重
         let lm_head_weight = match get_weight(weights, "lm_head.weight") {
             Ok(w) => w.clone(),
             Err(_) if config.tie_word_embeddings => embed_tokens.clone(),
-            Err(_) => return Err(RsinferError::WeightError(
-                "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
-            )),
+            Err(_) => {
+                return Err(RsinferError::WeightError(
+                    "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
+                ))
+            }
         };
         let lm_head = Linear::new(lm_head_weight, None);
 
-        Ok(Self { config: config.clone(), embed_tokens, layers, norm, lm_head })
+        Ok(Self {
+            config: config.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     /// 返回最后一个位置的 logits: [1, vocab_size]。
@@ -77,12 +88,19 @@ impl Qwen3Model {
                     self.config.vocab_size
                 )));
             }
-            result.row_mut(i).assign(&self.embed_tokens.data.slice(s![id, ..]));
+            result
+                .row_mut(i)
+                .assign(&self.embed_tokens.data.slice(s![id, ..]));
         }
-        Ok(Tensor { data: result.into_dyn() })
+        Ok(Tensor {
+            data: result.into_dyn(),
+        })
     }
 
     pub fn create_kv_cache(&self) -> KVCache {
-        KVCache::new(self.config.num_hidden_layers, self.config.max_position_embeddings)
+        KVCache::new(
+            self.config.num_hidden_layers,
+            self.config.max_position_embeddings,
+        )
     }
 }

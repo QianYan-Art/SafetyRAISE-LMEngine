@@ -1,7 +1,7 @@
 //! 从 logits 选择下一个 token 的采样策略。
 
-use rand::Rng;
 use crate::tensor::Tensor;
+use rand::Rng;
 
 pub trait Sampler: Send + Sync {
     /// logits: [vocab_size] 一维张量
@@ -28,7 +28,11 @@ pub struct CombinedSampler {
 
 impl CombinedSampler {
     pub fn new(temperature: f32, top_k: usize, top_p: f32) -> Self {
-        Self { temperature, top_k, top_p }
+        Self {
+            temperature,
+            top_k,
+            top_p,
+        }
     }
 }
 

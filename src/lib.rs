@@ -2,9 +2,9 @@
 //!
 //! 使用 Rust 实现，支持 LLaMA 架构，可加载 HuggingFace SafeTensors 模型进行文本生成。
 
-pub mod error;
-pub mod tensor;
-pub mod model;
 pub mod engine;
+pub mod error;
+pub mod model;
+pub mod tensor;
 
-pub use error::{RsinferError, Result};
+pub use error::{Result, RsinferError};

@@ -30,7 +30,7 @@ pub fn load_weights<P: AsRef<Path>>(model_dir: P) -> Result<WeightMap> {
     let model_dir = model_dir.as_ref();
     let index_path = model_dir.join("model.safetensors.index.json");
     let single_path = model_dir.join("model.safetensors");
-    
+
     if index_path.exists() {
         // 分片格式
         load_sharded_weights(model_dir, &index_path)
@@ -48,20 +48,20 @@ pub fn load_weights<P: AsRef<Path>>(model_dir: P) -> Result<WeightMap> {
 /// 加载单文件 SafeTensors
 fn load_single_weights<P: AsRef<Path>>(path: P) -> Result<WeightMap> {
     let data = fs::read(path.as_ref())?;
-    let safetensors = SafeTensors::deserialize(&data)
-        .map_err(|e| RsinferError::SafeTensors(e.to_string()))?;
-    
+    let safetensors =
+        SafeTensors::deserialize(&data).map_err(|e| RsinferError::SafeTensors(e.to_string()))?;
+
     let mut weights = HashMap::new();
-    
+
     for (name, tensor_info) in safetensors.tensors() {
         let shape: Vec<usize> = tensor_info.shape().to_vec();
         let dtype = tensor_info.dtype();
         let data_bytes = tensor_info.data();
-        
+
         let tensor = convert_tensor(&shape, dtype, data_bytes, &name)?;
         weights.insert(name.to_string(), tensor);
     }
-    
+
     Ok(weights)
 }
 
@@ -69,28 +69,28 @@ fn load_single_weights<P: AsRef<Path>>(path: P) -> Result<WeightMap> {
 fn load_sharded_weights<P: AsRef<Path>>(model_dir: P, index_path: P) -> Result<WeightMap> {
     let index_content = fs::read_to_string(index_path.as_ref())?;
     let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
-    
+
     // 收集所有需要加载的文件
     let shard_files: std::collections::HashSet<_> = index.weight_map.values().cloned().collect();
-    
+
     let mut weights = HashMap::new();
-    
+
     for shard_file in shard_files {
         let shard_path = model_dir.as_ref().join(&shard_file);
         let data = fs::read(&shard_path)?;
         let safetensors = SafeTensors::deserialize(&data)
             .map_err(|e| RsinferError::SafeTensors(format!("{}: {}", shard_file, e)))?;
-        
+
         for (name, tensor_info) in safetensors.tensors() {
             let shape: Vec<usize> = tensor_info.shape().to_vec();
             let dtype = tensor_info.dtype();
             let data_bytes = tensor_info.data();
-            
+
             let tensor = convert_tensor(&shape, dtype, data_bytes, &name)?;
             weights.insert(name.to_string(), tensor);
         }
     }
-    
+
     Ok(weights)
 }
 
@@ -114,9 +114,9 @@ fn convert_tensor(
 
 /// 从权重字典中获取指定名称的权重
 pub fn get_weight<'a>(weights: &'a WeightMap, name: &str) -> Result<&'a Tensor> {
-    weights.get(name).ok_or_else(|| {
-        RsinferError::WeightError(format!("Weight '{}' not found", name))
-    })
+    weights
+        .get(name)
+        .ok_or_else(|| RsinferError::WeightError(format!("Weight '{}' not found", name)))
 }
 
 #[cfg(test)]
@@ -128,7 +128,7 @@ mod tests {
         let shape = vec![2, 3];
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-        
+
         let tensor = convert_tensor(&shape, safetensors::Dtype::F32, &bytes, "test").unwrap();
         assert_eq!(tensor.shape(), &[2, 3]);
     }

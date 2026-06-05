@@ -4,11 +4,13 @@
 
 use half::f16;
 
-use crate::error::Result;
-use crate::tensor::{Tensor, rms_norm, silu, rope, scaled_dot_product_attention, repeat_kv, linear_forward_f16};
-use crate::model::config::Qwen3Config;
-use crate::model::weights::{WeightMap, get_weight};
 use crate::engine::KVCache;
+use crate::error::Result;
+use crate::model::config::Qwen3Config;
+use crate::model::weights::{get_weight, WeightMap};
+use crate::tensor::{
+    linear_forward_f16, repeat_kv, rms_norm, rope, scaled_dot_product_attention, silu, Tensor,
+};
 
 /// RMS 归一化层
 pub struct RmsNorm {
@@ -42,7 +44,11 @@ impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
         let shape = weight.shape();
         let (out_features, in_features) = (shape[0], shape[1]);
-        let weight: Vec<f16> = weight.as_slice().iter().map(|&v| f16::from_f32(v)).collect();
+        let weight: Vec<f16> = weight
+            .as_slice()
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         Self {
             weight,
             out_features,
@@ -97,9 +103,21 @@ impl Attention {
     ) -> Result<Tensor> {
         let seq_len = hidden_states.shape()[0];
 
-        let q = self.q_proj.forward(hidden_states)?.reshape(&[seq_len, self.num_heads, self.head_dim])?;
-        let k = self.k_proj.forward(hidden_states)?.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
-        let v = self.v_proj.forward(hidden_states)?.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
+        let q = self.q_proj.forward(hidden_states)?.reshape(&[
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        ])?;
+        let k = self.k_proj.forward(hidden_states)?.reshape(&[
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ])?;
+        let v = self.v_proj.forward(hidden_states)?.reshape(&[
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ])?;
 
         // Qwen3 QK-Norm：每个 head 沿 head_dim 做 RMSNorm，必须在 RoPE 之前
         let q = self.q_norm.forward(&q)?;
@@ -133,9 +151,9 @@ fn transpose_for_attention(x: &Tensor, num_heads: usize) -> Result<Tensor> {
     let shape = x.shape();
     let seq_len = shape[0];
     let head_dim = shape[2];
-    
+
     let mut result = ndarray::ArrayD::zeros(ndarray::IxDyn(&[num_heads, seq_len, head_dim]));
-    
+
     for s in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..head_dim {
@@ -143,16 +161,16 @@ fn transpose_for_attention(x: &Tensor, num_heads: usize) -> Result<Tensor> {
             }
         }
     }
-    
+
     Ok(Tensor { data: result })
 }
 
 /// 将 [num_heads, seq_len, head_dim] 转置回 [seq_len, num_heads, head_dim]
 fn transpose_back(x: &Tensor, seq_len: usize, num_heads: usize) -> Result<Tensor> {
     let head_dim = x.shape()[2];
-    
+
     let mut result = ndarray::ArrayD::zeros(ndarray::IxDyn(&[seq_len, num_heads, head_dim]));
-    
+
     for h in 0..num_heads {
         for s in 0..seq_len {
             for d in 0..head_dim {
@@ -160,7 +178,7 @@ fn transpose_back(x: &Tensor, seq_len: usize, num_heads: usize) -> Result<Tensor
             }
         }
     }
-    
+
     Ok(Tensor { data: result })
 }
 
@@ -228,7 +246,9 @@ impl TransformerBlock {
     ) -> Result<Tensor> {
         // RMSNorm -> Attention
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.attention.forward(&normed, kv_cache, layer_idx, position_offset)?;
+        let attn_output = self
+            .attention
+            .forward(&normed, kv_cache, layer_idx, position_offset)?;
 
         // Residual connection
         let hidden_states = hidden_states.add(&attn_output)?;

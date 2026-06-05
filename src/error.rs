@@ -17,7 +17,10 @@ pub enum RsinferError {
     SafeTensors(String),
 
     #[error("Tensor shape mismatch: expected {expected:?}, got {actual:?}")]
-    ShapeMismatch { expected: Vec<usize>, actual: Vec<usize> },
+    ShapeMismatch {
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+    },
 
     #[error("Tensor dimension error: {0}")]
     DimensionError(String),

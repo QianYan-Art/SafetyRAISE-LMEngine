@@ -2,8 +2,8 @@
 //!
 //! 封装 ndarray 的动态维度数组，提供类型安全的张量操作。
 
-use ndarray::{ArrayD, IxDyn, s};
 use crate::error::{Result, RsinferError};
+use ndarray::{s, ArrayD, IxDyn};
 
 /// 张量数据结构
 ///
@@ -78,7 +78,10 @@ impl Tensor {
                 actual: self.shape().to_vec(),
             });
         }
-        let reshaped = self.data.clone().into_shape_with_order(IxDyn(new_shape))
+        let reshaped = self
+            .data
+            .clone()
+            .into_shape_with_order(IxDyn(new_shape))
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?;
         Ok(Self { data: reshaped })
     }
@@ -104,12 +107,20 @@ impl Tensor {
         }
 
         // 使用 ndarray 的 dot 进行矩阵乘法
-        let a = self.data.view().into_dimensionality::<ndarray::Ix2>()
+        let a = self
+            .data
+            .view()
+            .into_dimensionality::<ndarray::Ix2>()
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?;
-        let b = other.data.view().into_dimensionality::<ndarray::Ix2>()
+        let b = other
+            .data
+            .view()
+            .into_dimensionality::<ndarray::Ix2>()
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?;
         let result = a.dot(&b);
-        Ok(Tensor { data: result.into_dyn() })
+        Ok(Tensor {
+            data: result.into_dyn(),
+        })
     }
 
     /// 逐元素加法 (支持广播)
@@ -148,7 +159,9 @@ impl Tensor {
     /// 对于 2D 张量，返回指定行的子集
     pub fn slice_rows(&self, start: usize, end: usize) -> Result<Tensor> {
         if self.ndim() < 1 {
-            return Err(RsinferError::DimensionError("Cannot slice 0D tensor".into()));
+            return Err(RsinferError::DimensionError(
+                "Cannot slice 0D tensor".into(),
+            ));
         }
         let sliced = self.data.slice(s![start..end, ..]).to_owned().into_dyn();
         Ok(Tensor { data: sliced })
@@ -157,24 +170,45 @@ impl Tensor {
     /// 获取最后一个元素 (用于生成)
     pub fn last_row(&self) -> Result<Tensor> {
         if self.ndim() < 1 {
-            return Err(RsinferError::DimensionError("Cannot get last row of 0D tensor".into()));
+            return Err(RsinferError::DimensionError(
+                "Cannot get last row of 0D tensor".into(),
+            ));
         }
         let shape = self.shape();
         let last_idx = shape[0] - 1;
-        
+
         // 根据维度数动态构造切片索引
         let sliced = match self.ndim() {
-            1 => self.data.slice(s![last_idx..last_idx + 1]).to_owned().into_dyn(),
-            2 => self.data.slice(s![last_idx..last_idx + 1, ..]).to_owned().into_dyn(),
-            3 => self.data.slice(s![last_idx..last_idx + 1, .., ..]).to_owned().into_dyn(),
-            _ => return Err(RsinferError::DimensionError("Unsupported dimension for last_row".into())),
+            1 => self
+                .data
+                .slice(s![last_idx..last_idx + 1])
+                .to_owned()
+                .into_dyn(),
+            2 => self
+                .data
+                .slice(s![last_idx..last_idx + 1, ..])
+                .to_owned()
+                .into_dyn(),
+            3 => self
+                .data
+                .slice(s![last_idx..last_idx + 1, .., ..])
+                .to_owned()
+                .into_dyn(),
+            _ => {
+                return Err(RsinferError::DimensionError(
+                    "Unsupported dimension for last_row".into(),
+                ))
+            }
         };
         Ok(Tensor { data: sliced })
     }
 
     /// 转换为 1D 视图 (用于采样)
     pub fn to_1d(&self) -> Result<Tensor> {
-        let flat = self.data.clone().into_shape_with_order(IxDyn(&[self.numel()]))
+        let flat = self
+            .data
+            .clone()
+            .into_shape_with_order(IxDyn(&[self.numel()]))
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?;
         Ok(Tensor { data: flat })
     }

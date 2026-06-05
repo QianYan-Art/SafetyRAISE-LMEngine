@@ -2,10 +2,10 @@
 //!
 //! 包含 softmax、rms_norm、silu、rope 等 LLM 推理所需的核心算子。
 
-use ndarray::{ArrayD, IxDyn, Axis};
-use rayon::prelude::*;
 use half::f16;
 use half::slice::HalfFloatSliceExt;
+use ndarray::{ArrayD, Axis, IxDyn};
+use rayon::prelude::*;
 
 use super::Tensor;
 use crate::error::{Result, RsinferError};
@@ -94,7 +94,12 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
             *acc += x * y;
         }
     }
-    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(&x, &y)| x * y).sum();
+    let tail: f32 = ca
+        .remainder()
+        .iter()
+        .zip(cb.remainder())
+        .map(|(&x, &y)| x * y)
+        .sum();
     acc.iter().sum::<f32>() + tail
 }
 
@@ -111,24 +116,24 @@ pub fn softmax(x: &Tensor, dim: usize) -> Result<Tensor> {
     }
 
     let data = &x.data;
-    
+
     // 数值稳定性：减去最大值
     let max_vals = data.map_axis(Axis(dim), |lane| {
         lane.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
     });
-    
+
     // 广播减法
     let shifted = data - &max_vals.insert_axis(Axis(dim));
-    
+
     // 计算 exp
     let exp_vals = shifted.mapv(f32::exp);
-    
+
     // 计算 sum
     let sum_vals = exp_vals.sum_axis(Axis(dim));
-    
+
     // 归一化
     let result = &exp_vals / &sum_vals.insert_axis(Axis(dim));
-    
+
     Ok(Tensor { data: result })
 }
 
@@ -138,23 +143,24 @@ pub fn softmax(x: &Tensor, dim: usize) -> Result<Tensor> {
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let data = &x.data;
     let last_dim = x.ndim() - 1;
-    
+
     // 计算 x^2
     let x_sq = data.mapv(|v| v * v);
-    
+
     // 计算 mean(x^2)
-    let mean_sq = x_sq.mean_axis(Axis(last_dim))
+    let mean_sq = x_sq
+        .mean_axis(Axis(last_dim))
         .ok_or_else(|| RsinferError::DimensionError("Failed to compute mean".into()))?;
-    
+
     // 计算 rsqrt(mean + eps)
     let rsqrt = mean_sq.mapv(|v| 1.0 / (v + eps).sqrt());
-    
+
     // 广播乘法归一化
     let normalized = data * &rsqrt.insert_axis(Axis(last_dim));
-    
+
     // 应用权重
     let result = &normalized * &weight.data;
-    
+
     Ok(Tensor { data: result })
 }
 
@@ -176,28 +182,28 @@ pub fn silu(x: &Tensor) -> Tensor {
 pub fn rope(q: &Tensor, k: &Tensor, pos: usize, theta: f32) -> Result<(Tensor, Tensor)> {
     let q_shape = q.shape();
     let _k_shape = k.shape();
-    
+
     if q.ndim() != 3 || k.ndim() != 3 {
         return Err(RsinferError::DimensionError(
             "RoPE requires 3D tensors [seq_len, num_heads, head_dim]".into(),
         ));
     }
-    
+
     let seq_len = q_shape[0];
     let head_dim = q_shape[2];
     let half_dim = head_dim / 2;
-    
+
     // 计算频率
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
         .collect();
-    
+
     // 对 Q 应用旋转
     let q_rotated = apply_rope_to_tensor(&q.data, &inv_freq, pos, seq_len, half_dim)?;
-    
+
     // 对 K 应用旋转
     let k_rotated = apply_rope_to_tensor(&k.data, &inv_freq, pos, seq_len, half_dim)?;
-    
+
     Ok((Tensor { data: q_rotated }, Tensor { data: k_rotated }))
 }
 
@@ -211,29 +217,29 @@ fn apply_rope_to_tensor(
 ) -> Result<ArrayD<f32>> {
     let shape = data.shape().to_vec();
     let mut result = data.clone();
-    
+
     for seq_idx in 0..seq_len {
         let cur_pos = pos + seq_idx;
-        
+
         // 对于每个位置，计算旋转角度
         for (freq_idx, &inv_f) in inv_freq.iter().enumerate() {
             let angle = cur_pos as f32 * inv_f;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
-            
+
             // 遍历所有 head
             for head_idx in 0..shape[1] {
                 // 获取 x1 和 x2
                 let x1 = result[[seq_idx, head_idx, freq_idx]];
                 let x2 = result[[seq_idx, head_idx, freq_idx + half_dim]];
-                
+
                 // 应用旋转
                 result[[seq_idx, head_idx, freq_idx]] = x1 * cos_val - x2 * sin_val;
                 result[[seq_idx, head_idx, freq_idx + half_dim]] = x1 * sin_val + x2 * cos_val;
             }
         }
     }
-    
+
     Ok(result)
 }
 
@@ -250,7 +256,7 @@ pub fn scaled_dot_product_attention(
     // q: [num_heads, seq_len_q, head_dim]
     // k: [num_heads, seq_len_k, head_dim]
     // v: [num_heads, seq_len_k, head_dim]
-    
+
     let num_heads = q.shape()[0];
     let seq_len_q = q.shape()[1];
     let seq_len_k = k.shape()[1];
@@ -330,21 +336,21 @@ pub fn repeat_kv(x: &Tensor, num_repeats: usize) -> Result<Tensor> {
     if num_repeats == 1 {
         return Ok(x.clone());
     }
-    
+
     let shape = x.shape();
     if shape.len() != 3 {
         return Err(RsinferError::DimensionError(
             "repeat_kv expects 3D tensor [num_kv_heads, seq_len, head_dim]".into(),
         ));
     }
-    
+
     let num_kv_heads = shape[0];
     let seq_len = shape[1];
     let head_dim = shape[2];
     let num_heads = num_kv_heads * num_repeats;
-    
+
     let mut result = ArrayD::zeros(IxDyn(&[num_heads, seq_len, head_dim]));
-    
+
     for kv_head in 0..num_kv_heads {
         for rep in 0..num_repeats {
             let head_idx = kv_head * num_repeats + rep;
@@ -355,7 +361,7 @@ pub fn repeat_kv(x: &Tensor, num_repeats: usize) -> Result<Tensor> {
             }
         }
     }
-    
+
     Ok(Tensor { data: result })
 }
 

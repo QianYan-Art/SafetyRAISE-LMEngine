@@ -12,13 +12,13 @@ use ndarray::{ArrayD, IxDyn};
 pub struct KVCache {
     /// 每层的 Key 缓存: [num_heads, seq_len, head_dim]
     key_cache: Vec<Option<Tensor>>,
-    
+
     /// 每层的 Value 缓存: [num_heads, seq_len, head_dim]
     value_cache: Vec<Option<Tensor>>,
-    
+
     /// 当前序列长度 (用于跟踪)
     current_len: usize,
-    
+
     /// 最大支持的序列长度 (保留用于未来扩展)
     #[allow(dead_code)]
     max_len: usize,
@@ -58,7 +58,7 @@ impl KVCache {
         if self.key_cache[layer_idx].is_none() {
             self.key_cache[layer_idx] = Some(new_k.clone());
             self.value_cache[layer_idx] = Some(new_v.clone());
-            
+
             // 更新当前长度 (只在第一层更新)
             if layer_idx == 0 {
                 self.current_len = new_k.shape()[1];
@@ -88,20 +88,22 @@ impl KVCache {
     ///
     /// 返回 (key_cache, value_cache)，形状均为 [num_heads, seq_len, head_dim]
     pub fn get(&self, layer_idx: usize) -> Result<(&Tensor, &Tensor)> {
-        let k = self.key_cache.get(layer_idx)
+        let k = self
+            .key_cache
+            .get(layer_idx)
             .and_then(|x| x.as_ref())
-            .ok_or_else(|| RsinferError::DimensionError(format!(
-                "No cache for layer {}",
-                layer_idx
-            )))?;
-        
-        let v = self.value_cache.get(layer_idx)
+            .ok_or_else(|| {
+                RsinferError::DimensionError(format!("No cache for layer {}", layer_idx))
+            })?;
+
+        let v = self
+            .value_cache
+            .get(layer_idx)
             .and_then(|x| x.as_ref())
-            .ok_or_else(|| RsinferError::DimensionError(format!(
-                "No cache for layer {}",
-                layer_idx
-            )))?;
-        
+            .ok_or_else(|| {
+                RsinferError::DimensionError(format!("No cache for layer {}", layer_idx))
+            })?;
+
         Ok((k, v))
     }
 
@@ -180,13 +182,13 @@ mod tests {
     #[test]
     fn test_kv_cache_append() {
         let mut cache = KVCache::new(2, 1024);
-        
+
         let k = Tensor::zeros(&[4, 3, 64]); // [num_heads, seq_len, head_dim]
         let v = Tensor::zeros(&[4, 3, 64]);
-        
+
         cache.append(0, &k, &v).unwrap();
         assert_eq!(cache.current_len(), 3);
-        
+
         // 追加更多
         let k2 = Tensor::zeros(&[4, 2, 64]);
         let v2 = Tensor::zeros(&[4, 2, 64]);

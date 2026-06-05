@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
+use crate::engine::sampler::{default_sampler, Sampler};
 use crate::error::{Result, RsinferError};
 use crate::model::Qwen3Model;
-use crate::engine::sampler::{Sampler, default_sampler};
 
 pub struct GenerationConfig {
     pub max_tokens: usize,
@@ -13,7 +13,10 @@ pub struct GenerationConfig {
 
 impl Default for GenerationConfig {
     fn default() -> Self {
-        Self { max_tokens: 256, stop_tokens: Vec::new() }
+        Self {
+            max_tokens: 256,
+            stop_tokens: Vec::new(),
+        }
     }
 }
 
@@ -45,7 +48,10 @@ impl Generator {
             model,
             tokenizer,
             sampler: default_sampler(),
-            config: GenerationConfig { stop_tokens, ..Default::default() },
+            config: GenerationConfig {
+                stop_tokens,
+                ..Default::default()
+            },
         })
     }
 
@@ -101,7 +107,9 @@ impl Generator {
                 printed = text.len();
             }
 
-            let logits = self.model.forward(&[next], &mut kv_cache, prompt_len + step)?;
+            let logits = self
+                .model
+                .forward(&[next], &mut kv_cache, prompt_len + step)?;
             next = self.sampler.sample(&logits.to_1d()?);
         }
 

@@ -1,8 +1,8 @@
 //! Qwen3 模型配置解析（HuggingFace config.json）。
 
 use serde::Deserialize;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 use crate::error::Result;
 
@@ -11,56 +11,56 @@ use crate::error::Result;
 pub struct Qwen3Config {
     /// 隐藏层维度
     pub hidden_size: usize,
-    
+
     /// MLP 中间层维度
     pub intermediate_size: usize,
-    
+
     /// Transformer 层数
     pub num_hidden_layers: usize,
-    
+
     /// 注意力头数
     pub num_attention_heads: usize,
-    
+
     /// KV 头数 (用于 GQA)。若 config.json 未提供，则在 `from_file` 中
     /// 回退为 `num_attention_heads`（即标准 MHA）。
     #[serde(default)]
     pub num_key_value_heads: usize,
-    
+
     /// 每个注意力头的维度 (可选，Qwen3 等模型显式指定)
     #[serde(default, rename = "head_dim")]
     pub explicit_head_dim: Option<usize>,
-    
+
     /// 词汇表大小
     pub vocab_size: usize,
-    
+
     /// 最大位置编码长度
     #[serde(default = "default_max_position")]
     pub max_position_embeddings: usize,
-    
+
     /// RMSNorm 的 epsilon
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
-    
+
     /// RoPE 的 theta 值
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
-    
+
     /// 模型类型
     #[serde(default)]
     pub model_type: String,
-    
+
     /// 数据类型
     #[serde(default)]
     pub torch_dtype: String,
-    
+
     /// 是否绑定 embedding 和 lm_head 权重
     #[serde(default)]
     pub tie_word_embeddings: bool,
-    
+
     /// EOS token ID
     #[serde(default = "default_eos_token_id")]
     pub eos_token_id: u32,
-    
+
     /// BOS token ID
     #[serde(default)]
     pub bos_token_id: Option<u32>,
@@ -95,15 +95,16 @@ impl Qwen3Config {
 
         Ok(config)
     }
-    
+
     /// 计算每个 head 的维度
-    /// 
+    ///
     /// 如果配置中显式指定了 head_dim，使用显式值；
     /// 否则使用 hidden_size / num_attention_heads
     pub fn head_dim(&self) -> usize {
-        self.explicit_head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.explicit_head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
-    
+
     /// 计算 GQA 的扩展倍数
     pub fn kv_group_size(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
@@ -128,7 +129,7 @@ mod tests {
             "rope_theta": 10000.0,
             "model_type": "llama"
         }"#;
-        
+
         let config: Qwen3Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.hidden_size, 4096);
         assert_eq!(config.num_hidden_layers, 32);
