@@ -5,9 +5,9 @@
 mod config;
 mod weights;
 mod layers;
-mod llama;
+mod qwen3;
 
 pub use config::*;
 pub use weights::*;
 pub use layers::*;
-pub use llama::*;
+pub use qwen3::*;

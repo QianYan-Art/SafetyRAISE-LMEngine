@@ -6,7 +6,7 @@ use half::f16;
 
 use crate::error::Result;
 use crate::tensor::{Tensor, rms_norm, silu, rope, scaled_dot_product_attention, repeat_kv, linear_forward_f16};
-use crate::model::config::LlamaConfig;
+use crate::model::config::Qwen3Config;
 use crate::model::weights::{WeightMap, get_weight};
 use crate::engine::KVCache;
 
@@ -270,7 +270,7 @@ impl TransformerBlock {
 
 pub fn build_transformer_block(
     weights: &WeightMap,
-    config: &LlamaConfig,
+    config: &Qwen3Config,
     layer_idx: usize,
 ) -> Result<TransformerBlock> {
     let prefix = format!("model.layers.{layer_idx}");

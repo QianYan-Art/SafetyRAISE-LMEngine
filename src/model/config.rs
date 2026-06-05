@@ -1,6 +1,4 @@
-//! LLaMA 模型配置解析
-//!
-//! 解析 HuggingFace 格式的 config.json 文件。
+//! Qwen3 模型配置解析（HuggingFace config.json）。
 
 use serde::Deserialize;
 use std::path::Path;
@@ -8,11 +6,9 @@ use std::fs;
 
 use crate::error::Result;
 
-/// LLaMA/Qwen 模型配置
-///
-/// 对应 HuggingFace 的 config.json 格式。
+/// Qwen3 模型配置，对应 HuggingFace 的 config.json。
 #[derive(Debug, Clone, Deserialize)]
-pub struct LlamaConfig {
+pub struct Qwen3Config {
     /// 隐藏层维度
     pub hidden_size: usize,
     
@@ -86,11 +82,11 @@ fn default_eos_token_id() -> u32 {
     2 // 默认 LLaMA EOS token ID
 }
 
-impl LlamaConfig {
+impl Qwen3Config {
     /// 从 config.json 文件加载配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path.as_ref())?;
-        let mut config: LlamaConfig = serde_json::from_str(&content)?;
+        let mut config: Qwen3Config = serde_json::from_str(&content)?;
 
         // 未指定（或为 0）时回退为 num_attention_heads（标准 MHA）
         if config.num_key_value_heads == 0 {
@@ -133,7 +129,7 @@ mod tests {
             "model_type": "llama"
         }"#;
         
-        let config: LlamaConfig = serde_json::from_str(json).unwrap();
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.hidden_size, 4096);
         assert_eq!(config.num_hidden_layers, 32);
         assert_eq!(config.head_dim(), 128);

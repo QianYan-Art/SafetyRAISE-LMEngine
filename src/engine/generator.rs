@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::error::{Result, RsinferError};
-use crate::model::LlamaModel;
+use crate::model::Qwen3Model;
 use crate::engine::sampler::{Sampler, default_sampler};
 
 pub struct GenerationConfig {
@@ -18,7 +18,7 @@ impl Default for GenerationConfig {
 }
 
 pub struct Generator {
-    pub model: LlamaModel,
+    pub model: Qwen3Model,
     pub tokenizer: tokenizers::Tokenizer,
     pub sampler: Box<dyn Sampler>,
     pub config: GenerationConfig,
@@ -27,7 +27,7 @@ pub struct Generator {
 impl Generator {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let model = LlamaModel::from_pretrained(model_dir)?;
+        let model = Qwen3Model::from_pretrained(model_dir)?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| RsinferError::TokenizerError(e.to_string()))?;

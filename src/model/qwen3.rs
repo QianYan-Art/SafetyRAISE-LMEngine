@@ -6,28 +6,28 @@ use ndarray::{Array2, s};
 
 use crate::error::{Result, RsinferError};
 use crate::tensor::Tensor;
-use crate::model::config::LlamaConfig;
+use crate::model::config::Qwen3Config;
 use crate::model::weights::{WeightMap, load_weights, get_weight};
 use crate::model::layers::{TransformerBlock, RmsNorm, Linear, build_transformer_block};
 use crate::engine::KVCache;
 
-pub struct LlamaModel {
-    pub config: LlamaConfig,
+pub struct Qwen3Model {
+    pub config: Qwen3Config,
     pub embed_tokens: Tensor, // [vocab_size, hidden_size]
     pub layers: Vec<TransformerBlock>,
     pub norm: RmsNorm,
     pub lm_head: Linear,
 }
 
-impl LlamaModel {
+impl Qwen3Model {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let config = LlamaConfig::from_file(model_dir.join("config.json"))?;
+        let config = Qwen3Config::from_file(model_dir.join("config.json"))?;
         let weights = load_weights(model_dir)?;
         Self::from_weights(&config, &weights)
     }
 
-    pub fn from_weights(config: &LlamaConfig, weights: &WeightMap) -> Result<Self> {
+    pub fn from_weights(config: &Qwen3Config, weights: &WeightMap) -> Result<Self> {
         let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?.clone();
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
