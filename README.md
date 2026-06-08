@@ -67,6 +67,20 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 
 `--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
 
+## 本机基准
+
+`tools/benchmark-local.ps1` 可用于对比 safetensors 直读路径的 `cpu` / `hybrid` 模式，并可用 `llama-bench.exe` 对本机 GGUF 参考模型做单独基准。输出目录默认是 `target\benchmarks`，脚本会拒绝把输出写进模型输入目录。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\benchmark-local.ps1 `
+  -SafetensorsModelDir D:\MCP_Server\root\autodl-tmp\TS-Qwen3 `
+  -GgufModelPath D:\MCP_Server\root\TS_Qwen3_Finetuned\TS-Qwen3-Finetuned.gguf `
+  -LlamaBenchExe D:\MCP_Server\llamacpp\llama.cpp\build\bin\Release\llama-bench.exe `
+  -RsinferDevices cpu,hybrid -GpuLayers 1 -MaxTokens 1 -Repeat 1
+```
+
+短基准主要用于选择下一步优化方向；除非有同提示词、同采样、足够 token 数和多轮重复数据，否则不要把它解释成质量或速度领先证明。
+
 ## 代码结构
 
 ```

@@ -5,14 +5,18 @@ param(
 
     [string]$RsinferExe = "",
     [string]$LlamaExe = "",
+    [string]$LlamaBenchExe = "",
     [string]$GgufModelPath = "",
-    [string]$Prompt = "用一句话介绍杭州。",
+    [string]$Prompt = "Say hello in one sentence.",
     [int]$MaxTokens = 128,
     [int]$Repeat = 1,
     [double]$Temperature = 0.6,
     [double]$TopP = 0.95,
     [int]$TopK = 20,
     [bool]$Chat = $true,
+    [string[]]$RsinferDevices = @("cpu"),
+    [int]$GpuLayers = 0,
+    [int]$LlamaBenchPromptTokens = 8,
     [string[]]$LlamaExtraArgs = @(),
     [string]$OutputDir = "target\benchmarks",
     [switch]$DryRun
@@ -123,6 +127,11 @@ if ($LlamaExe) {
     $resolvedLlamaExe = Resolve-ExistingPath -Path $LlamaExe -Name "LlamaExe"
 }
 
+$resolvedLlamaBenchExe = ""
+if ($LlamaBenchExe) {
+    $resolvedLlamaBenchExe = Resolve-ExistingPath -Path $LlamaBenchExe -Name "LlamaBenchExe"
+}
+
 $resolvedRsinferExe = ""
 if ($RsinferExe) {
     $resolvedRsinferExe = Resolve-ExistingPath -Path $RsinferExe -Name "RsinferExe"
@@ -131,6 +140,27 @@ if ($RsinferExe) {
     if (Test-Path -LiteralPath $candidate -PathType Leaf) {
         $resolvedRsinferExe = (Resolve-Path -LiteralPath $candidate).Path
     }
+}
+
+[string[]]$normalizedRsinferDevices = @(
+    $RsinferDevices |
+        ForEach-Object { $_ -split "," } |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ }
+) | Select-Object -Unique
+if (@($normalizedRsinferDevices).Count -eq 0) {
+    throw "RsinferDevices must contain at least one device."
+}
+foreach ($device in $normalizedRsinferDevices) {
+    if ($device -notin @("cpu", "auto", "hybrid")) {
+        throw "Unsupported rsinfer device '$device'. Expected one of: cpu, auto, hybrid."
+    }
+}
+if ($GpuLayers -lt 0) {
+    throw "GpuLayers must be non-negative."
+}
+if ($LlamaBenchPromptTokens -lt 1) {
+    throw "LlamaBenchPromptTokens must be positive."
 }
 
 $outputFull = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDir))
@@ -157,14 +187,33 @@ if ($Chat) {
     $commonRsinferArgs += "--chat"
 }
 
-if ($resolvedRsinferExe) {
-    $rsinferCommand = [pscustomobject]@{ file = $resolvedRsinferExe; args = $commonRsinferArgs }
-} else {
-    $rsinferCommand = [pscustomobject]@{ file = "cargo"; args = @("run", "--release", "--") + $commonRsinferArgs }
+$rsinferCommands = New-Object System.Collections.Generic.List[object]
+foreach ($device in $normalizedRsinferDevices) {
+    $deviceArgs = $commonRsinferArgs + @("--device", $device)
+    if ($device -ne "cpu" -and $GpuLayers -gt 0) {
+        $deviceArgs += @("--gpu-layers", "$GpuLayers")
+    }
+
+    if ($resolvedRsinferExe) {
+        $rsinferCommands.Add([pscustomobject]@{ name = "rsinfer-$device"; file = $resolvedRsinferExe; args = $deviceArgs })
+    } else {
+        $rsinferCommands.Add([pscustomobject]@{ name = "rsinfer-$device"; file = "cargo"; args = @("run", "--release", "--") + $deviceArgs })
+    }
 }
 
 $llamaCommand = $null
-if ($resolvedLlamaExe -and $ggufPath) {
+$llamaBenchCommand = $null
+if ($resolvedLlamaBenchExe -and $ggufPath) {
+    $llamaBenchArgs = @(
+        "-m", $ggufPath,
+        "-p", "$LlamaBenchPromptTokens",
+        "-n", "$MaxTokens",
+        "-r", "1",
+        "--no-warmup",
+        "-o", "json"
+    )
+    $llamaBenchCommand = [pscustomobject]@{ file = $resolvedLlamaBenchExe; args = $llamaBenchArgs }
+} elseif ($resolvedLlamaExe -and $ggufPath) {
     $llamaArgs = @(
         "-m", $ggufPath,
         "-p", $Prompt,
@@ -183,15 +232,22 @@ Write-Host "Benchmark output directory: $outputFull"
 Write-Host "This script never writes into the model input directories."
 
 Write-Host ""
-Write-Host "Planned rsinfer command:"
-Write-Host (Format-Command -FilePath $rsinferCommand.file -Arguments $rsinferCommand.args)
+Write-Host "Planned rsinfer commands:"
+foreach ($command in $rsinferCommands) {
+    Write-Host "  $($command.name): $(Format-Command -FilePath $command.file -Arguments $command.args)"
+}
 if ($llamaCommand) {
     Write-Host ""
     Write-Host "Planned llama.cpp command:"
     Write-Host (Format-Command -FilePath $llamaCommand.file -Arguments $llamaCommand.args)
-} elseif ($LlamaExe -or $GgufModelPath) {
+}
+if ($llamaBenchCommand) {
     Write-Host ""
-    Write-Host "llama.cpp benchmark skipped: both -LlamaExe and -GgufModelPath are required."
+    Write-Host "Planned llama.cpp benchmark command:"
+    Write-Host (Format-Command -FilePath $llamaBenchCommand.file -Arguments $llamaBenchCommand.args)
+} elseif ($LlamaExe -or $LlamaBenchExe -or $GgufModelPath) {
+    Write-Host ""
+    Write-Host "llama.cpp benchmark skipped: provide -LlamaBenchExe or both -LlamaExe and -GgufModelPath."
 }
 
 if ($DryRun) {
@@ -205,11 +261,13 @@ $runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $results = New-Object System.Collections.Generic.List[object]
 
 for ($i = 1; $i -le $Repeat; $i++) {
-    $results.Add((Invoke-BenchmarkCommand `
-        -Name "rsinfer-$i" `
-        -FilePath $rsinferCommand.file `
-        -Arguments $rsinferCommand.args `
-        -LogPath (Join-Path $outputFull "$runStamp-rsinfer-$i.log")))
+    foreach ($command in $rsinferCommands) {
+        $results.Add((Invoke-BenchmarkCommand `
+            -Name "$($command.name)-$i" `
+            -FilePath $command.file `
+            -Arguments $command.args `
+            -LogPath (Join-Path $outputFull "$runStamp-$($command.name)-$i.log")))
+    }
 
     if ($llamaCommand) {
         $results.Add((Invoke-BenchmarkCommand `
@@ -217,6 +275,14 @@ for ($i = 1; $i -le $Repeat; $i++) {
             -FilePath $llamaCommand.file `
             -Arguments $llamaCommand.args `
             -LogPath (Join-Path $outputFull "$runStamp-llama-$i.log")))
+    }
+
+    if ($llamaBenchCommand) {
+        $results.Add((Invoke-BenchmarkCommand `
+            -Name "llama-bench-$i" `
+            -FilePath $llamaBenchCommand.file `
+            -Arguments $llamaBenchCommand.args `
+            -LogPath (Join-Path $outputFull "$runStamp-llama-bench-$i.json")))
     }
 }
 
@@ -233,6 +299,9 @@ $summary = [pscustomobject]@{
     top_p = $TopP
     top_k = $TopK
     chat = $Chat
+    rsinfer_devices = $normalizedRsinferDevices
+    gpu_layers = $GpuLayers
+    llama_bench_prompt_tokens = $LlamaBenchPromptTokens
     results = $results
 }
 $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
