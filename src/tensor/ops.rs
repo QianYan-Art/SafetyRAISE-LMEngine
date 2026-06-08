@@ -298,8 +298,31 @@ pub fn silu(x: &Tensor) -> Tensor {
 /// theta: 旋转频率基数 (通常为 10000.0)
 pub fn rope(q: &Tensor, k: &Tensor, pos: usize, theta: f32) -> Result<(Tensor, Tensor)> {
     let q_shape = q.shape();
-    let _k_shape = k.shape();
 
+    if q.ndim() != 3 || k.ndim() != 3 {
+        return Err(RsinferError::DimensionError(
+            "RoPE requires 3D tensors [seq_len, num_heads, head_dim]".into(),
+        ));
+    }
+
+    let head_dim = q_shape[2];
+    let half_dim = head_dim / 2;
+
+    // 计算频率
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+        .collect();
+
+    rope_with_inv_freq(q, k, pos, &inv_freq)
+}
+
+pub fn rope_with_inv_freq(
+    q: &Tensor,
+    k: &Tensor,
+    pos: usize,
+    inv_freq: &[f32],
+) -> Result<(Tensor, Tensor)> {
+    let q_shape = q.shape();
     if q.ndim() != 3 || k.ndim() != 3 {
         return Err(RsinferError::DimensionError(
             "RoPE requires 3D tensors [seq_len, num_heads, head_dim]".into(),
@@ -309,17 +332,18 @@ pub fn rope(q: &Tensor, k: &Tensor, pos: usize, theta: f32) -> Result<(Tensor, T
     let seq_len = q_shape[0];
     let head_dim = q_shape[2];
     let half_dim = head_dim / 2;
-
-    // 计算频率
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
-        .collect();
+    if inv_freq.len() != half_dim {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![half_dim],
+            actual: vec![inv_freq.len()],
+        });
+    }
 
     // 对 Q 应用旋转
-    let q_rotated = apply_rope_to_tensor(&q.data, &inv_freq, pos, seq_len, half_dim)?;
+    let q_rotated = apply_rope_to_tensor(&q.data, inv_freq, pos, seq_len, half_dim)?;
 
     // 对 K 应用旋转
-    let k_rotated = apply_rope_to_tensor(&k.data, &inv_freq, pos, seq_len, half_dim)?;
+    let k_rotated = apply_rope_to_tensor(&k.data, inv_freq, pos, seq_len, half_dim)?;
 
     Ok((Tensor { data: q_rotated }, Tensor { data: k_rotated }))
 }
@@ -774,6 +798,33 @@ mod tests {
         let weight = Tensor::from_f32_slice(&[4], &[1.0, 1.0, 1.0, 1.0]).unwrap();
         let result = rms_norm(&x, &weight, 1e-5).unwrap();
         assert_eq!(result.shape(), &[1, 4]);
+    }
+
+    #[test]
+    fn rope_with_inv_freq_matches_theta_path() {
+        let q = Tensor::from_f32_slice(
+            &[2, 2, 4],
+            &[
+                0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, -0.1, 0.6, 0.2, -0.4, 0.3, 0.9, -0.5, 0.1, 0.8,
+            ],
+        )
+        .unwrap();
+        let k = Tensor::from_f32_slice(&[2, 1, 4], &[0.2, -0.1, 0.4, 0.3, -0.2, 0.7, 0.5, 0.6])
+            .unwrap();
+        let theta: f32 = 10_000.0;
+        let inv_freq: Vec<f32> = (0..2)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f32 / 4.0))
+            .collect();
+
+        let (expected_q, expected_k) = rope(&q, &k, 5, theta).unwrap();
+        let (actual_q, actual_k) = rope_with_inv_freq(&q, &k, 5, &inv_freq).unwrap();
+
+        for (expected, actual) in expected_q.as_slice().iter().zip(actual_q.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+        for (expected, actual) in expected_k.as_slice().iter().zip(actual_k.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
     }
 
     #[test]

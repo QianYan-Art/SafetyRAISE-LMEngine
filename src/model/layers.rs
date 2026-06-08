@@ -13,8 +13,8 @@ use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
-    linear_forward_f16, linear_forward_q8, rms_norm, rope, scaled_dot_product_attention_gqa_cached,
-    silu, CachedAttention, Q8LinearWeight, Tensor,
+    linear_forward_f16, linear_forward_q8, rms_norm, rope_with_inv_freq,
+    scaled_dot_product_attention_gqa_cached, silu, CachedAttention, Q8LinearWeight, Tensor,
 };
 
 /// RMS 归一化层
@@ -244,6 +244,7 @@ pub struct Attention {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub rope_theta: f32,
+    rope_inv_freq: Vec<f32>,
     q8_qkv_batch: Option<GpuQ8SameInputBatch>,
 }
 
@@ -380,7 +381,7 @@ impl Attention {
         // Qwen3 QK-Norm：每个 head 沿 head_dim 做 RMSNorm，必须在 RoPE 之前
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
-        let (q, k) = rope(&q, &k, position_offset, self.rope_theta)?;
+        let (q, k) = rope_with_inv_freq(&q, &k, position_offset, &self.rope_inv_freq)?;
 
         // [seq, head, dim] -> [head, seq, dim]
         let q = transpose_for_attention(&q, self.num_heads)?;
@@ -485,6 +486,12 @@ fn transpose_back(x: &Tensor, seq_len: usize, num_heads: usize) -> Result<Tensor
     }
 
     Ok(Tensor { data: result })
+}
+
+fn rope_inv_freq(head_dim: usize, theta: f32) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+        .collect()
 }
 
 /// MLP 层 (SwiGLU)
@@ -742,6 +749,7 @@ pub fn build_transformer_block(
         num_kv_heads: config.num_key_value_heads,
         head_dim: config.head_dim(),
         rope_theta: config.rope_theta,
+        rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
         q8_qkv_batch: None,
     };
 
