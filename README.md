@@ -65,7 +65,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
-`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec，并批量提交同输入的 `q/k/v` 与 `gate/up` 线性层；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
 
 ## 代码结构
 
@@ -80,7 +80,7 @@ src/
 
 ## 已知限制与后续方向
 
-- 当前 prefill、attention 与 KV cache 仍走 CPU；选中 Transformer 层的 decode 线性 matvec 与 `lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
+- 当前 prefill、attention 与 KV cache 仍走 CPU；选中 Transformer 层的 decode 线性 matvec、MLP fused SwiGLU/down 路径与 `lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
 - 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
 - KV cache 用简单拼接（短序列下非瓶颈）。
 - 已有 GPU/CPU 运行时规划入口、decode 线性层 GPU matvec 和 `lm_head` GPU matvec；还没有 attention/KV/prefill GPU kernel。要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。

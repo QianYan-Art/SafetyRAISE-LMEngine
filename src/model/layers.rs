@@ -317,6 +317,20 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if x.shape()[0] == 1 {
+            if let (Some(gate_proj), Some(up_proj), Some(down_proj)) = (
+                self.gate_proj.gpu_matvec(),
+                self.up_proj.gpu_matvec(),
+                self.down_proj.gpu_matvec(),
+            ) {
+                if let Ok(output) =
+                    GpuMatVec::forward_swiglu_down_same_input(gate_proj, up_proj, down_proj, x)
+                {
+                    return Ok(output);
+                }
+            }
+        }
+
         let (gate, up) = if x.shape()[0] == 1 {
             match (self.gate_proj.gpu_matvec(), self.up_proj.gpu_matvec()) {
                 (Some(gate_proj), Some(up_proj)) => {
