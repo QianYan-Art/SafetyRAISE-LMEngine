@@ -5,9 +5,9 @@
 use half::f16;
 
 use crate::engine::KVCache;
-use crate::error::Result;
+use crate::error::{Result, RsinferError};
 use crate::model::config::Qwen3Config;
-use crate::model::weights::{get_weight, WeightMap};
+use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
     linear_forward_f16, repeat_kv, rms_norm, rope, scaled_dot_product_attention, silu, Tensor,
 };
@@ -55,6 +55,38 @@ impl Linear {
             in_features,
             bias,
         }
+    }
+
+    pub fn from_f16_weight(
+        shape: &[usize],
+        weight: Vec<f16>,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        if shape.len() != 2 {
+            return Err(RsinferError::DimensionError(format!(
+                "Linear weight 需要 2D, got {}D",
+                shape.len()
+            )));
+        }
+        let (out_features, in_features) = (shape[0], shape[1]);
+        let expected = out_features * in_features;
+        if weight.len() != expected {
+            return Err(RsinferError::ShapeMismatch {
+                expected: vec![expected],
+                actual: vec![weight.len()],
+            });
+        }
+        Ok(Self {
+            weight,
+            out_features,
+            in_features,
+            bias,
+        })
+    }
+
+    pub fn from_weight_map(weights: &WeightMap, name: &str, bias: Option<Tensor>) -> Result<Self> {
+        let (shape, weight) = get_linear_weight_f16(weights, name)?;
+        Self::from_f16_weight(&shape, weight, bias)
     }
 
     /// 前向传播: x @ W^T + b
@@ -268,9 +300,11 @@ pub fn build_transformer_block(
     layer_idx: usize,
 ) -> Result<TransformerBlock> {
     let prefix = format!("model.layers.{layer_idx}");
-    let get = |suffix: &str| get_weight(weights, &format!("{prefix}.{suffix}")).cloned();
+    let get = |suffix: &str| get_weight(weights, &format!("{prefix}.{suffix}"));
     let eps = config.rms_norm_eps;
-    let linear = |suffix: &str| -> Result<Linear> { Ok(Linear::new(get(suffix)?, None)) };
+    let linear = |suffix: &str| -> Result<Linear> {
+        Linear::from_weight_map(weights, &format!("{prefix}.{suffix}"), None)
+    };
 
     let attention = Attention {
         q_proj: linear("self_attn.q_proj.weight")?,

@@ -28,7 +28,7 @@ impl Qwen3Model {
     }
 
     pub fn from_weights(config: &Qwen3Config, weights: &WeightMap) -> Result<Self> {
-        let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?.clone();
+        let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
@@ -36,21 +36,22 @@ impl Qwen3Model {
         }
 
         let norm = RmsNorm::new(
-            get_weight(weights, "model.norm.weight")?.clone(),
+            get_weight(weights, "model.norm.weight")?,
             config.rms_norm_eps,
         );
 
         // tie_word_embeddings 时 lm_head 复用 embedding 权重
-        let lm_head_weight = match get_weight(weights, "lm_head.weight") {
-            Ok(w) => w.clone(),
-            Err(_) if config.tie_word_embeddings => embed_tokens.clone(),
+        let lm_head = match Linear::from_weight_map(weights, "lm_head.weight", None) {
+            Ok(linear) => linear,
+            Err(_) if config.tie_word_embeddings => {
+                Linear::from_weight_map(weights, "model.embed_tokens.weight", None)?
+            }
             Err(_) => {
                 return Err(RsinferError::WeightError(
                     "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
                 ))
             }
         };
-        let lm_head = Linear::new(lm_head_weight, None);
 
         Ok(Self {
             config: config.clone(),

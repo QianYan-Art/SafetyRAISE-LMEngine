@@ -28,12 +28,31 @@ impl DType {
 
 /// 将 f16 字节切片转换为 f32 向量
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let f16_slice =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / 2) };
-    if f16_slice.len() >= PARALLEL_CONVERT_THRESHOLD {
-        f16_slice.par_iter().map(|x| x.to_f32()).collect()
+    f16_slice_to_f32(&f16_bytes_to_f16(bytes))
+}
+
+/// 将 f16 字节切片转换为 f16 向量
+pub fn f16_bytes_to_f16(bytes: &[u8]) -> Vec<f16> {
+    debug_assert_eq!(bytes.len() % 2, 0);
+    if bytes.len() / 2 >= PARALLEL_CONVERT_THRESHOLD {
+        bytes
+            .par_chunks_exact(2)
+            .map(|b| f16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+            .collect()
     } else {
-        f16_slice.iter().map(|x| x.to_f32()).collect()
+        bytes
+            .chunks_exact(2)
+            .map(|b| f16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+            .collect()
+    }
+}
+
+/// 将 f16 切片转换为 f32 向量
+pub fn f16_slice_to_f32(values: &[f16]) -> Vec<f32> {
+    if values.len() >= PARALLEL_CONVERT_THRESHOLD {
+        values.par_iter().map(|x| x.to_f32()).collect()
+    } else {
+        values.iter().map(|x| x.to_f32()).collect()
     }
 }
 
