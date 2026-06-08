@@ -148,6 +148,16 @@ pub fn linear_forward_q8(x: &Tensor, weight: &Q8LinearWeight) -> Result<Tensor> 
         .ok_or_else(|| RsinferError::DimensionError("x 非连续内存".into()))?;
 
     let n = weight.out_features;
+    if m == 1 {
+        let input = &xs[..k];
+        let mut out = vec![0f32; n];
+        out.par_iter_mut().enumerate().for_each(|(j, dst)| {
+            let w_row = &weight.qweight[j * k..(j + 1) * k];
+            *dst = dot_q8(input, w_row, weight.scales[j]);
+        });
+        return Tensor::from_f32_vec(&[1, n], out);
+    }
+
     let mut out_t = vec![0f32; n * m];
     const JCHUNK: usize = 16;
     out_t
@@ -993,5 +1003,27 @@ mod tests {
                 "q8 output {actual} too far from f16 {expected}"
             );
         }
+    }
+
+    #[test]
+    fn test_linear_forward_q8_single_row_matches_multi_row_first_row() {
+        let weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let q8 = Q8LinearWeight::from_f16(&weight, 3, 2).unwrap();
+        let single = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let multi = Tensor::from_f32_slice(&[2, 2], &[0.6, -1.4, 1.0, 0.25]).unwrap();
+
+        let single_out = linear_forward_q8(&single, &q8).unwrap();
+        let multi_out = linear_forward_q8(&multi, &q8).unwrap();
+
+        assert_eq!(single_out.shape(), &[1, 3]);
+        assert_eq!(multi_out.shape(), &[2, 3]);
+        assert_eq!(single_out.as_slice(), &multi_out.as_slice()[..3]);
     }
 }
