@@ -11,8 +11,8 @@ use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
-    linear_forward_f16, linear_forward_q8, repeat_kv, rms_norm, rope, scaled_dot_product_attention,
-    silu, Q8LinearWeight, Tensor,
+    linear_forward_f16, linear_forward_q8, rms_norm, rope, scaled_dot_product_attention_gqa, silu,
+    Q8LinearWeight, Tensor,
 };
 
 /// RMS 归一化层
@@ -359,13 +359,10 @@ impl Attention {
         kv_cache.append(layer_idx, &k, &v)?;
         let (cached_k, cached_v) = kv_cache.get(layer_idx)?;
 
-        // GQA：把 kv head 复制到对应的 query head 组
+        // GQA：直接按 query head 映射到对应的 KV head，避免实体复制 cached K/V。
         let kv_group_size = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(cached_k, kv_group_size)?;
-        let v = repeat_kv(cached_v, kv_group_size)?;
-
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn = scaled_dot_product_attention(&q, &k, &v, scale)?;
+        let attn = scaled_dot_product_attention_gqa(&q, cached_k, cached_v, kv_group_size, scale)?;
 
         let attn = transpose_back(&attn, seq_len, self.num_heads)?
             .reshape(&[seq_len, self.num_heads * self.head_dim])?;

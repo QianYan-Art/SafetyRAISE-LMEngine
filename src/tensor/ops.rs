@@ -446,6 +446,104 @@ pub fn scaled_dot_product_attention(
     })
 }
 
+pub fn scaled_dot_product_attention_gqa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    kv_group_size: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let q_shape = q.shape();
+    let k_shape = k.shape();
+    let v_shape = v.shape();
+    if q_shape.len() != 3 || k_shape.len() != 3 || v_shape.len() != 3 {
+        return Err(RsinferError::DimensionError(
+            "GQA attention expects q/k/v to be 3D tensors".into(),
+        ));
+    }
+
+    let num_heads = q_shape[0];
+    let seq_len_q = q_shape[1];
+    let head_dim = q_shape[2];
+    let num_kv_heads = k_shape[0];
+    let seq_len_k = k_shape[1];
+    if kv_group_size == 0
+        || num_kv_heads * kv_group_size != num_heads
+        || v_shape[0] != num_kv_heads
+        || v_shape[1] != seq_len_k
+        || k_shape[2] != head_dim
+        || v_shape[2] != head_dim
+    {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![num_heads, seq_len_q, head_dim],
+            actual: vec![num_kv_heads, seq_len_k, k_shape[2]],
+        });
+    }
+    if seq_len_q > seq_len_k {
+        return Err(RsinferError::DimensionError(format!(
+            "GQA attention seq_len_q {seq_len_q} exceeds seq_len_k {seq_len_k}"
+        )));
+    }
+
+    let q_std = q.data.as_standard_layout();
+    let k_std = k.data.as_standard_layout();
+    let v_std = v.data.as_standard_layout();
+    let qs = q_std.as_slice().unwrap();
+    let ks = k_std.as_slice().unwrap();
+    let vs = v_std.as_slice().unwrap();
+
+    let mut output = vec![0f32; num_heads * seq_len_q * head_dim];
+    let head_stride_q = seq_len_q * head_dim;
+    let head_stride_k = seq_len_k * head_dim;
+    let key_offset = seq_len_k - seq_len_q;
+
+    output
+        .par_chunks_mut(head_stride_q)
+        .enumerate()
+        .for_each(|(h, out_head)| {
+            let kv_head_idx = h / kv_group_size;
+            let q_head = &qs[h * head_stride_q..(h + 1) * head_stride_q];
+            let k_head = &ks[kv_head_idx * head_stride_k..(kv_head_idx + 1) * head_stride_k];
+            let v_head = &vs[kv_head_idx * head_stride_k..(kv_head_idx + 1) * head_stride_k];
+
+            let mut scores = vec![0f32; seq_len_k];
+            for i in 0..seq_len_q {
+                let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
+                let causal_limit = key_offset + i;
+
+                let mut max_score = f32::NEG_INFINITY;
+                for j in 0..=causal_limit {
+                    let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                    let s = dot(q_row, k_row) * scale;
+                    scores[j] = s;
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
+                let mut sum_exp = 0f32;
+                for s in scores[..=causal_limit].iter_mut() {
+                    *s = (*s - max_score).exp();
+                    sum_exp += *s;
+                }
+                let inv_sum = 1.0 / sum_exp;
+
+                let out_row = &mut out_head[i * head_dim..(i + 1) * head_dim];
+                for j in 0..=causal_limit {
+                    let w = scores[j] * inv_sum;
+                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                    for d in 0..head_dim {
+                        out_row[d] += w * v_row[d];
+                    }
+                }
+            }
+        });
+
+    Ok(Tensor {
+        data: ArrayD::from_shape_vec(IxDyn(&[num_heads, seq_len_q, head_dim]), output)
+            .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+    })
+}
+
 /// GQA (Grouped Query Attention) 的 KV 头扩展
 ///
 /// 将 [num_kv_heads, seq_len, head_dim] 扩展到 [num_heads, seq_len, head_dim]
@@ -508,6 +606,40 @@ mod tests {
         let weight = Tensor::from_f32_slice(&[4], &[1.0, 1.0, 1.0, 1.0]).unwrap();
         let result = rms_norm(&x, &weight, 1e-5).unwrap();
         assert_eq!(result.shape(), &[1, 4]);
+    }
+
+    #[test]
+    fn gqa_attention_matches_repeated_kv_path() {
+        let q = Tensor::from_f32_slice(
+            &[4, 2, 2],
+            &[
+                0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, -0.1, 0.6, 0.2, -0.4, 0.3, 0.9, -0.5, 0.1, 0.8,
+            ],
+        )
+        .unwrap();
+        let k = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.2, -0.1, 0.4, 0.3, -0.2, 0.7, 0.5, 0.6, -0.3, 0.2, 0.8, -0.4,
+            ],
+        )
+        .unwrap();
+        let v = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.3, 0.1, -0.2, 0.4, 0.7, -0.5, -0.1, 0.8, 0.6, -0.3, 0.2, 0.5,
+            ],
+        )
+        .unwrap();
+        let repeated_k = repeat_kv(&k, 2).unwrap();
+        let repeated_v = repeat_kv(&v, 2).unwrap();
+        let expected = scaled_dot_product_attention(&q, &repeated_k, &repeated_v, 0.5).unwrap();
+        let actual = scaled_dot_product_attention_gqa(&q, &k, &v, 2, 0.5).unwrap();
+
+        assert_eq!(expected.shape(), actual.shape());
+        for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
     }
 
     #[test]
