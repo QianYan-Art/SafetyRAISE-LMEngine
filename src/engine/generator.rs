@@ -1,6 +1,7 @@
 //! 自回归文本生成。
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::engine::sampler::{default_sampler, Sampler};
 use crate::engine::KVCache;
@@ -27,6 +28,28 @@ pub struct Generator {
     pub tokenizer: tokenizers::Tokenizer,
     pub sampler: Box<dyn Sampler>,
     pub config: GenerationConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GenerationProfile {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prefill_forward: Duration,
+    pub prefill_sample: Duration,
+    pub decode_forward: Duration,
+    pub decode_sample: Duration,
+    pub text_decode: Duration,
+    pub fast_path_tokens: usize,
+}
+
+impl GenerationProfile {
+    pub fn avg_decode_forward_ms(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_forward.as_secs_f64() * 1000.0 / (self.generated_tokens - 1) as f64
+        }
+    }
 }
 
 impl Generator {
@@ -93,10 +116,29 @@ impl Generator {
 
     /// 生成并通过 `on_text` 流式回调新产生的文本，返回完整结果。
     pub fn generate_stream<F: FnMut(&str)>(&self, prompt: &str, mut on_text: F) -> Result<String> {
+        self.generate_stream_with_profile(prompt, |text| on_text(text))
+            .map(|(text, _)| text)
+    }
+
+    pub fn generate_stream_with_profile<F: FnMut(&str)>(
+        &self,
+        prompt: &str,
+        mut on_text: F,
+    ) -> Result<(String, GenerationProfile)> {
         let input_ids = self.encode(prompt)?;
         let mut kv_cache = self.model.create_kv_cache();
+        let mut profile = GenerationProfile {
+            prompt_tokens: input_ids.len(),
+            ..Default::default()
+        };
 
-        let mut next = self.next_token(&input_ids, &mut kv_cache, 0)?;
+        let (mut next, forward_time, sample_time, fast_path) =
+            self.next_token_profile(&input_ids, &mut kv_cache, 0)?;
+        profile.prefill_forward += forward_time;
+        profile.prefill_sample += sample_time;
+        if fast_path {
+            profile.fast_path_tokens += 1;
+        }
         let prompt_len = input_ids.len();
 
         // 逐 token 解码会截断多字节字符，故每步解码整段、只刷出已完整的新增后缀。
@@ -109,40 +151,58 @@ impl Generator {
             }
             tokens.push(next);
 
+            let decode_start = Instant::now();
             let text = self.decode(&tokens)?;
+            profile.text_decode += decode_start.elapsed();
             if !text.ends_with('\u{FFFD}') && text.len() > printed {
                 on_text(&text[printed..]);
                 printed = text.len();
             }
 
-            next = self.next_token(&[next], &mut kv_cache, prompt_len + step)?;
+            if step + 1 < self.config.max_tokens {
+                let (token, forward_time, sample_time, fast_path) =
+                    self.next_token_profile(&[next], &mut kv_cache, prompt_len + step)?;
+                profile.decode_forward += forward_time;
+                profile.decode_sample += sample_time;
+                if fast_path {
+                    profile.fast_path_tokens += 1;
+                }
+                next = token;
+            }
         }
 
+        profile.generated_tokens = tokens.len();
+        let decode_start = Instant::now();
         let text = self.decode(&tokens)?;
+        profile.text_decode += decode_start.elapsed();
         if text.len() > printed {
             on_text(&text[printed..]);
         }
-        Ok(text)
+        Ok((text, profile))
     }
 
-    fn next_token(
+    fn next_token_profile(
         &self,
         input_ids: &[u32],
         kv_cache: &mut KVCache,
         position_offset: usize,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Duration, Duration, bool)> {
+        let forward_start = Instant::now();
         if self.sampler.is_greedy() && self.model.has_greedy_token_fast_path() {
             let snapshot = kv_cache.snapshot();
             match self
                 .model
                 .forward_greedy_token(input_ids, kv_cache, position_offset)
             {
-                Ok(token) => return Ok(token),
+                Ok(token) => return Ok((token, forward_start.elapsed(), Duration::ZERO, true)),
                 Err(_) => kv_cache.restore(snapshot)?,
             }
         }
 
         let logits = self.model.forward(input_ids, kv_cache, position_offset)?;
-        Ok(self.sampler.sample(&logits.to_1d()?))
+        let forward_time = forward_start.elapsed();
+        let sample_start = Instant::now();
+        let token = self.sampler.sample(&logits.to_1d()?);
+        Ok((token, forward_time, sample_start.elapsed(), false))
     }
 }

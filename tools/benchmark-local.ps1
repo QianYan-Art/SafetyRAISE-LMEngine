@@ -14,6 +14,7 @@ param(
     [double]$TopP = 0.95,
     [int]$TopK = 20,
     [bool]$Chat = $true,
+    [switch]$ProfileTokens,
     [string[]]$RsinferDevices = @("cpu"),
     [int]$GpuLayers = 0,
     [string]$RsinferQuantization = "none",
@@ -207,6 +208,9 @@ $commonRsinferArgs = @(
 if ($Chat) {
     $commonRsinferArgs += "--chat"
 }
+if ($ProfileTokens) {
+    $commonRsinferArgs += "--profile-tokens"
+}
 
 $rsinferCommands = New-Object System.Collections.Generic.List[object]
 foreach ($device in $normalizedRsinferDevices) {
@@ -326,6 +330,7 @@ $summary = [pscustomobject]@{
     top_p = $TopP
     top_k = $TopK
     chat = $Chat
+    profile_tokens = [bool]$ProfileTokens
     rsinfer_devices = $normalizedRsinferDevices
     gpu_layers = $GpuLayers
     rsinfer_quantizations = $normalizedQuantizations

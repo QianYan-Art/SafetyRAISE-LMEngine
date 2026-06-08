@@ -94,6 +94,10 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    /// 打印 token 级生成耗时 profile；默认关闭
+    #[arg(long)]
+    profile_tokens: bool,
+
     /// 推理设备规划: cpu 保持现有 CPU 路径；auto/hybrid 探测 GPU 并生成混合放置计划
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
@@ -196,9 +200,15 @@ fn main() -> rsinfer::Result<()> {
             } else {
                 prompt
             };
-            generate_and_print(&generator, &final_prompt, args.verbose)?;
+            generate_and_print(&generator, &final_prompt, args.verbose, args.profile_tokens)?;
         }
-        _ => run_interactive(&generator, args.chat, args.system.as_deref(), args.verbose)?,
+        _ => run_interactive(
+            &generator,
+            args.chat,
+            args.system.as_deref(),
+            args.verbose,
+            args.profile_tokens,
+        )?,
     }
     Ok(())
 }
@@ -207,12 +217,13 @@ fn generate_and_print(
     generator: &Generator,
     prompt: &str,
     verbose: bool,
+    profile_tokens: bool,
 ) -> rsinfer::Result<String> {
     if verbose {
         println!("=== 输入 prompt ===\n{prompt}\n=== 开始生成 ===");
     }
     let start = std::time::Instant::now();
-    let full = generator.generate_stream(prompt, |t| {
+    let (full, profile) = generator.generate_stream_with_profile(prompt, |t| {
         print!("{t}");
         io::stdout().flush().ok();
     })?;
@@ -223,6 +234,21 @@ fn generate_and_print(
             start.elapsed().as_secs_f32()
         );
     }
+    if profile_tokens {
+        println!(
+            "profile.tokens prompt={} generated={} fast_path={}",
+            profile.prompt_tokens, profile.generated_tokens, profile.fast_path_tokens
+        );
+        println!(
+            "profile.time_ms prefill_forward={:.3} prefill_sample={:.3} decode_forward={:.3} decode_sample={:.3} text_decode={:.3} avg_decode_forward_per_token={:.3}",
+            profile.prefill_forward.as_secs_f64() * 1000.0,
+            profile.prefill_sample.as_secs_f64() * 1000.0,
+            profile.decode_forward.as_secs_f64() * 1000.0,
+            profile.decode_sample.as_secs_f64() * 1000.0,
+            profile.text_decode.as_secs_f64() * 1000.0,
+            profile.avg_decode_forward_ms(),
+        );
+    }
     Ok(full)
 }
 
@@ -231,6 +257,7 @@ fn run_interactive(
     use_chat: bool,
     system: Option<&str>,
     verbose: bool,
+    profile_tokens: bool,
 ) -> rsinfer::Result<()> {
     println!("\n=== rsinfer 交互式模式 ===");
     if use_chat {
@@ -278,7 +305,7 @@ fn run_interactive(
 
         print!("助手: ");
         stdout.flush().ok();
-        let full = generate_and_print(generator, &prompt, verbose)?;
+        let full = generate_and_print(generator, &prompt, verbose, profile_tokens)?;
 
         if use_chat {
             history.push(Message {
