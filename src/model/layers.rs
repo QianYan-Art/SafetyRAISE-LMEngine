@@ -6,7 +6,7 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::{GpuContext, GpuMatVec, GpuSwiGluDown};
+use crate::gpu::{GpuContext, GpuMatVec, GpuQ8MatVec, GpuSwiGluDown};
 use crate::model::config::Qwen3Config;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
@@ -40,6 +40,7 @@ pub struct Linear {
     pub in_features: usize,
     pub bias: Option<Tensor>,
     gpu_matvec: Option<GpuMatVec>,
+    q8_gpu_matvec: Option<GpuQ8MatVec>,
     q8_weight: Option<Q8LinearWeight>,
 }
 
@@ -59,6 +60,7 @@ impl Linear {
             in_features,
             bias,
             gpu_matvec: None,
+            q8_gpu_matvec: None,
             q8_weight: None,
         }
     }
@@ -88,6 +90,7 @@ impl Linear {
             in_features,
             bias,
             gpu_matvec: None,
+            q8_gpu_matvec: None,
             q8_weight: None,
         })
     }
@@ -126,6 +129,22 @@ impl Linear {
         self.gpu_matvec.as_ref()
     }
 
+    pub fn try_enable_q8_gpu_matvec_with_context(
+        &mut self,
+        context: &GpuContext,
+    ) -> std::result::Result<(), String> {
+        if self.q8_weight.is_none() {
+            self.try_enable_q8_weight().map_err(|err| err.to_string())?;
+        }
+        let q8_weight = self
+            .q8_weight
+            .as_ref()
+            .ok_or_else(|| "Q8 weight was not attached".to_string())?;
+        let accelerator = GpuQ8MatVec::from_q8_weight_with_context(context, q8_weight)?;
+        self.q8_gpu_matvec = Some(accelerator);
+        Ok(())
+    }
+
     pub fn try_enable_q8_weight(&mut self) -> Result<()> {
         let q8 = Q8LinearWeight::from_f16(&self.weight, self.out_features, self.in_features)?;
         self.q8_weight = Some(q8);
@@ -137,6 +156,11 @@ impl Linear {
     /// x: [batch, in_features] -> result: [batch, out_features]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if self.bias.is_none() {
+            if let Some(q8_gpu_matvec) = &self.q8_gpu_matvec {
+                if let Ok(result) = q8_gpu_matvec.forward(x) {
+                    return Ok(result);
+                }
+            }
             if let Some(gpu_matvec) = &self.gpu_matvec {
                 if let Ok(result) = gpu_matvec.forward(x) {
                     return Ok(result);
@@ -204,6 +228,23 @@ impl Attention {
             match linear.try_enable_gpu_matvec_with_context(context) {
                 Ok(()) => attached += 1,
                 Err(err) => errors.push(format!("attention.{name}: {err}")),
+            }
+        }
+        (attached, errors)
+    }
+
+    pub fn try_enable_q8_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
+        let mut attached = 0usize;
+        let mut errors = Vec::new();
+        for (name, linear) in [
+            ("q_proj", &mut self.q_proj),
+            ("k_proj", &mut self.k_proj),
+            ("v_proj", &mut self.v_proj),
+            ("o_proj", &mut self.o_proj),
+        ] {
+            match linear.try_enable_q8_gpu_matvec_with_context(context) {
+                Ok(()) => attached += 1,
+                Err(err) => errors.push(format!("attention.{name}.q8_gpu: {err}")),
             }
         }
         (attached, errors)
@@ -424,6 +465,22 @@ impl Mlp {
         };
         (attached, errors)
     }
+
+    pub fn try_enable_q8_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
+        let mut attached = 0usize;
+        let mut errors = Vec::new();
+        for (name, linear) in [
+            ("gate_proj", &mut self.gate_proj),
+            ("up_proj", &mut self.up_proj),
+            ("down_proj", &mut self.down_proj),
+        ] {
+            match linear.try_enable_q8_gpu_matvec_with_context(context) {
+                Ok(()) => attached += 1,
+                Err(err) => errors.push(format!("mlp.{name}.q8_gpu: {err}")),
+            }
+        }
+        (attached, errors)
+    }
 }
 
 /// Transformer Block
@@ -481,6 +538,13 @@ impl TransformerBlock {
     pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
         let (attn_count, mut errors) = self.attention.try_enable_gpu_matvecs(context);
         let (mlp_count, mlp_errors) = self.mlp.try_enable_gpu_matvecs(context);
+        errors.extend(mlp_errors);
+        (attn_count + mlp_count, errors)
+    }
+
+    pub fn try_enable_q8_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
+        let (attn_count, mut errors) = self.attention.try_enable_q8_gpu_matvecs(context);
+        let (mlp_count, mlp_errors) = self.mlp.try_enable_q8_gpu_matvecs(context);
         errors.extend(mlp_errors);
         (attn_count + mlp_count, errors)
     }

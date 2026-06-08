@@ -9,6 +9,7 @@ use std::process::Command;
 use crate::model::Qwen3Config;
 
 const MAX_ACTIVE_TRANSFORMER_GPU_LAYERS: usize = 4;
+const MAX_AUTO_TRANSFORMER_GPU_LAYERS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevicePreference {
@@ -172,9 +173,9 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             };
 
             let estimated = estimate_gpu_layers(config, &gpu);
-            let requested = options.gpu_layers.unwrap_or(estimated);
-            let gpu_layers = requested
-                .min(estimated.max(options.gpu_layers.unwrap_or(0).min(1)))
+            let requested = options.gpu_layers;
+            let requested_or_estimated = requested.unwrap_or(estimated);
+            let gpu_layers = requested_or_estimated
                 .min(config.num_hidden_layers)
                 .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS);
             let mut layer_devices = vec![LayerDevice::Cpu; config.num_hidden_layers];
@@ -188,19 +189,22 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 "Layer placement controls optional decode linear GPU offload and remains CPU fallback compatible."
                     .to_string(),
             ];
-            if requested > config.num_hidden_layers {
+            if requested_or_estimated > config.num_hidden_layers {
                 notes.push(format!(
-                    "--gpu-layers requested {requested}, clamped to {} transformer layers.",
+                    "--gpu-layers requested {requested_or_estimated}, clamped to {} transformer layers.",
                     config.num_hidden_layers
                 ));
             }
-            if requested > gpu_layers {
+            if requested_or_estimated > gpu_layers {
                 notes.push(format!(
-                    "--gpu-layers requested {requested}, active transformer GPU layers capped to {gpu_layers} for this wgpu/f32 backend."
+                    "--gpu-layers requested {requested_or_estimated}, active transformer GPU layers capped to {gpu_layers} for this wgpu/f32 backend."
                 ));
             }
             if options.gpu_layers.is_none() {
-                notes.push("GPU layer count was estimated from visible GPU memory.".to_string());
+                notes.push(
+                    "GPU layer count was conservatively estimated from visible GPU memory."
+                        .to_string(),
+                );
             }
 
             RuntimePlan {
@@ -223,6 +227,13 @@ impl RuntimePlan {
         self.refresh_compute_backend();
         self.notes
             .push("lm_head matvec is using the optional wgpu backend.".to_string());
+    }
+
+    pub fn mark_lm_head_q8_gpu(&mut self) {
+        self.lm_head_device = LayerDevice::Gpu;
+        self.refresh_compute_backend();
+        self.notes
+            .push("lm_head Q8 matvec is using the optional wgpu backend.".to_string());
     }
 
     pub fn mark_lm_head_gpu_fallback(&mut self, reason: impl Into<String>) {
@@ -255,6 +266,16 @@ impl RuntimePlan {
         }
     }
 
+    pub fn mark_transformer_decode_q8_gpu_layers(&mut self, active_layers: usize, attached: usize) {
+        self.transformer_decode_gpu_layers = active_layers;
+        self.refresh_compute_backend();
+        if active_layers > 0 {
+            self.notes.push(format!(
+                "decode Q8 matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; prefill still falls back to CPU."
+            ));
+        }
+    }
+
     pub fn mark_transformer_gpu_fallback(&mut self, reason: impl Into<String>) {
         self.notes.push(format!(
             "transformer decode GPU backend unavailable or partial; using CPU fallback where needed: {}",
@@ -265,7 +286,7 @@ impl RuntimePlan {
     pub fn mark_q8_quantization(&mut self, attached_linears: usize) {
         self.quantization = QuantizationMode::Q8;
         self.notes.push(format!(
-            "Q8 linear CPU path enabled for {attached_linears} bias-free linear layer(s); GPU matvecs still take priority where attached."
+            "Q8 linear path enabled for {attached_linears} bias-free linear layer(s); Q8 GPU matvecs or existing GPU matvecs take priority where attached, then CPU Q8 is used as fallback."
         ));
     }
 
@@ -302,6 +323,7 @@ fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
     let fit = (usable_mib * 1024 * 1024) / bytes_per_layer;
     fit.min(config.num_hidden_layers)
         .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS)
+        .min(MAX_AUTO_TRANSFORMER_GPU_LAYERS)
 }
 
 fn estimate_transformer_layer_bytes(config: &Qwen3Config) -> usize {

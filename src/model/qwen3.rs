@@ -65,26 +65,6 @@ impl Qwen3Model {
         for layer_idx in 0..config.num_hidden_layers {
             layers.push(build_transformer_block(weights, config, layer_idx)?);
         }
-        let planned_gpu_layers = runtime_plan.planned_transformer_gpu_layers();
-        if let Some(context) = &gpu_context {
-            let mut active_layers = 0usize;
-            let mut attached_linears = 0usize;
-            let mut fallback_errors = Vec::new();
-            for (layer_idx, layer) in layers.iter_mut().enumerate().take(planned_gpu_layers) {
-                let (attached, errors) = layer.try_enable_gpu_matvecs(context);
-                if attached > 0 {
-                    active_layers += 1;
-                    attached_linears += attached;
-                }
-                if !errors.is_empty() {
-                    fallback_errors.push(format!("layer {layer_idx}: {}", errors.join("; ")));
-                }
-            }
-            runtime_plan.mark_transformer_decode_gpu_layers(active_layers, attached_linears);
-            if !fallback_errors.is_empty() {
-                runtime_plan.mark_transformer_gpu_fallback(fallback_errors.join(" | "));
-            }
-        }
 
         let norm = RmsNorm::new(
             get_weight(weights, "model.norm.weight")?,
@@ -103,15 +83,9 @@ impl Qwen3Model {
                 ))
             }
         };
-        if let Some(context) = &gpu_context {
-            match lm_head.try_enable_gpu_matvec_with_context(context) {
-                Ok(()) if lm_head.has_gpu_matvec() => runtime_plan.mark_lm_head_gpu(),
-                Ok(()) => runtime_plan.mark_lm_head_gpu_fallback("backend was not attached"),
-                Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
-            }
-        }
 
-        if runtime_options.quantization == QuantizationMode::Q8 {
+        let use_q8 = runtime_options.quantization == QuantizationMode::Q8;
+        if use_q8 {
             let mut attached_linears = 0usize;
             for layer in &mut layers {
                 attached_linears += layer.try_enable_q8_weights()?;
@@ -119,6 +93,48 @@ impl Qwen3Model {
             lm_head.try_enable_q8_weight()?;
             attached_linears += 1;
             runtime_plan.mark_q8_quantization(attached_linears);
+        }
+
+        let planned_gpu_layers = runtime_plan.planned_transformer_gpu_layers();
+        if let Some(context) = &gpu_context {
+            let mut active_layers = 0usize;
+            let mut attached_linears = 0usize;
+            let mut fallback_errors = Vec::new();
+            for (layer_idx, layer) in layers.iter_mut().enumerate().take(planned_gpu_layers) {
+                let (attached, errors) = if use_q8 {
+                    layer.try_enable_q8_gpu_matvecs(context)
+                } else {
+                    layer.try_enable_gpu_matvecs(context)
+                };
+                if attached > 0 {
+                    active_layers += 1;
+                    attached_linears += attached;
+                }
+                if !errors.is_empty() {
+                    fallback_errors.push(format!("layer {layer_idx}: {}", errors.join("; ")));
+                }
+            }
+            if use_q8 {
+                runtime_plan.mark_transformer_decode_q8_gpu_layers(active_layers, attached_linears);
+            } else {
+                runtime_plan.mark_transformer_decode_gpu_layers(active_layers, attached_linears);
+            }
+            if !fallback_errors.is_empty() {
+                runtime_plan.mark_transformer_gpu_fallback(fallback_errors.join(" | "));
+            }
+
+            if use_q8 {
+                match lm_head.try_enable_q8_gpu_matvec_with_context(context) {
+                    Ok(()) => runtime_plan.mark_lm_head_q8_gpu(),
+                    Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
+                }
+            } else {
+                match lm_head.try_enable_gpu_matvec_with_context(context) {
+                    Ok(()) if lm_head.has_gpu_matvec() => runtime_plan.mark_lm_head_gpu(),
+                    Ok(()) => runtime_plan.mark_lm_head_gpu_fallback("backend was not attached"),
+                    Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
+                }
+            }
         }
 
         Ok(Self {
