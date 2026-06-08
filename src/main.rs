@@ -3,8 +3,26 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rsinfer::engine::{CombinedSampler, Generator, GreedySampler, Sampler};
+use rsinfer::runtime::{DevicePreference, RuntimeOptions};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DeviceArg {
+    Cpu,
+    Auto,
+    Hybrid,
+}
+
+impl From<DeviceArg> for DevicePreference {
+    fn from(value: DeviceArg) -> Self {
+        match value {
+            DeviceArg::Cpu => DevicePreference::Cpu,
+            DeviceArg::Auto => DevicePreference::Auto,
+            DeviceArg::Hybrid => DevicePreference::Hybrid,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -45,6 +63,14 @@ struct Args {
 
     #[arg(short, long)]
     verbose: bool,
+
+    /// 推理设备规划: cpu 保持现有 CPU 路径；auto/hybrid 探测 GPU 并生成混合放置计划
+    #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
+    device: DeviceArg,
+
+    /// 计划放到 GPU 的 Transformer 层数；当前 GPU kernel 未接入，执行仍会明确标注为 CPU
+    #[arg(long)]
+    gpu_layers: Option<usize>,
 }
 
 const IM_START: &str = "\x3c|im_start|>";
@@ -88,8 +114,15 @@ fn main() -> rsinfer::Result<()> {
 
     println!("正在加载模型: {:?}", args.model_path);
     let start = std::time::Instant::now();
-    let generator = Generator::from_pretrained(&args.model_path)?;
+    let runtime_options = RuntimeOptions {
+        device: args.device.into(),
+        gpu_layers: args.gpu_layers,
+    };
+    let generator = Generator::from_pretrained_with_options(&args.model_path, &runtime_options)?;
     println!("模型加载完成，耗时: {:.2}s", start.elapsed().as_secs_f32());
+    if args.verbose {
+        print!("{}", generator.model.runtime_plan);
+    }
 
     let sampler: Box<dyn Sampler> = if args.temperature <= 0.0 {
         Box::new(GreedySampler)

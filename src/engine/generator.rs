@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::engine::sampler::{default_sampler, Sampler};
 use crate::error::{Result, RsinferError};
 use crate::model::Qwen3Model;
+use crate::runtime::RuntimeOptions;
 
 pub struct GenerationConfig {
     pub max_tokens: usize,
@@ -29,8 +30,15 @@ pub struct Generator {
 
 impl Generator {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
+        Self::from_pretrained_with_options(model_dir, &RuntimeOptions::default())
+    }
+
+    pub fn from_pretrained_with_options<P: AsRef<Path>>(
+        model_dir: P,
+        runtime_options: &RuntimeOptions,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let model = Qwen3Model::from_pretrained(model_dir)?;
+        let model = Qwen3Model::from_pretrained_with_options(model_dir, runtime_options)?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| RsinferError::TokenizerError(e.to_string()))?;

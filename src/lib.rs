@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod error;
 pub mod model;
+pub mod runtime;
 pub mod tensor;
 
 pub use error::{Result, RsinferError};

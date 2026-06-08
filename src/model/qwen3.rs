@@ -9,6 +9,7 @@ use crate::error::{Result, RsinferError};
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
 use crate::model::weights::{get_weight, load_weights, WeightMap};
+use crate::runtime::{build_runtime_plan, RuntimeOptions, RuntimePlan};
 use crate::tensor::Tensor;
 
 pub struct Qwen3Model {
@@ -17,17 +18,34 @@ pub struct Qwen3Model {
     pub layers: Vec<TransformerBlock>,
     pub norm: RmsNorm,
     pub lm_head: Linear,
+    pub runtime_plan: RuntimePlan,
 }
 
 impl Qwen3Model {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
+        Self::from_pretrained_with_options(model_dir, &RuntimeOptions::default())
+    }
+
+    pub fn from_pretrained_with_options<P: AsRef<Path>>(
+        model_dir: P,
+        runtime_options: &RuntimeOptions,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let config = Qwen3Config::from_file(model_dir.join("config.json"))?;
         let weights = load_weights(model_dir)?;
-        Self::from_weights(&config, &weights)
+        Self::from_weights_with_options(&config, &weights, runtime_options)
     }
 
     pub fn from_weights(config: &Qwen3Config, weights: &WeightMap) -> Result<Self> {
+        Self::from_weights_with_options(config, weights, &RuntimeOptions::default())
+    }
+
+    pub fn from_weights_with_options(
+        config: &Qwen3Config,
+        weights: &WeightMap,
+        runtime_options: &RuntimeOptions,
+    ) -> Result<Self> {
+        let runtime_plan = build_runtime_plan(config, runtime_options);
         let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -59,6 +77,7 @@ impl Qwen3Model {
             layers,
             norm,
             lm_head,
+            runtime_plan,
         })
     }
 

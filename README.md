@@ -3,7 +3,7 @@
 [![CI](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-用 Rust 从零写的极简大模型推理引擎（crate 名 `rsinfer`），纯 CPU，专门适配微调的 **Qwen3-4B-Thinking** 模型，服务于 SafetyRAISE 系统。
+用 Rust 从零写的极简大模型推理引擎（crate 名 `rsinfer`），默认 CPU 执行，专门适配微调的 **Qwen3-4B-Thinking** 模型，服务于 SafetyRAISE 系统。
 
 定位是学习/练手项目：把 Transformer 推理的每一环（权重加载、张量算子、注意力、KV cache、采样、生成循环）都用可读的 Rust 实现一遍。要追求生产级速度请用 llama.cpp。
 
@@ -60,8 +60,12 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 | `--top-p` / `--top-k` | 核采样 / top-k | 0.95 / 20 |
 | `-i, --interactive` | 交互模式 | 关 |
 | `-v, --verbose` | 打印 prompt 与耗时 | 关 |
+| `--device` | 运行时设备规划：`cpu` / `auto` / `hybrid` | `cpu` |
+| `--gpu-layers` | 计划放到 GPU 的 Transformer 层数 | 自动估计或 0 |
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
+
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。当前 GPU kernel 尚未接入，实际计算仍走 CPU kernel，输出中的 `runtime.compute_backend` 会明确标注为 `cpu-execution-with-planned-gpu-placement`，不会把规划误报成 GPU 加速。
 
 ## 代码结构
 
@@ -70,15 +74,16 @@ src/
 ├── tensor/    张量与数学算子 (matmul, rmsnorm, rope, attention, silu)
 ├── model/     config 解析 / safetensors 加载 / Transformer 层 / 模型组装
 ├── engine/    KV cache / 采样器 / 生成循环
+├── runtime.rs 设备探测与 CPU/GPU 分层规划
 └── main.rs    CLI 与交互式对话
 ```
 
 ## 已知限制与后续方向
 
-- 纯 CPU、f32 计算（权重以 f16 存储省内存带宽），4B 模型约 2–3 tokens/s。
+- 当前执行 kernel 仍为 CPU、f32 计算（权重以 f16 存储省内存带宽），4B 模型约 2–3 tokens/s。
 - 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
 - KV cache 用简单拼接（短序列下非瓶颈）。
-- 不支持 GPU；要 GPU 推理请用 llama.cpp + 量化 GGUF。
+- 已有 GPU/CPU 运行时规划入口，但还没有真实 GPU 线性层/注意力 kernel；要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 
 ## 许可证
 

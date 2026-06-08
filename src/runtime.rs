@@ -1,0 +1,315 @@
+//! 运行时设备规划。
+//!
+//! 当前计算内核仍是 CPU 路径；本模块只负责把 CPU/GPU 混合推理的选择、
+//! GPU 探测和层放置计划固定下来，避免后续接 GPU kernel 时改动 CLI/API。
+
+use std::fmt;
+use std::process::Command;
+
+use crate::model::Qwen3Config;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevicePreference {
+    Cpu,
+    Auto,
+    Hybrid,
+}
+
+impl DevicePreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Auto => "auto",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayerDevice {
+    Cpu,
+    Gpu,
+}
+
+impl fmt::Display for LayerDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("CPU"),
+            Self::Gpu => f.write_str("GPU"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeOptions {
+    pub device: DevicePreference,
+    pub gpu_layers: Option<usize>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            device: DevicePreference::Cpu,
+            gpu_layers: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuInfo {
+    pub name: String,
+    pub memory_total_mib: Option<usize>,
+    pub driver_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePlan {
+    pub requested_device: DevicePreference,
+    pub compute_backend: String,
+    pub gpu: Option<GpuInfo>,
+    pub layer_devices: Vec<LayerDevice>,
+    pub notes: Vec<String>,
+}
+
+impl RuntimePlan {
+    pub fn cpu_only(num_layers: usize, requested_device: DevicePreference, note: String) -> Self {
+        Self {
+            requested_device,
+            compute_backend: "cpu".to_string(),
+            gpu: None,
+            layer_devices: vec![LayerDevice::Cpu; num_layers],
+            notes: vec![note],
+        }
+    }
+
+    pub fn gpu_layer_count(&self) -> usize {
+        self.layer_devices
+            .iter()
+            .filter(|&&device| device == LayerDevice::Gpu)
+            .count()
+    }
+}
+
+impl fmt::Display for RuntimePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "runtime.device: {}", self.requested_device.as_str())?;
+        writeln!(f, "runtime.compute_backend: {}", self.compute_backend)?;
+        if let Some(gpu) = &self.gpu {
+            write!(f, "runtime.gpu: {}", gpu.name)?;
+            if let Some(memory) = gpu.memory_total_mib {
+                write!(f, " ({memory} MiB)")?;
+            }
+            if let Some(driver) = &gpu.driver_version {
+                write!(f, ", driver {driver}")?;
+            }
+            writeln!(f)?;
+        } else {
+            writeln!(f, "runtime.gpu: none")?;
+        }
+        writeln!(
+            f,
+            "runtime.layers: {} GPU / {} CPU",
+            self.gpu_layer_count(),
+            self.layer_devices
+                .len()
+                .saturating_sub(self.gpu_layer_count())
+        )?;
+        for note in &self.notes {
+            writeln!(f, "runtime.note: {note}")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> RuntimePlan {
+    match options.device {
+        DevicePreference::Cpu => RuntimePlan::cpu_only(
+            config.num_hidden_layers,
+            DevicePreference::Cpu,
+            "CPU-only execution selected; no GPU probing performed.".to_string(),
+        ),
+        DevicePreference::Auto | DevicePreference::Hybrid => {
+            let gpu = detect_nvidia_gpu();
+            let Some(gpu) = gpu else {
+                return RuntimePlan::cpu_only(
+                    config.num_hidden_layers,
+                    options.device,
+                    "No NVIDIA GPU was detected through nvidia-smi; falling back to CPU execution."
+                        .to_string(),
+                );
+            };
+
+            let requested = options
+                .gpu_layers
+                .unwrap_or_else(|| estimate_gpu_layers(config, &gpu));
+            let gpu_layers = requested.min(config.num_hidden_layers);
+            let mut layer_devices = vec![LayerDevice::Cpu; config.num_hidden_layers];
+            for device in layer_devices.iter_mut().take(gpu_layers) {
+                *device = LayerDevice::Gpu;
+            }
+
+            let mut notes = vec![
+                "GPU kernels are not implemented yet; current inference still executes with CPU kernels."
+                    .to_string(),
+                "Layer placement is a forward-compatible plan for the upcoming GPU linear/attention kernels."
+                    .to_string(),
+            ];
+            if requested > config.num_hidden_layers {
+                notes.push(format!(
+                    "--gpu-layers requested {requested}, clamped to {} transformer layers.",
+                    config.num_hidden_layers
+                ));
+            }
+            if options.gpu_layers.is_none() {
+                notes.push("GPU layer count was estimated from visible GPU memory.".to_string());
+            }
+
+            RuntimePlan {
+                requested_device: options.device,
+                compute_backend: "cpu-execution-with-planned-gpu-placement".to_string(),
+                gpu: Some(gpu),
+                layer_devices,
+                notes,
+            }
+        }
+    }
+}
+
+fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
+    let Some(memory_mib) = gpu.memory_total_mib else {
+        return 0;
+    };
+    if memory_mib < 4096 {
+        return 0;
+    }
+
+    let reserve_mib = 1536usize;
+    let usable_mib = memory_mib.saturating_sub(reserve_mib);
+    let bytes_per_layer = estimate_transformer_layer_bytes(config);
+    if bytes_per_layer == 0 {
+        return 0;
+    }
+
+    let fit = (usable_mib * 1024 * 1024) / bytes_per_layer;
+    fit.min(config.num_hidden_layers)
+}
+
+fn estimate_transformer_layer_bytes(config: &Qwen3Config) -> usize {
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let kv_hidden = config.num_key_value_heads * config.head_dim();
+
+    let q_proj = hidden * hidden;
+    let k_proj = kv_hidden * hidden;
+    let v_proj = kv_hidden * hidden;
+    let o_proj = hidden * hidden;
+    let gate_proj = intermediate * hidden;
+    let up_proj = intermediate * hidden;
+    let down_proj = hidden * intermediate;
+
+    (q_proj + k_proj + v_proj + o_proj + gate_proj + up_proj + down_proj) * 2
+}
+
+fn detect_nvidia_gpu() -> Option<GpuInfo> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(parse_nvidia_smi_line)
+}
+
+fn parse_nvidia_smi_line(line: &str) -> Option<GpuInfo> {
+    let mut fields = line.split(',').map(str::trim);
+    let name = fields.next()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let memory_total_mib = fields.next().and_then(|value| value.parse().ok());
+    let driver_version = fields
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(GpuInfo {
+        name,
+        memory_total_mib,
+        driver_version,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 256,
+            intermediate_size: 512,
+            num_hidden_layers: 4,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            explicit_head_dim: Some(32),
+            vocab_size: 1024,
+            max_position_embeddings: 2048,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            model_type: "qwen3".to_string(),
+            torch_dtype: "float16".to_string(),
+            tie_word_embeddings: true,
+            eos_token_id: 151645,
+            bos_token_id: None,
+        }
+    }
+
+    #[test]
+    fn cpu_plan_never_probes_gpu() {
+        let plan = build_runtime_plan(&test_config(), &RuntimeOptions::default());
+        assert_eq!(plan.compute_backend, "cpu");
+        assert_eq!(plan.gpu_layer_count(), 0);
+        assert!(plan.layer_devices.iter().all(|&d| d == LayerDevice::Cpu));
+    }
+
+    #[test]
+    fn nvidia_smi_parser_accepts_first_gpu_line() {
+        let gpu =
+            parse_nvidia_smi_line("NVIDIA GeForce RTX 4060 Laptop GPU, 8188, 595.79").unwrap();
+        assert_eq!(gpu.name, "NVIDIA GeForce RTX 4060 Laptop GPU");
+        assert_eq!(gpu.memory_total_mib, Some(8188));
+        assert_eq!(gpu.driver_version.as_deref(), Some("595.79"));
+    }
+
+    #[test]
+    fn runtime_plan_display_is_honest_about_cpu_execution() {
+        let config = test_config();
+        let gpu = GpuInfo {
+            name: "Test GPU".to_string(),
+            memory_total_mib: Some(8192),
+            driver_version: Some("1.0".to_string()),
+        };
+        let layers = estimate_gpu_layers(&config, &gpu);
+        assert!(layers <= config.num_hidden_layers);
+
+        let text = RuntimePlan {
+            requested_device: DevicePreference::Hybrid,
+            compute_backend: "cpu-execution-with-planned-gpu-placement".to_string(),
+            gpu: Some(gpu),
+            layer_devices: vec![
+                LayerDevice::Gpu,
+                LayerDevice::Gpu,
+                LayerDevice::Cpu,
+                LayerDevice::Cpu,
+            ],
+            notes: vec!["GPU kernels are not implemented yet.".to_string()],
+        }
+        .to_string();
+        assert!(text.contains("cpu-execution-with-planned-gpu-placement"));
+        assert!(text.contains("2 GPU / 2 CPU"));
+    }
+}
