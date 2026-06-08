@@ -65,7 +65,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
-`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。当前 GPU kernel 尚未接入，实际计算仍走 CPU kernel，输出中的 `runtime.compute_backend` 会明确标注为 `cpu-execution-with-planned-gpu-placement`，不会把规划误报成 GPU 加速。
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。当前 Transformer 层仍走 CPU kernel；`lm_head` 已可选用 wgpu 做 GPU matvec，输出中的 `runtime.lm_head` 会标明 `GPU` 或 `CPU` fallback。尚未接入的 Transformer 层规划不会被误报成加速。
 
 ## 代码结构
 
@@ -80,10 +80,10 @@ src/
 
 ## 已知限制与后续方向
 
-- 当前执行 kernel 仍为 CPU、f32 计算（权重以 f16 存储省内存带宽），4B 模型约 2–3 tokens/s。
+- 当前 Transformer 执行 kernel 仍为 CPU、f32 计算（权重以 f16 存储省内存带宽）；`lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
 - 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
 - KV cache 用简单拼接（短序列下非瓶颈）。
-- 已有 GPU/CPU 运行时规划入口，但还没有真实 GPU 线性层/注意力 kernel；要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
+- 已有 GPU/CPU 运行时规划入口和 `lm_head` GPU matvec；还没有 Transformer 线性层/注意力 GPU kernel。要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 
 ## 许可证
 

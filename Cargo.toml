@@ -17,6 +17,9 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rayon = "1"
+wgpu = "29.0.3"
+pollster = "0.4.0"
+bytemuck = "1.25.0"
 
 [profile.release]
 opt-level = 3

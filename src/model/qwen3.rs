@@ -45,7 +45,7 @@ impl Qwen3Model {
         weights: &WeightMap,
         runtime_options: &RuntimeOptions,
     ) -> Result<Self> {
-        let runtime_plan = build_runtime_plan(config, runtime_options);
+        let mut runtime_plan = build_runtime_plan(config, runtime_options);
         let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -59,7 +59,7 @@ impl Qwen3Model {
         );
 
         // tie_word_embeddings 时 lm_head 复用 embedding 权重
-        let lm_head = match Linear::from_weight_map(weights, "lm_head.weight", None) {
+        let mut lm_head = match Linear::from_weight_map(weights, "lm_head.weight", None) {
             Ok(linear) => linear,
             Err(_) if config.tie_word_embeddings => {
                 Linear::from_weight_map(weights, "model.embed_tokens.weight", None)?
@@ -70,6 +70,13 @@ impl Qwen3Model {
                 ))
             }
         };
+        if runtime_plan.should_try_lm_head_gpu() {
+            match lm_head.try_enable_gpu_matvec() {
+                Ok(()) if lm_head.has_gpu_matvec() => runtime_plan.mark_lm_head_gpu(),
+                Ok(()) => runtime_plan.mark_lm_head_gpu_fallback("backend was not attached"),
+                Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
+            }
+        }
 
         Ok(Self {
             config: config.clone(),

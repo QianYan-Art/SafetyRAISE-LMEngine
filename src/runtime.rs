@@ -68,6 +68,7 @@ pub struct RuntimePlan {
     pub compute_backend: String,
     pub gpu: Option<GpuInfo>,
     pub layer_devices: Vec<LayerDevice>,
+    pub lm_head_device: LayerDevice,
     pub notes: Vec<String>,
 }
 
@@ -78,6 +79,7 @@ impl RuntimePlan {
             compute_backend: "cpu".to_string(),
             gpu: None,
             layer_devices: vec![LayerDevice::Cpu; num_layers],
+            lm_head_device: LayerDevice::Cpu,
             notes: vec![note],
         }
     }
@@ -114,6 +116,7 @@ impl fmt::Display for RuntimePlan {
                 .len()
                 .saturating_sub(self.gpu_layer_count())
         )?;
+        writeln!(f, "runtime.lm_head: {}", self.lm_head_device)?;
         for note in &self.notes {
             writeln!(f, "runtime.note: {note}")?;
         }
@@ -149,7 +152,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             }
 
             let mut notes = vec![
-                "GPU kernels are not implemented yet; current inference still executes with CPU kernels."
+                "Transformer layer GPU kernels are not implemented yet; planned layer placement is not active acceleration."
                     .to_string(),
                 "Layer placement is a forward-compatible plan for the upcoming GPU linear/attention kernels."
                     .to_string(),
@@ -169,9 +172,31 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 compute_backend: "cpu-execution-with-planned-gpu-placement".to_string(),
                 gpu: Some(gpu),
                 layer_devices,
+                lm_head_device: LayerDevice::Cpu,
                 notes,
             }
         }
+    }
+}
+
+impl RuntimePlan {
+    pub fn mark_lm_head_gpu(&mut self) {
+        self.lm_head_device = LayerDevice::Gpu;
+        self.compute_backend = "cpu-transformer-gpu-lm-head".to_string();
+        self.notes
+            .push("lm_head matvec is using the optional wgpu backend.".to_string());
+    }
+
+    pub fn mark_lm_head_gpu_fallback(&mut self, reason: impl Into<String>) {
+        self.lm_head_device = LayerDevice::Cpu;
+        self.notes.push(format!(
+            "lm_head GPU backend unavailable; using CPU fallback: {}",
+            reason.into()
+        ));
+    }
+
+    pub fn should_try_lm_head_gpu(&self) -> bool {
+        self.requested_device != DevicePreference::Cpu && self.gpu.is_some()
     }
 }
 
@@ -306,6 +331,7 @@ mod tests {
                 LayerDevice::Cpu,
                 LayerDevice::Cpu,
             ],
+            lm_head_device: LayerDevice::Cpu,
             notes: vec!["GPU kernels are not implemented yet.".to_string()],
         }
         .to_string();

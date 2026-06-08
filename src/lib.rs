@@ -4,6 +4,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod gpu;
 pub mod model;
 pub mod runtime;
 pub mod tensor;

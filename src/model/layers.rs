@@ -6,6 +6,7 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
+use crate::gpu::GpuMatVec;
 use crate::model::config::Qwen3Config;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
@@ -37,6 +38,7 @@ pub struct Linear {
     pub out_features: usize,
     pub in_features: usize,
     pub bias: Option<Tensor>,
+    gpu_matvec: Option<GpuMatVec>,
 }
 
 impl Linear {
@@ -54,6 +56,7 @@ impl Linear {
             out_features,
             in_features,
             bias,
+            gpu_matvec: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl Linear {
             out_features,
             in_features,
             bias,
+            gpu_matvec: None,
         })
     }
 
@@ -89,10 +93,29 @@ impl Linear {
         Self::from_f16_weight(&shape, weight, bias)
     }
 
+    pub fn try_enable_gpu_matvec(&mut self) -> std::result::Result<(), String> {
+        let accelerator =
+            GpuMatVec::from_f16_weight(&self.weight, self.out_features, self.in_features)?;
+        self.gpu_matvec = Some(accelerator);
+        Ok(())
+    }
+
+    pub fn has_gpu_matvec(&self) -> bool {
+        self.gpu_matvec.is_some()
+    }
+
     /// 前向传播: x @ W^T + b
     ///
     /// x: [batch, in_features] -> result: [batch, out_features]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.bias.is_none() {
+            if let Some(gpu_matvec) = &self.gpu_matvec {
+                if let Ok(result) = gpu_matvec.forward(x) {
+                    return Ok(result);
+                }
+            }
+        }
+
         let result = linear_forward_f16(x, &self.weight, self.out_features, self.in_features)?;
 
         if let Some(bias) = &self.bias {
