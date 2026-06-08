@@ -223,7 +223,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             if options.gpu_layers.is_none() {
                 if options.quantization == QuantizationMode::Q8 {
                     notes.push(
-                        "Q8 hybrid defaults transformer decode GPU layers to 0 because local token profiling showed partial transformer offload slower than CPU Q8 for this backend; pass --gpu-layers to override."
+                        "Q8 hybrid defaults transformer decode GPU layers to 0 because partial transformer offload remains workload-sensitive for this backend; pass --gpu-layers to enable explicit GPU+CPU decode testing."
                             .to_string(),
                     );
                 } else {

@@ -81,21 +81,44 @@ fn unpack_i8(word: u32, lane: u32) -> i32 {
     return signed;
 }
 
+var<workgroup> partial_sum: array<f32, 64>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let out_idx = id.x;
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {
+    let out_idx = workgroup_id.x;
     if (out_idx >= params.out_features) {
         return;
     }
 
     var sum = 0.0;
     let base = out_idx * params.words_per_row;
-    for (var i = 0u; i < params.in_features; i = i + 1u) {
+    let lane = local_id.x;
+    for (var i = lane; i < params.in_features; i = i + 64u) {
         let word = qweight[base + (i / 4u)];
         let q = unpack_i8(word, i & 3u);
         sum = sum + input[i] * f32(q);
     }
-    output[out_idx] = sum * scales[out_idx];
+    partial_sum[lane] = sum;
+    workgroupBarrier();
+
+    var stride = 32u;
+    loop {
+        if (lane < stride) {
+            partial_sum[lane] = partial_sum[lane] + partial_sum[lane + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+        output[out_idx] = partial_sum[0] * scales[out_idx];
+    }
 }
 "#;
 
@@ -923,8 +946,7 @@ impl GpuQ8MatVec {
                     });
                     pass.set_pipeline(&first.context.inner.q8_matvec_pipeline);
                     pass.set_bind_group(0, &chunk.bind_group, &[]);
-                    let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
-                    pass.dispatch_workgroups(workgroups, 1, 1);
+                    pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
                 }
                 encoder.copy_buffer_to_buffer(
                     &chunk.output_buffer,
@@ -1097,8 +1119,7 @@ impl GpuQ8SameInputBatch {
                     });
                     pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
                     pass.set_bind_group(0, &self.bind_groups[matvec_idx][chunk_idx], &[]);
-                    let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
-                    pass.dispatch_workgroups(workgroups, 1, 1);
+                    pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
                 }
                 encoder.copy_buffer_to_buffer(
                     &chunk.output_buffer,
@@ -1385,8 +1406,7 @@ impl GpuQ8SwiGluDown {
                 });
                 pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
                 pass.set_bind_group(0, &chunk.bind_group, &[]);
-                let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
-                pass.dispatch_workgroups(workgroups, 1, 1);
+                pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
             }
         }
         for cached in &self.bind_groups {
@@ -1407,8 +1427,7 @@ impl GpuQ8SwiGluDown {
                 });
                 pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
                 pass.set_bind_group(0, &chunk.bind_group, &[]);
-                let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
-                pass.dispatch_workgroups(workgroups, 1, 1);
+                pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
             }
             encoder.copy_buffer_to_buffer(
                 &chunk.output_buffer,
