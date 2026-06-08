@@ -6,7 +6,7 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::{GpuContext, GpuMatVec, GpuQ8MatVec, GpuSwiGluDown};
+use crate::gpu::{GpuContext, GpuMatVec, GpuQ8MatVec, GpuQ8SwiGluDown, GpuSwiGluDown};
 use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
@@ -133,6 +133,10 @@ impl Linear {
 
     pub fn gpu_matvec(&self) -> Option<&GpuMatVec> {
         self.gpu_matvec.as_ref()
+    }
+
+    pub fn q8_gpu_matvec(&self) -> Option<&GpuQ8MatVec> {
+        self.q8_gpu_matvec.as_ref()
     }
 
     pub fn try_enable_q8_gpu_matvec_with_context(
@@ -406,6 +410,7 @@ pub struct Mlp {
     pub up_proj: Linear,
     pub down_proj: Linear,
     gpu_swiglu_down: Option<GpuSwiGluDown>,
+    q8_gpu_swiglu_down: Option<GpuQ8SwiGluDown>,
 }
 
 impl Mlp {
@@ -415,11 +420,23 @@ impl Mlp {
             up_proj,
             down_proj,
             gpu_swiglu_down: None,
+            q8_gpu_swiglu_down: None,
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if x.shape()[0] == 1 {
+            if let (Some(gate_proj), Some(up_proj), Some(down_proj)) = (
+                self.gate_proj.q8_gpu_matvec(),
+                self.up_proj.q8_gpu_matvec(),
+                self.down_proj.q8_gpu_matvec(),
+            ) {
+                if let Some(fused) = &self.q8_gpu_swiglu_down {
+                    if let Ok(output) = fused.forward(gate_proj, up_proj, down_proj, x) {
+                        return Ok(output);
+                    }
+                }
+            }
             if let (Some(gate_proj), Some(up_proj), Some(down_proj)) = (
                 self.gate_proj.gpu_matvec(),
                 self.up_proj.gpu_matvec(),
@@ -515,6 +532,22 @@ impl Mlp {
                 Err(err) => errors.push(format!("mlp.{name}.q8_gpu: {err}")),
             }
         }
+        self.q8_gpu_swiglu_down = match (
+            self.gate_proj.q8_gpu_matvec(),
+            self.up_proj.q8_gpu_matvec(),
+            self.down_proj.q8_gpu_matvec(),
+        ) {
+            (Some(gate_proj), Some(up_proj), Some(down_proj)) => {
+                match GpuQ8SwiGluDown::new(gate_proj, up_proj, down_proj) {
+                    Ok(fused) => Some(fused),
+                    Err(err) => {
+                        errors.push(format!("mlp.q8_swiglu_down: {err}"));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         (attached, errors)
     }
 }

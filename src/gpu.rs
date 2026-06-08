@@ -170,6 +170,12 @@ pub struct GpuSwiGluDown {
     _params_buffers: Vec<wgpu::Buffer>,
 }
 
+pub struct GpuQ8SwiGluDown {
+    context: GpuContext,
+    bind_groups: Vec<GpuSwiGluBindGroup>,
+    _params_buffers: Vec<wgpu::Buffer>,
+}
+
 struct GpuSwiGluBindGroup {
     bind_group: wgpu::BindGroup,
     out_features: usize,
@@ -846,6 +852,156 @@ impl GpuSwiGluDown {
     }
 }
 
+impl GpuQ8SwiGluDown {
+    pub fn new(gate: &GpuQ8MatVec, up: &GpuQ8MatVec, down: &GpuQ8MatVec) -> Result<Self, String> {
+        validate_q8_swiglu_down_matvecs(gate, up, down)?;
+
+        let device = &gate.context.inner.device;
+        let mut bind_groups = Vec::with_capacity(gate.chunks.len());
+        let mut params_buffers = Vec::with_capacity(gate.chunks.len());
+        for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
+            let params = [
+                gate_chunk.out_offset as u32,
+                gate_chunk.out_features as u32,
+                0_u32,
+                0_u32,
+            ];
+            let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rsinfer-q8-swiglu-params"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rsinfer-q8-swiglu-bind-group"),
+                layout: &gate.context.inner.swiglu_bind_group_layout,
+                entries: &[
+                    buffer_entry(0, &gate_chunk.output_buffer),
+                    buffer_entry(1, &up_chunk.output_buffer),
+                    buffer_entry(2, &down.input_buffer),
+                    buffer_entry(3, &params_buffer),
+                ],
+            });
+            params_buffers.push(params_buffer);
+            bind_groups.push(GpuSwiGluBindGroup {
+                bind_group,
+                out_features: gate_chunk.out_features,
+            });
+        }
+
+        Ok(Self {
+            context: gate.context.clone(),
+            bind_groups,
+            _params_buffers: params_buffers,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        gate: &GpuQ8MatVec,
+        up: &GpuQ8MatVec,
+        down: &GpuQ8MatVec,
+        x: &Tensor,
+    ) -> Result<Tensor, String> {
+        validate_q8_swiglu_down_inputs(gate, up, down, x)?;
+        if !Arc::ptr_eq(&self.context.inner, &gate.context.inner) {
+            return Err(
+                "GPU Q8 fused MLP cached resources require the original GpuContext".to_string(),
+            );
+        }
+
+        let x_std = x.data.as_standard_layout();
+        let input = x_std
+            .as_slice()
+            .ok_or_else(|| "GPU Q8 fused MLP input is not contiguous".to_string())?;
+        for matvec in [gate, up] {
+            matvec.context.inner.queue.write_buffer(
+                &matvec.input_buffer,
+                0,
+                bytemuck::cast_slice(input),
+            );
+        }
+
+        let device = &self.context.inner.device;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rsinfer-q8-fused-mlp-encoder"),
+        });
+        for matvec in [gate, up] {
+            for chunk in &matvec.chunks {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rsinfer-q8-fused-mlp-gate-up-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+                pass.set_bind_group(0, &chunk.bind_group, &[]);
+                let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+        }
+        for cached in &self.bind_groups {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-q8-swiglu-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&gate.context.inner.swiglu_pipeline);
+            pass.set_bind_group(0, &cached.bind_group, &[]);
+            let workgroups = (cached.out_features as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        for chunk in &down.chunks {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rsinfer-q8-fused-mlp-down-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+                pass.set_bind_group(0, &chunk.bind_group, &[]);
+                let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &chunk.output_buffer,
+                0,
+                &chunk.readback_buffer,
+                0,
+                bytes_len(chunk.out_features),
+            );
+        }
+        gate.context.inner.queue.submit(Some(encoder.finish()));
+
+        let mut receivers = Vec::new();
+        for (chunk_idx, chunk) in down.chunks.iter().enumerate() {
+            let slice = chunk.readback_buffer.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send((chunk_idx, result.map_err(|e| e.to_string())));
+            });
+            receivers.push(rx);
+        }
+        gate.context
+            .inner
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("device poll failed: {e}"))?;
+
+        for rx in receivers {
+            let (_, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
+            result?;
+        }
+
+        let mut output = vec![0f32; down.out_features];
+        for chunk in &down.chunks {
+            let slice = chunk.readback_buffer.slice(..);
+            let mapped = slice.get_mapped_range();
+            let values = bytemuck::cast_slice::<u8, f32>(&mapped);
+            output[chunk.out_offset..chunk.out_offset + chunk.out_features].copy_from_slice(values);
+            drop(mapped);
+            chunk.readback_buffer.unmap();
+        }
+
+        Tensor::from_f32_slice(&[1, down.out_features], &output).map_err(|e| e.to_string())
+    }
+}
+
 fn validate_swiglu_down_matvecs(
     gate: &GpuMatVec,
     up: &GpuMatVec,
@@ -895,6 +1051,62 @@ fn validate_swiglu_down_inputs(
     if x.ndim() != 2 || x.shape() != [1, gate.in_features] {
         return Err(format!(
             "GPU fused MLP expects [1, {}], got {:?}",
+            gate.in_features,
+            x.shape()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_q8_swiglu_down_matvecs(
+    gate: &GpuQ8MatVec,
+    up: &GpuQ8MatVec,
+    down: &GpuQ8MatVec,
+) -> Result<(), String> {
+    if gate.in_features != up.in_features {
+        return Err("GPU Q8 fused MLP requires gate/up input width to match".to_string());
+    }
+    if gate.out_features != up.out_features || gate.out_features != down.in_features {
+        return Err(format!(
+            "GPU Q8 fused MLP shape mismatch: gate {}, up {}, down input {}",
+            gate.out_features, up.out_features, down.in_features
+        ));
+    }
+    if gate.chunks.iter().zip(&up.chunks).count() != gate.chunks.len()
+        || gate.chunks.len() != up.chunks.len()
+    {
+        return Err("GPU Q8 fused MLP requires gate/up chunk count to match".to_string());
+    }
+    for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
+        if gate_chunk.out_offset != up_chunk.out_offset
+            || gate_chunk.out_features != up_chunk.out_features
+        {
+            return Err("GPU Q8 fused MLP requires gate/up chunk layout to match".to_string());
+        }
+        if gate_chunk.out_offset > u32::MAX as usize || gate_chunk.out_features > u32::MAX as usize
+        {
+            return Err("GPU Q8 fused MLP chunk is too large for u32 shader params".to_string());
+        }
+    }
+    if [&up, &down]
+        .iter()
+        .any(|matvec| !Arc::ptr_eq(&matvec.context.inner, &gate.context.inner))
+    {
+        return Err("GPU Q8 fused MLP requires a shared GpuContext".to_string());
+    }
+    Ok(())
+}
+
+fn validate_q8_swiglu_down_inputs(
+    gate: &GpuQ8MatVec,
+    up: &GpuQ8MatVec,
+    down: &GpuQ8MatVec,
+    x: &Tensor,
+) -> Result<(), String> {
+    validate_q8_swiglu_down_matvecs(gate, up, down)?;
+    if x.ndim() != 2 || x.shape() != [1, gate.in_features] {
+        return Err(format!(
+            "GPU Q8 fused MLP expects [1, {}], got {:?}",
             gate.in_features,
             x.shape()
         ));
@@ -1256,6 +1468,56 @@ mod tests {
         let down_gpu =
             GpuMatVec::from_f16_weight_with_context(&context, &down_weight, 2, 3).unwrap();
         let fused = GpuSwiGluDown::new(&gate_gpu, &up_gpu, &down_gpu).unwrap();
+        let got = fused.forward(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
+
+        for (expected, actual) in cpu.as_slice().iter().zip(got.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+    }
+
+    #[test]
+    fn q8_fused_swiglu_down_matches_cpu_q8_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("fused GPU Q8 MLP test skipped: no usable wgpu adapter");
+            return;
+        };
+        let gate_weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let up_weight = [
+            f16::from_f32(1.0),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.5),
+            f16::from_f32(0.75),
+            f16::from_f32(1.25),
+            f16::from_f32(-1.0),
+        ];
+        let down_weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-0.25),
+            f16::from_f32(1.0),
+            f16::from_f32(-1.5),
+            f16::from_f32(0.75),
+            f16::from_f32(0.25),
+        ];
+        let gate_q8 = Q8LinearWeight::from_f16(&gate_weight, 3, 2).unwrap();
+        let up_q8 = Q8LinearWeight::from_f16(&up_weight, 3, 2).unwrap();
+        let down_q8 = Q8LinearWeight::from_f16(&down_weight, 2, 3).unwrap();
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let gate = linear_forward_q8(&x, &gate_q8).unwrap();
+        let up = linear_forward_q8(&x, &up_q8).unwrap();
+        let hidden = silu(&gate).mul(&up).unwrap();
+        let cpu = linear_forward_q8(&hidden, &down_q8).unwrap();
+
+        let gate_gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &gate_q8).unwrap();
+        let up_gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &up_q8).unwrap();
+        let down_gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &down_q8).unwrap();
+        let fused = GpuQ8SwiGluDown::new(&gate_gpu, &up_gpu, &down_gpu).unwrap();
         let got = fused.forward(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
 
         for (expected, actual) in cpu.as_slice().iter().zip(got.as_slice()) {
