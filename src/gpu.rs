@@ -5,7 +5,7 @@
 //! `[out_features, in_features]`。初始化或执行失败时上层会回退 CPU。
 
 use std::borrow::Cow;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use half::f16;
 use wgpu::util::DeviceExt;
@@ -50,10 +50,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-pub struct GpuMatVec {
+#[derive(Clone)]
+pub struct GpuContext {
+    inner: Arc<GpuContextInner>,
+}
+
+struct GpuContextInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    max_chunk_bytes: wgpu::BufferAddress,
+}
+
+pub struct GpuMatVec {
+    context: GpuContext,
     input_buffer: wgpu::Buffer,
     chunks: Vec<GpuMatVecChunk>,
     in_features: usize,
@@ -70,20 +81,8 @@ struct GpuMatVecChunk {
     out_features: usize,
 }
 
-impl GpuMatVec {
-    pub fn from_f16_weight(
-        weight: &[f16],
-        out_features: usize,
-        in_features: usize,
-    ) -> Result<Self, String> {
-        if weight.len() != out_features * in_features {
-            return Err(format!(
-                "GPU matvec weight length mismatch: got {}, expected {}",
-                weight.len(),
-                out_features * in_features
-            ));
-        }
-
+impl GpuContext {
+    pub fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -99,13 +98,6 @@ impl GpuMatVec {
             ..Default::default()
         }))
         .map_err(|e| format!("request_device failed: {e}"))?;
-
-        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rsinfer-lm-head-input"),
-            size: bytes_len(in_features),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rsinfer-lm-head-matvec"),
@@ -142,12 +134,56 @@ impl GpuMatVec {
             compilation_options: Default::default(),
             cache: None,
         });
-
         let limits = device.limits();
         let max_chunk_bytes = limits
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size);
+
+        Ok(Self {
+            inner: Arc::new(GpuContextInner {
+                device,
+                queue,
+                pipeline,
+                bind_group_layout,
+                max_chunk_bytes,
+            }),
+        })
+    }
+}
+
+impl GpuMatVec {
+    pub fn from_f16_weight(
+        weight: &[f16],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<Self, String> {
+        let context = GpuContext::new()?;
+        Self::from_f16_weight_with_context(&context, weight, out_features, in_features)
+    }
+
+    pub fn from_f16_weight_with_context(
+        context: &GpuContext,
+        weight: &[f16],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<Self, String> {
+        if weight.len() != out_features * in_features {
+            return Err(format!(
+                "GPU matvec weight length mismatch: got {}, expected {}",
+                weight.len(),
+                out_features * in_features
+            ));
+        }
+
+        let input_buffer = context.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rsinfer-matvec-input"),
+            size: bytes_len(in_features),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let row_bytes = bytes_len(in_features);
+        let max_chunk_bytes = context.inner.max_chunk_bytes;
         if row_bytes == 0 || row_bytes > max_chunk_bytes {
             return Err(format!(
                 "lm_head row is too large for one GPU storage buffer binding: row={row_bytes}, limit={max_chunk_bytes}"
@@ -159,8 +195,8 @@ impl GpuMatVec {
         while out_offset < out_features {
             let rows = rows_per_chunk.min(out_features - out_offset);
             chunks.push(create_chunk(
-                &device,
-                &bind_group_layout,
+                &context.inner.device,
+                &context.inner.bind_group_layout,
                 &input_buffer,
                 weight,
                 in_features,
@@ -171,9 +207,7 @@ impl GpuMatVec {
         }
 
         Ok(Self {
-            device,
-            queue,
-            pipeline,
+            context: context.clone(),
             input_buffer,
             chunks,
             in_features,
@@ -193,21 +227,25 @@ impl GpuMatVec {
         let input = x_std
             .as_slice()
             .ok_or_else(|| "GPU matvec input is not contiguous".to_string())?;
-        self.queue
+        self.context
+            .inner
+            .queue
             .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(input));
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rsinfer-lm-head-encoder"),
-            });
+        let mut encoder =
+            self.context
+                .inner
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rsinfer-lm-head-encoder"),
+                });
         for chunk in &self.chunks {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("rsinfer-lm-head-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipeline);
+                pass.set_pipeline(&self.context.inner.pipeline);
                 pass.set_bind_group(0, &chunk.bind_group, &[]);
                 let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
                 pass.dispatch_workgroups(workgroups, 1, 1);
@@ -220,7 +258,7 @@ impl GpuMatVec {
                 bytes_len(chunk.out_features),
             );
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.context.inner.queue.submit(Some(encoder.finish()));
 
         let mut receivers = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
@@ -231,7 +269,9 @@ impl GpuMatVec {
             });
             receivers.push(rx);
         }
-        self.device
+        self.context
+            .inner
+            .device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| format!("device poll failed: {e}"))?;
 
@@ -366,5 +406,43 @@ mod tests {
             max_abs <= 1e-4,
             "GPU matvec max abs diff {max_abs} exceeded tolerance"
         );
+    }
+
+    #[test]
+    fn shared_context_can_drive_multiple_matvecs_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("shared GPU context test skipped: no usable wgpu adapter");
+            return;
+        };
+        let weight_a = [
+            f16::from_f32(1.0),
+            f16::from_f32(0.0),
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+        ];
+        let weight_b = [
+            f16::from_f32(-0.25),
+            f16::from_f32(2.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[2.0, -1.0]).unwrap();
+        let cpu_a = linear_forward_f16(&x, &weight_a, 2, 2).unwrap();
+        let cpu_b = linear_forward_f16(&x, &weight_b, 2, 2).unwrap();
+        let gpu_a = GpuMatVec::from_f16_weight_with_context(&context, &weight_a, 2, 2)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let gpu_b = GpuMatVec::from_f16_weight_with_context(&context, &weight_b, 2, 2)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+
+        for (expected, actual) in cpu_a.as_slice().iter().zip(gpu_a.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+        for (expected, actual) in cpu_b.as_slice().iter().zip(gpu_b.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
     }
 }

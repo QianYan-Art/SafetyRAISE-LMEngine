@@ -6,6 +6,7 @@ use ndarray::{s, Array2};
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
+use crate::gpu::GpuContext;
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
 use crate::model::weights::{get_weight, load_weights, WeightMap};
@@ -46,6 +47,18 @@ impl Qwen3Model {
         runtime_options: &RuntimeOptions,
     ) -> Result<Self> {
         let mut runtime_plan = build_runtime_plan(config, runtime_options);
+        let gpu_context = if runtime_plan.should_try_gpu_backend() {
+            match GpuContext::new() {
+                Ok(context) => Some(context),
+                Err(err) => {
+                    runtime_plan.mark_transformer_gpu_fallback(err.clone());
+                    runtime_plan.mark_lm_head_gpu_fallback(err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -53,12 +66,12 @@ impl Qwen3Model {
             layers.push(build_transformer_block(weights, config, layer_idx)?);
         }
         let planned_gpu_layers = runtime_plan.planned_transformer_gpu_layers();
-        if planned_gpu_layers > 0 {
+        if let Some(context) = &gpu_context {
             let mut active_layers = 0usize;
             let mut attached_linears = 0usize;
             let mut fallback_errors = Vec::new();
             for (layer_idx, layer) in layers.iter_mut().enumerate().take(planned_gpu_layers) {
-                let (attached, errors) = layer.try_enable_gpu_matvecs();
+                let (attached, errors) = layer.try_enable_gpu_matvecs(context);
                 if attached > 0 {
                     active_layers += 1;
                     attached_linears += attached;
@@ -90,8 +103,8 @@ impl Qwen3Model {
                 ))
             }
         };
-        if runtime_plan.should_try_lm_head_gpu() {
-            match lm_head.try_enable_gpu_matvec() {
+        if let Some(context) = &gpu_context {
+            match lm_head.try_enable_gpu_matvec_with_context(context) {
                 Ok(()) if lm_head.has_gpu_matvec() => runtime_plan.mark_lm_head_gpu(),
                 Ok(()) => runtime_plan.mark_lm_head_gpu_fallback("backend was not attached"),
                 Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),

@@ -6,7 +6,7 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::GpuMatVec;
+use crate::gpu::{GpuContext, GpuMatVec};
 use crate::model::config::Qwen3Config;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
@@ -100,6 +100,20 @@ impl Linear {
         Ok(())
     }
 
+    pub fn try_enable_gpu_matvec_with_context(
+        &mut self,
+        context: &GpuContext,
+    ) -> std::result::Result<(), String> {
+        let accelerator = GpuMatVec::from_f16_weight_with_context(
+            context,
+            &self.weight,
+            self.out_features,
+            self.in_features,
+        )?;
+        self.gpu_matvec = Some(accelerator);
+        Ok(())
+    }
+
     pub fn has_gpu_matvec(&self) -> bool {
         self.gpu_matvec.is_some()
     }
@@ -145,7 +159,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
+    pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
         let mut attached = 0usize;
         let mut errors = Vec::new();
         for (name, linear) in [
@@ -154,7 +168,7 @@ impl Attention {
             ("v_proj", &mut self.v_proj),
             ("o_proj", &mut self.o_proj),
         ] {
-            match linear.try_enable_gpu_matvec() {
+            match linear.try_enable_gpu_matvec_with_context(context) {
                 Ok(()) => attached += 1,
                 Err(err) => errors.push(format!("attention.{name}: {err}")),
             }
@@ -280,7 +294,7 @@ impl Mlp {
         self.down_proj.forward(&hidden)
     }
 
-    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
+    pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
         let mut attached = 0usize;
         let mut errors = Vec::new();
         for (name, linear) in [
@@ -288,7 +302,7 @@ impl Mlp {
             ("up_proj", &mut self.up_proj),
             ("down_proj", &mut self.down_proj),
         ] {
-            match linear.try_enable_gpu_matvec() {
+            match linear.try_enable_gpu_matvec_with_context(context) {
                 Ok(()) => attached += 1,
                 Err(err) => errors.push(format!("mlp.{name}: {err}")),
             }
@@ -349,9 +363,9 @@ impl TransformerBlock {
         hidden_states.add(&mlp_output)
     }
 
-    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
-        let (attn_count, mut errors) = self.attention.try_enable_gpu_matvecs();
-        let (mlp_count, mlp_errors) = self.mlp.try_enable_gpu_matvecs();
+    pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
+        let (attn_count, mut errors) = self.attention.try_enable_gpu_matvecs(context);
+        let (mlp_count, mlp_errors) = self.mlp.try_enable_gpu_matvecs(context);
         errors.extend(mlp_errors);
         (attn_count + mlp_count, errors)
     }

@@ -216,6 +216,10 @@ impl RuntimePlan {
         self.requested_device != DevicePreference::Cpu && self.gpu.is_some()
     }
 
+    pub fn should_try_gpu_backend(&self) -> bool {
+        self.should_try_lm_head_gpu() || self.planned_transformer_gpu_layers() > 0
+    }
+
     pub fn planned_transformer_gpu_layers(&self) -> usize {
         self.gpu_layer_count()
     }
@@ -225,7 +229,7 @@ impl RuntimePlan {
         self.refresh_compute_backend();
         if active_layers > 0 {
             self.notes.push(format!(
-                "decode matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels; prefill still falls back to CPU."
+                "decode matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; prefill still falls back to CPU."
             ));
         }
     }

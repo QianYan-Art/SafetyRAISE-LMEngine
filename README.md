@@ -65,7 +65,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
-`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层尝试 wgpu GPU matvec；prefill 多 token 仍回退 CPU。`lm_head` 也已可选用 wgpu 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
 
 ## 代码结构
 
