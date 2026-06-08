@@ -709,7 +709,7 @@ impl GpuMatVec {
                 chunk.readback_buffer.unmap();
             }
             outputs.push(
-                Tensor::from_f32_slice(&[1, matvec.out_features], &output)
+                Tensor::from_f32_vec(&[1, matvec.out_features], output)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -995,7 +995,7 @@ impl GpuQ8MatVec {
                 chunk.readback_buffer.unmap();
             }
             outputs.push(
-                Tensor::from_f32_slice(&[1, matvec.out_features], &output)
+                Tensor::from_f32_vec(&[1, matvec.out_features], output)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -1167,7 +1167,7 @@ impl GpuQ8SameInputBatch {
                 chunk.readback_buffer.unmap();
             }
             outputs.push(
-                Tensor::from_f32_slice(&[1, matvec.out_features], &output)
+                Tensor::from_f32_vec(&[1, matvec.out_features], output)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -1321,7 +1321,7 @@ impl GpuSwiGluDown {
             chunk.readback_buffer.unmap();
         }
 
-        Tensor::from_f32_slice(&[1, down.out_features], &output).map_err(|e| e.to_string())
+        Tensor::from_f32_vec(&[1, down.out_features], output).map_err(|e| e.to_string())
     }
 }
 
@@ -1469,7 +1469,7 @@ impl GpuQ8SwiGluDown {
             chunk.readback_buffer.unmap();
         }
 
-        Tensor::from_f32_slice(&[1, down.out_features], &output).map_err(|e| e.to_string())
+        Tensor::from_f32_vec(&[1, down.out_features], output).map_err(|e| e.to_string())
     }
 }
 

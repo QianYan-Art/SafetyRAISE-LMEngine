@@ -30,6 +30,20 @@ impl Tensor {
         Ok(Self { data: array })
     }
 
+    /// 从已拥有的 f32 Vec 和形状创建张量，避免再次复制数据。
+    pub fn from_f32_vec(shape: &[usize], data: Vec<f32>) -> Result<Self> {
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
+            return Err(RsinferError::ShapeMismatch {
+                expected: shape.to_vec(),
+                actual: vec![data.len()],
+            });
+        }
+        let array = ArrayD::from_shape_vec(IxDyn(shape), data)
+            .map_err(|e| RsinferError::DimensionError(e.to_string()))?;
+        Ok(Self { data: array })
+    }
+
     /// 从 f16 字节数据创建张量
     pub fn from_f16_bytes(shape: &[usize], bytes: &[u8]) -> Result<Self> {
         let f32_data = super::f16_bytes_to_f32(bytes);
@@ -228,6 +242,13 @@ mod tests {
         let t = Tensor::from_f32_slice(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(t.shape(), &[2, 3]);
         assert_eq!(t.numel(), 6);
+    }
+
+    #[test]
+    fn test_tensor_creation_from_vec() {
+        let t = Tensor::from_f32_vec(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.as_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
