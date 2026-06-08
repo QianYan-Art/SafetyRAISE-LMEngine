@@ -6,7 +6,7 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::{GpuContext, GpuMatVec};
+use crate::gpu::{GpuContext, GpuMatVec, GpuSwiGluDown};
 use crate::model::config::Qwen3Config;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
@@ -305,6 +305,7 @@ pub struct Mlp {
     pub gate_proj: Linear,
     pub up_proj: Linear,
     pub down_proj: Linear,
+    gpu_swiglu_down: Option<GpuSwiGluDown>,
 }
 
 impl Mlp {
@@ -313,6 +314,7 @@ impl Mlp {
             gate_proj,
             up_proj,
             down_proj,
+            gpu_swiglu_down: None,
         }
     }
 
@@ -323,10 +325,10 @@ impl Mlp {
                 self.up_proj.gpu_matvec(),
                 self.down_proj.gpu_matvec(),
             ) {
-                if let Ok(output) =
-                    GpuMatVec::forward_swiglu_down_same_input(gate_proj, up_proj, down_proj, x)
-                {
-                    return Ok(output);
+                if let Some(fused) = &self.gpu_swiglu_down {
+                    if let Ok(output) = fused.forward(gate_proj, up_proj, down_proj, x) {
+                        return Ok(output);
+                    }
                 }
             }
         }
@@ -366,6 +368,22 @@ impl Mlp {
                 Err(err) => errors.push(format!("mlp.{name}: {err}")),
             }
         }
+        self.gpu_swiglu_down = match (
+            self.gate_proj.gpu_matvec(),
+            self.up_proj.gpu_matvec(),
+            self.down_proj.gpu_matvec(),
+        ) {
+            (Some(gate_proj), Some(up_proj), Some(down_proj)) => {
+                match GpuSwiGluDown::new(gate_proj, up_proj, down_proj) {
+                    Ok(fused) => Some(fused),
+                    Err(err) => {
+                        errors.push(format!("mlp.swiglu_down: {err}"));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         (attached, errors)
     }
 }

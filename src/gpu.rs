@@ -104,6 +104,17 @@ pub struct GpuMatVec {
     out_features: usize,
 }
 
+pub struct GpuSwiGluDown {
+    context: GpuContext,
+    bind_groups: Vec<GpuSwiGluBindGroup>,
+    _params_buffers: Vec<wgpu::Buffer>,
+}
+
+struct GpuSwiGluBindGroup {
+    bind_group: wgpu::BindGroup,
+    out_features: usize,
+}
+
 struct GpuMatVecChunk {
     bind_group: wgpu::BindGroup,
     _weight_buffer: wgpu::Buffer,
@@ -417,29 +428,19 @@ impl GpuMatVec {
         down: &GpuMatVec,
         x: &Tensor,
     ) -> Result<Tensor, String> {
-        validate_swiglu_down_inputs(gate, up, down, x)?;
+        let fused = GpuSwiGluDown::new(gate, up, down)?;
+        fused.forward(gate, up, down, x)
+    }
+}
 
-        let x_std = x.data.as_standard_layout();
-        let input = x_std
-            .as_slice()
-            .ok_or_else(|| "GPU fused MLP input is not contiguous".to_string())?;
-        for matvec in [gate, up] {
-            matvec.context.inner.queue.write_buffer(
-                &matvec.input_buffer,
-                0,
-                bytemuck::cast_slice(input),
-            );
-        }
+impl GpuSwiGluDown {
+    pub fn new(gate: &GpuMatVec, up: &GpuMatVec, down: &GpuMatVec) -> Result<Self, String> {
+        validate_swiglu_down_matvecs(gate, up, down)?;
 
         let device = &gate.context.inner.device;
-        let mut swiglu_bind_groups = Vec::with_capacity(gate.chunks.len());
-        let mut swiglu_params = Vec::with_capacity(gate.chunks.len());
+        let mut bind_groups = Vec::with_capacity(gate.chunks.len());
+        let mut params_buffers = Vec::with_capacity(gate.chunks.len());
         for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
-            if gate_chunk.out_offset != up_chunk.out_offset
-                || gate_chunk.out_features != up_chunk.out_features
-            {
-                return Err("GPU fused MLP requires gate/up chunk layout to match".to_string());
-            }
             let params = [
                 gate_chunk.out_offset as u32,
                 gate_chunk.out_features as u32,
@@ -461,10 +462,47 @@ impl GpuMatVec {
                     buffer_entry(3, &params_buffer),
                 ],
             });
-            swiglu_params.push(params_buffer);
-            swiglu_bind_groups.push((bind_group, gate_chunk.out_features));
+            params_buffers.push(params_buffer);
+            bind_groups.push(GpuSwiGluBindGroup {
+                bind_group,
+                out_features: gate_chunk.out_features,
+            });
         }
 
+        Ok(Self {
+            context: gate.context.clone(),
+            bind_groups,
+            _params_buffers: params_buffers,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        gate: &GpuMatVec,
+        up: &GpuMatVec,
+        down: &GpuMatVec,
+        x: &Tensor,
+    ) -> Result<Tensor, String> {
+        validate_swiglu_down_inputs(gate, up, down, x)?;
+        if !Arc::ptr_eq(&self.context.inner, &gate.context.inner) {
+            return Err(
+                "GPU fused MLP cached resources require the original GpuContext".to_string(),
+            );
+        }
+
+        let x_std = x.data.as_standard_layout();
+        let input = x_std
+            .as_slice()
+            .ok_or_else(|| "GPU fused MLP input is not contiguous".to_string())?;
+        for matvec in [gate, up] {
+            matvec.context.inner.queue.write_buffer(
+                &matvec.input_buffer,
+                0,
+                bytemuck::cast_slice(input),
+            );
+        }
+
+        let device = &self.context.inner.device;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rsinfer-fused-mlp-encoder"),
         });
@@ -480,14 +518,14 @@ impl GpuMatVec {
                 pass.dispatch_workgroups(workgroups, 1, 1);
             }
         }
-        for (bind_group, out_features) in &swiglu_bind_groups {
+        for cached in &self.bind_groups {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rsinfer-swiglu-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&gate.context.inner.swiglu_pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            let workgroups = (*out_features as u32).div_ceil(WORKGROUP_SIZE);
+            pass.set_bind_group(0, &cached.bind_group, &[]);
+            let workgroups = (cached.out_features as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
         for chunk in &down.chunks {
@@ -540,25 +578,16 @@ impl GpuMatVec {
             drop(mapped);
             chunk.readback_buffer.unmap();
         }
-        drop(swiglu_params);
 
         Tensor::from_f32_slice(&[1, down.out_features], &output).map_err(|e| e.to_string())
     }
 }
 
-fn validate_swiglu_down_inputs(
+fn validate_swiglu_down_matvecs(
     gate: &GpuMatVec,
     up: &GpuMatVec,
     down: &GpuMatVec,
-    x: &Tensor,
 ) -> Result<(), String> {
-    if x.ndim() != 2 || x.shape() != [1, gate.in_features] {
-        return Err(format!(
-            "GPU fused MLP expects [1, {}], got {:?}",
-            gate.in_features,
-            x.shape()
-        ));
-    }
     if gate.in_features != up.in_features {
         return Err("GPU fused MLP requires gate/up input width to match".to_string());
     }
@@ -573,11 +602,39 @@ fn validate_swiglu_down_inputs(
     {
         return Err("GPU fused MLP requires gate/up chunk count to match".to_string());
     }
+    for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
+        if gate_chunk.out_offset != up_chunk.out_offset
+            || gate_chunk.out_features != up_chunk.out_features
+        {
+            return Err("GPU fused MLP requires gate/up chunk layout to match".to_string());
+        }
+        if gate_chunk.out_offset > u32::MAX as usize || gate_chunk.out_features > u32::MAX as usize
+        {
+            return Err("GPU fused MLP chunk is too large for u32 shader params".to_string());
+        }
+    }
     if [&up, &down]
         .iter()
         .any(|matvec| !Arc::ptr_eq(&matvec.context.inner, &gate.context.inner))
     {
         return Err("GPU fused MLP requires a shared GpuContext".to_string());
+    }
+    Ok(())
+}
+
+fn validate_swiglu_down_inputs(
+    gate: &GpuMatVec,
+    up: &GpuMatVec,
+    down: &GpuMatVec,
+    x: &Tensor,
+) -> Result<(), String> {
+    validate_swiglu_down_matvecs(gate, up, down)?;
+    if x.ndim() != 2 || x.shape() != [1, gate.in_features] {
+        return Err(format!(
+            "GPU fused MLP expects [1, {}], got {:?}",
+            gate.in_features,
+            x.shape()
+        ));
     }
     Ok(())
 }
@@ -812,8 +869,8 @@ mod tests {
         let up_gpu = GpuMatVec::from_f16_weight_with_context(&context, &up_weight, 3, 2).unwrap();
         let down_gpu =
             GpuMatVec::from_f16_weight_with_context(&context, &down_weight, 2, 3).unwrap();
-        let got =
-            GpuMatVec::forward_swiglu_down_same_input(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
+        let fused = GpuSwiGluDown::new(&gate_gpu, &up_gpu, &down_gpu).unwrap();
+        let got = fused.forward(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
 
         for (expected, actual) in cpu.as_slice().iter().zip(got.as_slice()) {
             assert!((expected - actual).abs() <= 1e-4);
