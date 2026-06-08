@@ -8,6 +8,7 @@ use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
 use crate::gpu::{GpuContext, GpuMatVec, GpuQ8MatVec, GpuSwiGluDown};
 use crate::model::config::Qwen3Config;
+use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
     linear_forward_f16, linear_forward_q8, repeat_kv, rms_norm, rope, scaled_dot_product_attention,
@@ -42,6 +43,7 @@ pub struct Linear {
     gpu_matvec: Option<GpuMatVec>,
     q8_gpu_matvec: Option<GpuQ8MatVec>,
     q8_weight: Option<Q8LinearWeight>,
+    source_name: Option<String>,
 }
 
 impl Linear {
@@ -62,6 +64,7 @@ impl Linear {
             gpu_matvec: None,
             q8_gpu_matvec: None,
             q8_weight: None,
+            source_name: None,
         }
     }
 
@@ -92,12 +95,15 @@ impl Linear {
             gpu_matvec: None,
             q8_gpu_matvec: None,
             q8_weight: None,
+            source_name: None,
         })
     }
 
     pub fn from_weight_map(weights: &WeightMap, name: &str, bias: Option<Tensor>) -> Result<Self> {
         let (shape, weight) = get_linear_weight_f16(weights, name)?;
-        Self::from_f16_weight(&shape, weight, bias)
+        let mut linear = Self::from_f16_weight(&shape, weight, bias)?;
+        linear.source_name = Some(name.to_string());
+        Ok(linear)
     }
 
     pub fn try_enable_gpu_matvec(&mut self) -> std::result::Result<(), String> {
@@ -151,6 +157,24 @@ impl Linear {
         Ok(())
     }
 
+    pub fn try_enable_q8_weight_with_sidecar(
+        &mut self,
+        sidecar: Option<&mut Q8SidecarCache>,
+    ) -> Result<()> {
+        if let (Some(cache), Some(name)) = (sidecar, self.source_name.as_deref()) {
+            match cache.load_or_create(name, self.out_features, self.in_features, || {
+                Q8LinearWeight::from_f16(&self.weight, self.out_features, self.in_features)
+            }) {
+                Ok(q8) => {
+                    self.q8_weight = Some(q8);
+                    return Ok(());
+                }
+                Err(err) => cache.record_fallback(name, err.to_string()),
+            }
+        }
+        self.try_enable_q8_weight()
+    }
+
     /// 前向传播: x @ W^T + b
     ///
     /// x: [batch, in_features] -> result: [batch, out_features]
@@ -202,7 +226,10 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
+    pub fn try_enable_q8_weights(
+        &mut self,
+        mut sidecar: Option<&mut Q8SidecarCache>,
+    ) -> Result<usize> {
         let mut attached = 0usize;
         for linear in [
             &mut self.q_proj,
@@ -210,7 +237,10 @@ impl Attention {
             &mut self.v_proj,
             &mut self.o_proj,
         ] {
-            linear.try_enable_q8_weight()?;
+            match sidecar.as_deref_mut() {
+                Some(cache) => linear.try_enable_q8_weight_with_sidecar(Some(cache))?,
+                None => linear.try_enable_q8_weight_with_sidecar(None)?,
+            }
             attached += 1;
         }
         Ok(attached)
@@ -425,10 +455,16 @@ impl Mlp {
         self.down_proj.forward(&hidden)
     }
 
-    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
+    pub fn try_enable_q8_weights(
+        &mut self,
+        mut sidecar: Option<&mut Q8SidecarCache>,
+    ) -> Result<usize> {
         let mut attached = 0usize;
         for linear in [&mut self.gate_proj, &mut self.up_proj, &mut self.down_proj] {
-            linear.try_enable_q8_weight()?;
+            match sidecar.as_deref_mut() {
+                Some(cache) => linear.try_enable_q8_weight_with_sidecar(Some(cache))?,
+                None => linear.try_enable_q8_weight_with_sidecar(None)?,
+            }
             attached += 1;
         }
         Ok(attached)
@@ -549,8 +585,19 @@ impl TransformerBlock {
         (attn_count + mlp_count, errors)
     }
 
-    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
-        Ok(self.attention.try_enable_q8_weights()? + self.mlp.try_enable_q8_weights()?)
+    pub fn try_enable_q8_weights(&mut self, sidecar: Option<&mut Q8SidecarCache>) -> Result<usize> {
+        let (attention, mlp) = if let Some(cache) = sidecar {
+            (
+                self.attention.try_enable_q8_weights(Some(&mut *cache))?,
+                self.mlp.try_enable_q8_weights(Some(cache))?,
+            )
+        } else {
+            (
+                self.attention.try_enable_q8_weights(None)?,
+                self.mlp.try_enable_q8_weights(None)?,
+            )
+        };
+        Ok(attention + mlp)
     }
 }
 

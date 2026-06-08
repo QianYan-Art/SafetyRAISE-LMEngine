@@ -4,10 +4,12 @@
 
 mod config;
 mod layers;
+mod q8_sidecar;
 mod qwen3;
 mod weights;
 
 pub use config::*;
 pub use layers::*;
+pub use q8_sidecar::*;
 pub use qwen3::*;
 pub use weights::*;

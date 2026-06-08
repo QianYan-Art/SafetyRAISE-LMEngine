@@ -63,12 +63,14 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 | `--device` | 运行时设备规划：`cpu` / `auto` / `hybrid` | `cpu` |
 | `--gpu-layers` | 计划放到 GPU 的 Transformer 层数 | 自动估计或 0 |
 | `--quantization` | 权重量化路径：`none` / `q8` | `none` |
+| `--q8-cache` | Q8 sidecar 缓存：`auto` / `off` | `auto` |
+| `--q8-cache-dir` | Q8 sidecar 目录；默认在模型目录同级创建 `<model>.rsinfer-q8` | — |
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
 `--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
 
-`--quantization q8` 会在 safetensors 权重加载后，为 bias-free 线性层构建行级 Q8 CPU fallback 权重；它不会修改原始模型文件。若同一个线性层已接入 GPU matvec，GPU 路径仍优先，Q8 只作为 CPU 线性 fallback 使用。
+`--quantization q8` 会在 safetensors 权重加载后，为 bias-free 线性层构建行级 Q8 权重；它不会修改原始模型文件。默认 `--q8-cache auto` 会在模型目录同级创建 sidecar 目录（例如 `TS-Qwen3.rsinfer-q8`），后续运行若模型 fingerprint 匹配就直接读取 Q8 sidecar，减少重复量化加载成本。`--q8-cache off` 会关闭 sidecar 并每次在内存中派生 Q8 权重。若同一个线性层已接入 Q8 GPU matvec 或 f16 GPU matvec，GPU 路径仍优先，Q8 CPU linear 是 fallback。
 
 ## 本机基准
 
@@ -98,7 +100,7 @@ src/
 ## 已知限制与后续方向
 
 - 当前 prefill、attention 与 KV cache 仍走 CPU；选中 Transformer 层的 decode 线性 matvec、MLP fused SwiGLU/down 路径与 `lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
-- 无 batch、无 prompt 缓存复用；已支持显式 `--quantization q8` 的行级 Q8 CPU fallback，但完整持久化 sidecar 量化模型生成/加载尚未接入。
+- 无 batch、无 prompt 缓存复用；已支持显式 `--quantization q8` 的行级 Q8 权重、Q8 GPU matvec 原型和只读模型的 sidecar 缓存，但短基准中 Q8 路径仍未快过默认 f16/CPU 路径。
 - KV cache 用简单拼接（短序列下非瓶颈）。
 - 已有 GPU/CPU 运行时规划入口、decode 线性层 GPU matvec 和 `lm_head` GPU matvec；还没有 attention/KV/prefill GPU kernel。要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 

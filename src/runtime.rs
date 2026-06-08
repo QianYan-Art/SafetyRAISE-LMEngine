@@ -4,6 +4,7 @@
 //! GPU 探测和层放置计划固定下来，避免后续接 GPU kernel 时改动 CLI/API。
 
 use std::fmt;
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::model::Qwen3Config;
@@ -40,6 +41,21 @@ pub enum QuantizationMode {
     Q8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizationCacheMode {
+    Auto,
+    Off,
+}
+
+impl QuantizationCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+}
+
 impl QuantizationMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -63,6 +79,8 @@ pub struct RuntimeOptions {
     pub device: DevicePreference,
     pub gpu_layers: Option<usize>,
     pub quantization: QuantizationMode,
+    pub quantization_cache: QuantizationCacheMode,
+    pub q8_cache_dir: Option<PathBuf>,
 }
 
 impl Default for RuntimeOptions {
@@ -71,6 +89,8 @@ impl Default for RuntimeOptions {
             device: DevicePreference::Cpu,
             gpu_layers: None,
             quantization: QuantizationMode::None,
+            quantization_cache: QuantizationCacheMode::Auto,
+            q8_cache_dir: None,
         }
     }
 }
@@ -287,6 +307,30 @@ impl RuntimePlan {
         self.quantization = QuantizationMode::Q8;
         self.notes.push(format!(
             "Q8 linear path enabled for {attached_linears} bias-free linear layer(s); Q8 GPU matvecs or existing GPU matvecs take priority where attached, then CPU Q8 is used as fallback."
+        ));
+    }
+
+    pub fn mark_q8_sidecar_disabled(&mut self) {
+        self.notes
+            .push("Q8 sidecar cache disabled; deriving Q8 weights in memory.".to_string());
+    }
+
+    pub fn mark_q8_sidecar_unavailable(&mut self, reason: impl Into<String>) {
+        self.notes.push(format!(
+            "Q8 sidecar cache unavailable; deriving Q8 weights in memory: {}",
+            reason.into()
+        ));
+    }
+
+    pub fn mark_q8_sidecar_report(
+        &mut self,
+        dir: impl fmt::Display,
+        hits: usize,
+        writes: usize,
+        fallbacks: usize,
+    ) {
+        self.notes.push(format!(
+            "Q8 sidecar cache at {dir}: {hits} hit(s), {writes} write(s), {fallbacks} fallback(s)."
         ));
     }
 

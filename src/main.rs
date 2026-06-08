@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use rsinfer::engine::{CombinedSampler, Generator, GreedySampler, Sampler};
-use rsinfer::runtime::{DevicePreference, QuantizationMode, RuntimeOptions};
+use rsinfer::runtime::{DevicePreference, QuantizationCacheMode, QuantizationMode, RuntimeOptions};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DeviceArg {
@@ -18,6 +18,12 @@ enum DeviceArg {
 enum QuantizationArg {
     None,
     Q8,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum QuantizationCacheArg {
+    Auto,
+    Off,
 }
 
 impl From<DeviceArg> for DevicePreference {
@@ -35,6 +41,15 @@ impl From<QuantizationArg> for QuantizationMode {
         match value {
             QuantizationArg::None => Self::None,
             QuantizationArg::Q8 => Self::Q8,
+        }
+    }
+}
+
+impl From<QuantizationCacheArg> for QuantizationCacheMode {
+    fn from(value: QuantizationCacheArg) -> Self {
+        match value {
+            QuantizationCacheArg::Auto => Self::Auto,
+            QuantizationCacheArg::Off => Self::Off,
         }
     }
 }
@@ -90,6 +105,14 @@ struct Args {
     /// 权重量化路径: none 保持 f16；q8 启用行级 Q8 CPU linear fallback
     #[arg(long, value_enum, default_value_t = QuantizationArg::None)]
     quantization: QuantizationArg,
+
+    /// Q8 派生权重缓存: auto 写入/读取模型目录旁的 sidecar；off 每次内存派生
+    #[arg(long = "q8-cache", value_enum, default_value_t = QuantizationCacheArg::Auto)]
+    q8_cache: QuantizationCacheArg,
+
+    /// Q8 sidecar 目录；默认使用模型目录旁的 <model>.rsinfer-q8
+    #[arg(long = "q8-cache-dir")]
+    q8_cache_dir: Option<PathBuf>,
 }
 
 const IM_START: &str = "\x3c|im_start|>";
@@ -137,6 +160,8 @@ fn main() -> rsinfer::Result<()> {
         device: args.device.into(),
         gpu_layers: args.gpu_layers,
         quantization: args.quantization.into(),
+        quantization_cache: args.q8_cache.into(),
+        q8_cache_dir: args.q8_cache_dir.clone(),
     };
     let generator = Generator::from_pretrained_with_options(&args.model_path, &runtime_options)?;
     println!("模型加载完成，耗时: {:.2}s", start.elapsed().as_secs_f32());

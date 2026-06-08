@@ -9,8 +9,11 @@ use crate::error::{Result, RsinferError};
 use crate::gpu::GpuContext;
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
+use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_weight, load_weights, WeightMap};
-use crate::runtime::{build_runtime_plan, QuantizationMode, RuntimeOptions, RuntimePlan};
+use crate::runtime::{
+    build_runtime_plan, QuantizationCacheMode, QuantizationMode, RuntimeOptions, RuntimePlan,
+};
 use crate::tensor::Tensor;
 
 pub struct Qwen3Model {
@@ -34,7 +37,23 @@ impl Qwen3Model {
         let model_dir = model_dir.as_ref();
         let config = Qwen3Config::from_file(model_dir.join("config.json"))?;
         let weights = load_weights(model_dir)?;
-        Self::from_weights_with_options(&config, &weights, runtime_options)
+        let (q8_sidecar, q8_sidecar_error) = if runtime_options.quantization == QuantizationMode::Q8
+            && runtime_options.quantization_cache == QuantizationCacheMode::Auto
+        {
+            match Q8SidecarCache::open(model_dir, runtime_options.q8_cache_dir.as_deref()) {
+                Ok(cache) => (Some(cache), None),
+                Err(err) => (None, Some(err.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+        Self::from_weights_with_options_and_sidecar(
+            &config,
+            &weights,
+            runtime_options,
+            q8_sidecar,
+            q8_sidecar_error,
+        )
     }
 
     pub fn from_weights(config: &Qwen3Config, weights: &WeightMap) -> Result<Self> {
@@ -45,6 +64,16 @@ impl Qwen3Model {
         config: &Qwen3Config,
         weights: &WeightMap,
         runtime_options: &RuntimeOptions,
+    ) -> Result<Self> {
+        Self::from_weights_with_options_and_sidecar(config, weights, runtime_options, None, None)
+    }
+
+    fn from_weights_with_options_and_sidecar(
+        config: &Qwen3Config,
+        weights: &WeightMap,
+        runtime_options: &RuntimeOptions,
+        mut q8_sidecar: Option<Q8SidecarCache>,
+        q8_sidecar_error: Option<String>,
     ) -> Result<Self> {
         let mut runtime_plan = build_runtime_plan(config, runtime_options);
         let gpu_context = if runtime_plan.should_try_gpu_backend() {
@@ -86,13 +115,37 @@ impl Qwen3Model {
 
         let use_q8 = runtime_options.quantization == QuantizationMode::Q8;
         if use_q8 {
+            match runtime_options.quantization_cache {
+                QuantizationCacheMode::Auto => {
+                    if let Some(err) = q8_sidecar_error {
+                        runtime_plan.mark_q8_sidecar_unavailable(err);
+                    }
+                }
+                QuantizationCacheMode::Off => runtime_plan.mark_q8_sidecar_disabled(),
+            }
+
             let mut attached_linears = 0usize;
             for layer in &mut layers {
-                attached_linears += layer.try_enable_q8_weights()?;
+                attached_linears += match q8_sidecar.as_mut() {
+                    Some(cache) => layer.try_enable_q8_weights(Some(cache))?,
+                    None => layer.try_enable_q8_weights(None)?,
+                };
             }
-            lm_head.try_enable_q8_weight()?;
+            match q8_sidecar.as_mut() {
+                Some(cache) => lm_head.try_enable_q8_weight_with_sidecar(Some(cache))?,
+                None => lm_head.try_enable_q8_weight_with_sidecar(None)?,
+            }
             attached_linears += 1;
             runtime_plan.mark_q8_quantization(attached_linears);
+            if let Some(cache) = &q8_sidecar {
+                let report = cache.report();
+                runtime_plan.mark_q8_sidecar_report(
+                    report.dir.display(),
+                    report.hits,
+                    report.writes,
+                    report.fallbacks.len(),
+                );
+            }
         }
 
         let planned_gpu_layers = runtime_plan.planned_transformer_gpu_layers();
