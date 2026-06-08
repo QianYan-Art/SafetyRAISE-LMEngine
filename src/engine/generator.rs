@@ -202,7 +202,13 @@ impl Generator {
         let logits = self.model.forward(input_ids, kv_cache, position_offset)?;
         let forward_time = forward_start.elapsed();
         let sample_start = Instant::now();
-        let token = self.sampler.sample(&logits.to_1d()?);
+        let logits_slice = logits.as_slice();
+        if logits_slice.len() != logits.numel() {
+            return Err(crate::error::RsinferError::DimensionError(
+                "logits tensor is not contiguous".into(),
+            ));
+        }
+        let token = self.sampler.sample(logits_slice);
         Ok((token, forward_time, sample_start.elapsed(), false))
     }
 }

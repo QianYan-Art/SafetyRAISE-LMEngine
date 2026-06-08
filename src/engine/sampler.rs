@@ -1,13 +1,12 @@
 //! 从 logits 选择下一个 token 的采样策略。
 
-use crate::tensor::Tensor;
 use rand::Rng;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 pub trait Sampler: Send + Sync {
-    /// logits: [vocab_size] 一维张量
-    fn sample(&self, logits: &Tensor) -> u32;
+    /// logits: [vocab_size] contiguous slice
+    fn sample(&self, logits: &[f32]) -> u32;
 
     fn is_greedy(&self) -> bool {
         false
@@ -18,8 +17,8 @@ pub trait Sampler: Send + Sync {
 pub struct GreedySampler;
 
 impl Sampler for GreedySampler {
-    fn sample(&self, logits: &Tensor) -> u32 {
-        argmax(logits.as_slice())
+    fn sample(&self, logits: &[f32]) -> u32 {
+        argmax(logits)
     }
 
     fn is_greedy(&self) -> bool {
@@ -47,8 +46,7 @@ impl CombinedSampler {
 }
 
 impl Sampler for CombinedSampler {
-    fn sample(&self, logits: &Tensor) -> u32 {
-        let data = logits.as_slice();
+    fn sample(&self, data: &[f32]) -> u32 {
         if self.temperature <= 0.0 {
             return argmax(data);
         }
@@ -232,13 +230,13 @@ mod tests {
 
     #[test]
     fn greedy_picks_max() {
-        let logits = Tensor::from_f32_slice(&[5], &[1.0, 2.0, 5.0, 3.0, 4.0]).unwrap();
+        let logits = [1.0, 2.0, 5.0, 3.0, 4.0];
         assert_eq!(GreedySampler.sample(&logits), 2);
     }
 
     #[test]
     fn zero_temperature_is_greedy() {
-        let logits = Tensor::from_f32_slice(&[5], &[1.0, 2.0, 5.0, 3.0, 4.0]).unwrap();
+        let logits = [1.0, 2.0, 5.0, 3.0, 4.0];
         assert_eq!(CombinedSampler::new(0.0, 0, 1.0).sample(&logits), 2);
     }
 
@@ -275,7 +273,7 @@ mod tests {
 
     #[test]
     fn top_k_sampling_never_returns_filtered_token() {
-        let logits = Tensor::from_f32_slice(&[5], &[100.0, 90.0, 80.0, -1000.0, -1000.0]).unwrap();
+        let logits = [100.0, 90.0, 80.0, -1000.0, -1000.0];
         let sampler = CombinedSampler::new(0.6, 2, 1.0);
 
         for _ in 0..64 {
@@ -286,7 +284,7 @@ mod tests {
 
     #[test]
     fn top_p_can_cut_top_k_candidates_to_first_token() {
-        let logits = Tensor::from_f32_slice(&[4], &[20.0, 1.0, 0.0, -1.0]).unwrap();
+        let logits = [20.0, 1.0, 0.0, -1.0];
         let sampler = CombinedSampler::new(1.0, 3, 0.5);
 
         for _ in 0..16 {
