@@ -6,22 +6,75 @@ use crate::error::{Result, RsinferError};
 use crate::tensor::Tensor;
 use ndarray::{ArrayD, IxDyn};
 
+#[derive(Clone)]
+struct KVCacheLayer {
+    key: Vec<f32>,
+    value: Vec<f32>,
+    num_heads: usize,
+    head_dim: usize,
+    current_len: usize,
+    capacity_len: usize,
+}
+
+pub struct CachedKV<'a> {
+    pub key: &'a [f32],
+    pub value: &'a [f32],
+    pub num_heads: usize,
+    pub seq_len: usize,
+    pub head_dim: usize,
+    pub capacity_len: usize,
+}
+
+impl KVCacheLayer {
+    fn ensure_capacity(&mut self, required_len: usize, max_len: usize) -> Result<()> {
+        if required_len <= self.capacity_len {
+            return Ok(());
+        }
+        let mut next_capacity = self.capacity_len.max(64);
+        while next_capacity < required_len {
+            next_capacity = next_capacity.saturating_mul(2);
+        }
+        next_capacity = next_capacity.min(max_len);
+        if next_capacity < required_len {
+            return Err(RsinferError::DimensionError(format!(
+                "KV cache required length {required_len} exceeds max_len {max_len}"
+            )));
+        }
+
+        let old_capacity = self.capacity_len;
+        let old_head_len = old_capacity * self.head_dim;
+        let new_head_len = next_capacity * self.head_dim;
+        let mut key = vec![0.0; self.num_heads * new_head_len];
+        let mut value = vec![0.0; key.len()];
+        if old_capacity > 0 {
+            let used_head_len = self.current_len * self.head_dim;
+            for h in 0..self.num_heads {
+                let old_start = h * old_head_len;
+                let new_start = h * new_head_len;
+                key[new_start..new_start + used_head_len]
+                    .copy_from_slice(&self.key[old_start..old_start + used_head_len]);
+                value[new_start..new_start + used_head_len]
+                    .copy_from_slice(&self.value[old_start..old_start + used_head_len]);
+            }
+        }
+        self.key = key;
+        self.value = value;
+        self.capacity_len = next_capacity;
+        Ok(())
+    }
+}
+
 /// KV Cache 数据结构
 ///
 /// 为每一层 Transformer 维护独立的 Key 和 Value 缓存。
 #[derive(Clone)]
 pub struct KVCache {
-    /// 每层的 Key 缓存: [num_heads, seq_len, head_dim]
-    key_cache: Vec<Option<Tensor>>,
-
-    /// 每层的 Value 缓存: [num_heads, seq_len, head_dim]
-    value_cache: Vec<Option<Tensor>>,
+    layers: Vec<Option<KVCacheLayer>>,
 
     /// 当前序列长度 (用于跟踪)
     current_len: usize,
 
-    /// 最大支持的序列长度 (保留用于未来扩展)
-    #[allow(dead_code)]
+    /// 最大支持的序列长度
     max_len: usize,
 }
 
@@ -33,8 +86,7 @@ impl KVCache {
     /// * `max_len` - 最大序列长度
     pub fn new(num_layers: usize, max_len: usize) -> Self {
         Self {
-            key_cache: vec![None; num_layers],
-            value_cache: vec![None; num_layers],
+            layers: vec![None; num_layers],
             current_len: 0,
             max_len,
         }
@@ -47,65 +99,133 @@ impl KVCache {
     /// * `new_k` - 新的 Key: [num_heads, new_seq_len, head_dim]
     /// * `new_v` - 新的 Value: [num_heads, new_seq_len, head_dim]
     pub fn append(&mut self, layer_idx: usize, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
-        if layer_idx >= self.key_cache.len() {
+        if layer_idx >= self.layers.len() {
             return Err(RsinferError::DimensionError(format!(
                 "Layer index {} out of range (max {})",
                 layer_idx,
-                self.key_cache.len()
+                self.layers.len()
             )));
         }
 
-        // 如果缓存为空，直接设置
-        if self.key_cache[layer_idx].is_none() {
-            self.key_cache[layer_idx] = Some(new_k.clone());
-            self.value_cache[layer_idx] = Some(new_v.clone());
-
-            // 更新当前长度 (只在第一层更新)
-            if layer_idx == 0 {
-                self.current_len = new_k.shape()[1];
-            }
-            return Ok(());
+        let k_shape = new_k.shape();
+        let v_shape = new_v.shape();
+        if k_shape.len() != 3 || v_shape.len() != 3 {
+            return Err(RsinferError::DimensionError(
+                "KV cache append expects [num_heads, seq_len, head_dim] tensors".into(),
+            ));
+        }
+        if k_shape != v_shape {
+            return Err(RsinferError::ShapeMismatch {
+                expected: k_shape.to_vec(),
+                actual: v_shape.to_vec(),
+            });
         }
 
-        // 否则，拼接新的 K, V
-        let old_k = self.key_cache[layer_idx].as_ref().unwrap();
-        let old_v = self.value_cache[layer_idx].as_ref().unwrap();
+        let num_heads = k_shape[0];
+        let new_seq_len = k_shape[1];
+        let head_dim = k_shape[2];
+        let layer = self.layers[layer_idx].get_or_insert_with(|| KVCacheLayer {
+            key: Vec::new(),
+            value: Vec::new(),
+            num_heads,
+            head_dim,
+            current_len: 0,
+            capacity_len: 0,
+        });
 
-        let concat_k = concat_along_seq(old_k, new_k)?;
-        let concat_v = concat_along_seq(old_v, new_v)?;
+        if layer.num_heads != num_heads || layer.head_dim != head_dim {
+            return Err(RsinferError::ShapeMismatch {
+                expected: vec![layer.num_heads, layer.current_len, layer.head_dim],
+                actual: k_shape.to_vec(),
+            });
+        }
+        if layer.current_len + new_seq_len > self.max_len {
+            return Err(RsinferError::DimensionError(format!(
+                "KV cache length {} exceeds max_len {}",
+                layer.current_len + new_seq_len,
+                self.max_len
+            )));
+        }
+        layer.ensure_capacity(layer.current_len + new_seq_len, self.max_len)?;
 
-        self.key_cache[layer_idx] = Some(concat_k);
-        self.value_cache[layer_idx] = Some(concat_v);
+        let k_std = new_k.data.as_standard_layout();
+        let v_std = new_v.data.as_standard_layout();
+        let k_slice = k_std
+            .as_slice()
+            .ok_or_else(|| RsinferError::DimensionError("new K tensor is not contiguous".into()))?;
+        let v_slice = v_std
+            .as_slice()
+            .ok_or_else(|| RsinferError::DimensionError("new V tensor is not contiguous".into()))?;
+        let new_head_len = new_seq_len * head_dim;
+        let cache_head_len = layer.capacity_len * head_dim;
+        let dst_seq_offset = layer.current_len * head_dim;
+        for h in 0..num_heads {
+            let src_start = h * new_head_len;
+            let dst_start = h * cache_head_len + dst_seq_offset;
+            layer.key[dst_start..dst_start + new_head_len]
+                .copy_from_slice(&k_slice[src_start..src_start + new_head_len]);
+            layer.value[dst_start..dst_start + new_head_len]
+                .copy_from_slice(&v_slice[src_start..src_start + new_head_len]);
+        }
 
-        // 更新当前长度
+        layer.current_len += new_seq_len;
         if layer_idx == 0 {
-            self.current_len = self.key_cache[0].as_ref().unwrap().shape()[1];
+            self.current_len = layer.current_len;
         }
-
         Ok(())
     }
 
-    /// 获取指定层的缓存
-    ///
-    /// 返回 (key_cache, value_cache)，形状均为 [num_heads, seq_len, head_dim]
-    pub fn get(&self, layer_idx: usize) -> Result<(&Tensor, &Tensor)> {
-        let k = self
-            .key_cache
+    pub fn get_cached(&self, layer_idx: usize) -> Result<CachedKV<'_>> {
+        let layer = self
+            .layers
             .get(layer_idx)
             .and_then(|x| x.as_ref())
             .ok_or_else(|| {
                 RsinferError::DimensionError(format!("No cache for layer {}", layer_idx))
             })?;
 
-        let v = self
-            .value_cache
-            .get(layer_idx)
-            .and_then(|x| x.as_ref())
-            .ok_or_else(|| {
-                RsinferError::DimensionError(format!("No cache for layer {}", layer_idx))
-            })?;
+        Ok(CachedKV {
+            key: &layer.key,
+            value: &layer.value,
+            num_heads: layer.num_heads,
+            seq_len: layer.current_len,
+            head_dim: layer.head_dim,
+            capacity_len: layer.capacity_len,
+        })
+    }
 
-        Ok((k, v))
+    /// 获取指定层的缓存，返回紧凑 Tensor。该兼容路径会复制当前缓存内容。
+    pub fn get(&self, layer_idx: usize) -> Result<(Tensor, Tensor)> {
+        let cached = self.get_cached(layer_idx)?;
+        let mut key = vec![0f32; cached.num_heads * cached.seq_len * cached.head_dim];
+        let mut value = vec![0f32; key.len()];
+        let compact_head_len = cached.seq_len * cached.head_dim;
+        let cache_head_len = cached.capacity_len * cached.head_dim;
+        for h in 0..cached.num_heads {
+            let src_start = h * cache_head_len;
+            let dst_start = h * compact_head_len;
+            key[dst_start..dst_start + compact_head_len]
+                .copy_from_slice(&cached.key[src_start..src_start + compact_head_len]);
+            value[dst_start..dst_start + compact_head_len]
+                .copy_from_slice(&cached.value[src_start..src_start + compact_head_len]);
+        }
+
+        Ok((
+            Tensor {
+                data: ArrayD::from_shape_vec(
+                    IxDyn(&[cached.num_heads, cached.seq_len, cached.head_dim]),
+                    key,
+                )
+                .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+            },
+            Tensor {
+                data: ArrayD::from_shape_vec(
+                    IxDyn(&[cached.num_heads, cached.seq_len, cached.head_dim]),
+                    value,
+                )
+                .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+            },
+        ))
     }
 
     /// 获取当前序列长度
@@ -115,65 +235,11 @@ impl KVCache {
 
     /// 重置缓存 (用于新的生成会话)
     pub fn reset(&mut self) {
-        for k in self.key_cache.iter_mut() {
-            *k = None;
-        }
-        for v in self.value_cache.iter_mut() {
-            *v = None;
+        for layer in self.layers.iter_mut().flatten() {
+            layer.current_len = 0;
         }
         self.current_len = 0;
     }
-}
-
-/// 沿序列维度 (axis=1) 拼接两个张量
-///
-/// a: [num_heads, seq_len_a, head_dim]
-/// b: [num_heads, seq_len_b, head_dim]
-/// result: [num_heads, seq_len_a + seq_len_b, head_dim]
-fn concat_along_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-
-    if a_shape[0] != b_shape[0] || a_shape[2] != b_shape[2] {
-        return Err(RsinferError::ShapeMismatch {
-            expected: vec![a_shape[0], a_shape[2]],
-            actual: vec![b_shape[0], b_shape[2]],
-        });
-    }
-
-    let num_heads = a_shape[0];
-    let seq_len_a = a_shape[1];
-    let seq_len_b = b_shape[1];
-    let head_dim = a_shape[2];
-    let total_seq_len = seq_len_a + seq_len_b;
-
-    let a_std = a.data.as_standard_layout();
-    let b_std = b.data.as_standard_layout();
-    let a_slice = a_std.as_slice().ok_or_else(|| {
-        RsinferError::DimensionError("K cache old tensor is not contiguous".into())
-    })?;
-    let b_slice = b_std.as_slice().ok_or_else(|| {
-        RsinferError::DimensionError("K cache new tensor is not contiguous".into())
-    })?;
-
-    let old_head_len = seq_len_a * head_dim;
-    let new_head_len = seq_len_b * head_dim;
-    let total_head_len = total_seq_len * head_dim;
-    let mut output = vec![0f32; num_heads * total_head_len];
-    for h in 0..num_heads {
-        let out_start = h * total_head_len;
-        let old_start = h * old_head_len;
-        let new_start = h * new_head_len;
-        output[out_start..out_start + old_head_len]
-            .copy_from_slice(&a_slice[old_start..old_start + old_head_len]);
-        output[out_start + old_head_len..out_start + total_head_len]
-            .copy_from_slice(&b_slice[new_start..new_start + new_head_len]);
-    }
-
-    Ok(Tensor {
-        data: ArrayD::from_shape_vec(IxDyn(&[num_heads, total_seq_len, head_dim]), output)
-            .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
-    })
 }
 
 #[cfg(test)]
@@ -202,6 +268,17 @@ mod tests {
         let v2 = Tensor::from_f32_slice(&[2, 1, 2], &[11.0, 12.0, 110.0, 120.0]).unwrap();
         cache.append(0, &k2, &v2).unwrap();
         assert_eq!(cache.current_len(), 3);
+
+        let cached = cache.get_cached(0).unwrap();
+        assert_eq!(cached.num_heads, 2);
+        assert_eq!(cached.seq_len, 3);
+        assert_eq!(cached.head_dim, 2);
+        assert_eq!(cached.capacity_len, 64);
+        assert_eq!(&cached.key[0..6], &[1.0, 2.0, 3.0, 4.0, 9.0, 10.0]);
+        assert_eq!(
+            &cached.key[128..134],
+            &[10.0, 20.0, 30.0, 40.0, 90.0, 100.0]
+        );
 
         let (cached_k, cached_v) = cache.get(0).unwrap();
         assert_eq!(cached_k.shape(), &[2, 3, 2]);

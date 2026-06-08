@@ -544,6 +544,103 @@ pub fn scaled_dot_product_attention_gqa(
     })
 }
 
+pub struct CachedAttention<'a> {
+    pub key: &'a [f32],
+    pub value: &'a [f32],
+    pub num_kv_heads: usize,
+    pub seq_len_k: usize,
+    pub head_dim: usize,
+    pub max_len: usize,
+}
+
+pub fn scaled_dot_product_attention_gqa_cached(
+    q: &Tensor,
+    cache: CachedAttention<'_>,
+    kv_group_size: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let q_shape = q.shape();
+    if q_shape.len() != 3 {
+        return Err(RsinferError::DimensionError(
+            "cached GQA attention expects q to be 3D".into(),
+        ));
+    }
+
+    let num_heads = q_shape[0];
+    let seq_len_q = q_shape[1];
+    let head_dim = q_shape[2];
+    if kv_group_size == 0
+        || cache.num_kv_heads * kv_group_size != num_heads
+        || cache.head_dim != head_dim
+        || seq_len_q > cache.seq_len_k
+        || cache.key.len() < cache.num_kv_heads * cache.max_len * cache.head_dim
+        || cache.value.len() < cache.num_kv_heads * cache.max_len * cache.head_dim
+    {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![num_heads, seq_len_q, head_dim],
+            actual: vec![cache.num_kv_heads, cache.seq_len_k, cache.head_dim],
+        });
+    }
+
+    let q_std = q.data.as_standard_layout();
+    let qs = q_std
+        .as_slice()
+        .ok_or_else(|| RsinferError::DimensionError("q tensor is not contiguous".into()))?;
+
+    let mut output = vec![0f32; num_heads * seq_len_q * head_dim];
+    let head_stride_q = seq_len_q * head_dim;
+    let cache_head_stride = cache.max_len * head_dim;
+    let key_offset = cache.seq_len_k - seq_len_q;
+
+    output
+        .par_chunks_mut(head_stride_q)
+        .enumerate()
+        .for_each(|(h, out_head)| {
+            let kv_head_idx = h / kv_group_size;
+            let q_head = &qs[h * head_stride_q..(h + 1) * head_stride_q];
+            let k_head =
+                &cache.key[kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+            let v_head = &cache.value
+                [kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+
+            let mut scores = vec![0f32; cache.seq_len_k];
+            for i in 0..seq_len_q {
+                let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
+                let causal_limit = key_offset + i;
+
+                let mut max_score = f32::NEG_INFINITY;
+                for j in 0..=causal_limit {
+                    let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                    let s = dot(q_row, k_row) * scale;
+                    scores[j] = s;
+                    if s > max_score {
+                        max_score = s;
+                    }
+                }
+                let mut sum_exp = 0f32;
+                for s in scores[..=causal_limit].iter_mut() {
+                    *s = (*s - max_score).exp();
+                    sum_exp += *s;
+                }
+                let inv_sum = 1.0 / sum_exp;
+
+                let out_row = &mut out_head[i * head_dim..(i + 1) * head_dim];
+                for j in 0..=causal_limit {
+                    let w = scores[j] * inv_sum;
+                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                    for d in 0..head_dim {
+                        out_row[d] += w * v_row[d];
+                    }
+                }
+            }
+        });
+
+    Ok(Tensor {
+        data: ArrayD::from_shape_vec(IxDyn(&[num_heads, seq_len_q, head_dim]), output)
+            .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+    })
+}
+
 /// GQA (Grouped Query Attention) 的 KV 头扩展
 ///
 /// 将 [num_kv_heads, seq_len, head_dim] 扩展到 [num_heads, seq_len, head_dim]
@@ -635,6 +732,64 @@ mod tests {
         let repeated_v = repeat_kv(&v, 2).unwrap();
         let expected = scaled_dot_product_attention(&q, &repeated_k, &repeated_v, 0.5).unwrap();
         let actual = scaled_dot_product_attention_gqa(&q, &k, &v, 2, 0.5).unwrap();
+
+        assert_eq!(expected.shape(), actual.shape());
+        for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn cached_gqa_attention_matches_compact_gqa_path() {
+        let q = Tensor::from_f32_slice(
+            &[4, 2, 2],
+            &[
+                0.1, 0.2, 0.3, 0.4, -0.2, 0.5, 0.7, -0.1, 0.6, 0.2, -0.4, 0.3, 0.9, -0.5, 0.1, 0.8,
+            ],
+        )
+        .unwrap();
+        let k = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.2, -0.1, 0.4, 0.3, -0.2, 0.7, 0.5, 0.6, -0.3, 0.2, 0.8, -0.4,
+            ],
+        )
+        .unwrap();
+        let v = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.3, 0.1, -0.2, 0.4, 0.7, -0.5, -0.1, 0.8, 0.6, -0.3, 0.2, 0.5,
+            ],
+        )
+        .unwrap();
+        let max_len = 5;
+        let head_dim = 2;
+        let mut key = vec![0.0; 2 * max_len * head_dim];
+        let mut value = vec![0.0; key.len()];
+        for h in 0..2 {
+            let compact_start = h * 3 * head_dim;
+            let cache_start = h * max_len * head_dim;
+            key[cache_start..cache_start + 3 * head_dim]
+                .copy_from_slice(&k.as_slice()[compact_start..compact_start + 3 * head_dim]);
+            value[cache_start..cache_start + 3 * head_dim]
+                .copy_from_slice(&v.as_slice()[compact_start..compact_start + 3 * head_dim]);
+        }
+
+        let expected = scaled_dot_product_attention_gqa(&q, &k, &v, 2, 0.5).unwrap();
+        let actual = scaled_dot_product_attention_gqa_cached(
+            &q,
+            CachedAttention {
+                key: &key,
+                value: &value,
+                num_kv_heads: 2,
+                seq_len_k: 3,
+                head_dim,
+                max_len,
+            },
+            2,
+            0.5,
+        )
+        .unwrap();
 
         assert_eq!(expected.shape(), actual.shape());
         for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
