@@ -132,13 +132,13 @@ impl Generator {
         position_offset: usize,
     ) -> Result<u32> {
         if self.sampler.is_greedy() && self.model.has_greedy_token_fast_path() {
-            let mut fast_cache = kv_cache.clone();
-            if let Ok(token) =
-                self.model
-                    .forward_greedy_token(input_ids, &mut fast_cache, position_offset)
+            let snapshot = kv_cache.snapshot();
+            match self
+                .model
+                .forward_greedy_token(input_ids, kv_cache, position_offset)
             {
-                *kv_cache = fast_cache;
-                return Ok(token);
+                Ok(token) => return Ok(token),
+                Err(_) => kv_cache.restore(snapshot)?,
             }
         }
 

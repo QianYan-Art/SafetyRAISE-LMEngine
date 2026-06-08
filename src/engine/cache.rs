@@ -25,6 +25,12 @@ pub struct CachedKV<'a> {
     pub capacity_len: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct KVCacheSnapshot {
+    layer_lengths: Vec<Option<usize>>,
+    current_len: usize,
+}
+
 impl KVCacheLayer {
     fn ensure_capacity(&mut self, required_len: usize, max_len: usize) -> Result<()> {
         if required_len <= self.capacity_len {
@@ -233,6 +239,49 @@ impl KVCache {
         self.current_len
     }
 
+    pub fn snapshot(&self) -> KVCacheSnapshot {
+        KVCacheSnapshot {
+            layer_lengths: self
+                .layers
+                .iter()
+                .map(|layer| layer.as_ref().map(|layer| layer.current_len))
+                .collect(),
+            current_len: self.current_len,
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: KVCacheSnapshot) -> Result<()> {
+        if snapshot.layer_lengths.len() != self.layers.len() {
+            return Err(RsinferError::DimensionError(format!(
+                "KV cache snapshot layer count {} does not match cache layer count {}",
+                snapshot.layer_lengths.len(),
+                self.layers.len()
+            )));
+        }
+        for (layer, length) in self.layers.iter_mut().zip(snapshot.layer_lengths) {
+            match (layer.as_mut(), length) {
+                (Some(layer), Some(length)) if length <= layer.capacity_len => {
+                    layer.current_len = length;
+                }
+                (Some(_), Some(length)) => {
+                    return Err(RsinferError::DimensionError(format!(
+                        "KV cache snapshot length {length} exceeds layer capacity"
+                    )));
+                }
+                (Some(layer), None) => layer.current_len = 0,
+                (None, Some(0)) => {}
+                (None, Some(_)) => {
+                    return Err(RsinferError::DimensionError(
+                        "KV cache snapshot references missing layer".into(),
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
+        self.current_len = snapshot.current_len;
+        Ok(())
+    }
+
     /// 重置缓存 (用于新的生成会话)
     pub fn reset(&mut self) {
         for layer in self.layers.iter_mut().flatten() {
@@ -290,5 +339,29 @@ mod tests {
             cached_v.as_slice(),
             &[5.0, 6.0, 7.0, 8.0, 11.0, 12.0, 50.0, 60.0, 70.0, 80.0, 110.0, 120.0]
         );
+    }
+
+    #[test]
+    fn snapshot_restore_truncates_lengths_without_losing_prior_cache() {
+        let mut cache = KVCache::new(1, 16);
+        let k = Tensor::from_f32_slice(&[1, 2, 2], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let v = Tensor::from_f32_slice(&[1, 2, 2], &[5.0, 6.0, 7.0, 8.0]).unwrap();
+        cache.append(0, &k, &v).unwrap();
+        let snapshot = cache.snapshot();
+
+        let speculative_k = Tensor::from_f32_slice(&[1, 1, 2], &[9.0, 10.0]).unwrap();
+        let speculative_v = Tensor::from_f32_slice(&[1, 1, 2], &[11.0, 12.0]).unwrap();
+        cache.append(0, &speculative_k, &speculative_v).unwrap();
+        assert_eq!(cache.current_len(), 3);
+
+        cache.restore(snapshot).unwrap();
+        assert_eq!(cache.current_len(), 2);
+        let replacement_k = Tensor::from_f32_slice(&[1, 1, 2], &[13.0, 14.0]).unwrap();
+        let replacement_v = Tensor::from_f32_slice(&[1, 1, 2], &[15.0, 16.0]).unwrap();
+        cache.append(0, &replacement_k, &replacement_v).unwrap();
+
+        let (cached_k, cached_v) = cache.get(0).unwrap();
+        assert_eq!(cached_k.as_slice(), &[1.0, 2.0, 3.0, 4.0, 13.0, 14.0]);
+        assert_eq!(cached_v.as_slice(), &[5.0, 6.0, 7.0, 8.0, 15.0, 16.0]);
     }
 }
