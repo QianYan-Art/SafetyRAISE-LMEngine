@@ -6,7 +6,9 @@ use half::f16;
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::{GpuContext, GpuMatVec, GpuQ8MatVec, GpuQ8SwiGluDown, GpuSwiGluDown};
+use crate::gpu::{
+    GpuContext, GpuMatVec, GpuQ8MatVec, GpuQ8SameInputBatch, GpuQ8SwiGluDown, GpuSwiGluDown,
+};
 use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
@@ -242,6 +244,7 @@ pub struct Attention {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub rope_theta: f32,
+    q8_qkv_batch: Option<GpuQ8SameInputBatch>,
 }
 
 impl Attention {
@@ -296,6 +299,22 @@ impl Attention {
                 Err(err) => errors.push(format!("attention.{name}.q8_gpu: {err}")),
             }
         }
+        self.q8_qkv_batch = match (
+            self.q_proj.q8_gpu_matvec(),
+            self.k_proj.q8_gpu_matvec(),
+            self.v_proj.q8_gpu_matvec(),
+        ) {
+            (Some(q_proj), Some(k_proj), Some(v_proj)) => {
+                match GpuQ8SameInputBatch::new(&[q_proj, k_proj, v_proj]) {
+                    Ok(batch) => Some(batch),
+                    Err(err) => {
+                        errors.push(format!("attention.qkv.q8_shared_input: {err}"));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         (attached, errors)
     }
 
@@ -314,11 +333,23 @@ impl Attention {
 
         let (q, k, v) = if seq_len == 1 {
             match (
+                self.q8_qkv_batch.as_ref(),
                 self.q_proj.q8_gpu_matvec(),
                 self.k_proj.q8_gpu_matvec(),
                 self.v_proj.q8_gpu_matvec(),
             ) {
-                (Some(q_proj), Some(k_proj), Some(v_proj)) => {
+                (Some(batch), Some(q_proj), Some(k_proj), Some(v_proj)) => {
+                    match batch.forward(&[q_proj, k_proj, v_proj], hidden_states) {
+                        Ok(mut outputs) if outputs.len() == 3 => {
+                            let v = outputs.pop().unwrap();
+                            let k = outputs.pop().unwrap();
+                            let q = outputs.pop().unwrap();
+                            (q, k, v)
+                        }
+                        _ => self.forward_qkv_decode_fallback(hidden_states)?,
+                    }
+                }
+                (_, Some(q_proj), Some(k_proj), Some(v_proj)) => {
                     match GpuQ8MatVec::forward_many_same_input(
                         &[q_proj, k_proj, v_proj],
                         hidden_states,
@@ -705,6 +736,7 @@ pub fn build_transformer_block(
         num_kv_heads: config.num_key_value_heads,
         head_dim: config.head_dim(),
         rope_theta: config.rope_theta,
+        q8_qkv_batch: None,
     };
 
     let mlp = Mlp::new(

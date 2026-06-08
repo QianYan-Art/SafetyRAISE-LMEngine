@@ -298,7 +298,7 @@ impl RuntimePlan {
         self.refresh_compute_backend();
         if active_layers > 0 {
             self.notes.push(format!(
-                "decode Q8 matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; MLP can fuse gate/up SwiGLU into Q8 GPU down_proj; prefill still falls back to CPU."
+                "decode Q8 matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; q/k/v can use one shared input upload, MLP can fuse gate/up SwiGLU into Q8 GPU down_proj, and prefill still falls back to CPU."
             ));
         }
     }

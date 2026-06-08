@@ -253,6 +253,14 @@ pub struct GpuQ8MatVec {
     out_features: usize,
 }
 
+pub struct GpuQ8SameInputBatch {
+    context: GpuContext,
+    input_buffer: wgpu::Buffer,
+    bind_groups: Vec<Vec<wgpu::BindGroup>>,
+    in_features: usize,
+    out_features: Vec<usize>,
+}
+
 pub struct GpuSwiGluDown {
     context: GpuContext,
     bind_groups: Vec<GpuSwiGluBindGroup>,
@@ -942,6 +950,179 @@ impl GpuQ8MatVec {
         }
         first
             .context
+            .inner
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("device poll failed: {e}"))?;
+
+        for rx in receivers {
+            let (_, _, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
+            result?;
+        }
+
+        let mut outputs = Vec::with_capacity(matvecs.len());
+        for matvec in matvecs {
+            let mut output = vec![0f32; matvec.out_features];
+            for chunk in &matvec.chunks {
+                let slice = chunk.readback_buffer.slice(..);
+                let mapped = slice.get_mapped_range();
+                let values = bytemuck::cast_slice::<u8, f32>(&mapped);
+                output[chunk.out_offset..chunk.out_offset + chunk.out_features]
+                    .copy_from_slice(values);
+                drop(mapped);
+                chunk.readback_buffer.unmap();
+            }
+            outputs.push(
+                Tensor::from_f32_slice(&[1, matvec.out_features], &output)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(outputs)
+    }
+}
+
+impl GpuQ8SameInputBatch {
+    pub fn new(matvecs: &[&GpuQ8MatVec]) -> Result<Self, String> {
+        if matvecs.is_empty() {
+            return Err("GPU Q8 shared-input batch requires at least one matvec".to_string());
+        }
+        let first = matvecs[0];
+        if matvecs
+            .iter()
+            .any(|matvec| matvec.in_features != first.in_features)
+        {
+            return Err("GPU Q8 shared-input batch requires the same input width".to_string());
+        }
+        if matvecs
+            .iter()
+            .any(|matvec| !Arc::ptr_eq(&matvec.context.inner, &first.context.inner))
+        {
+            return Err("GPU Q8 shared-input batch requires a shared GpuContext".to_string());
+        }
+
+        let input_buffer = first
+            .context
+            .inner
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rsinfer-q8-shared-input"),
+                size: bytes_len(first.in_features),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let mut bind_groups = Vec::with_capacity(matvecs.len());
+        for matvec in matvecs {
+            let mut matvec_groups = Vec::with_capacity(matvec.chunks.len());
+            for chunk in &matvec.chunks {
+                matvec_groups.push(first.context.inner.device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("rsinfer-q8-shared-input-bind-group"),
+                        layout: &first.context.inner.q8_matvec_bind_group_layout,
+                        entries: &[
+                            buffer_entry(0, &input_buffer),
+                            buffer_entry(1, &chunk._qweight_buffer),
+                            buffer_entry(2, &chunk._scales_buffer),
+                            buffer_entry(3, &chunk.output_buffer),
+                            buffer_entry(4, &chunk._params_buffer),
+                        ],
+                    },
+                ));
+            }
+            bind_groups.push(matvec_groups);
+        }
+
+        Ok(Self {
+            context: first.context.clone(),
+            input_buffer,
+            bind_groups,
+            in_features: first.in_features,
+            out_features: matvecs.iter().map(|matvec| matvec.out_features).collect(),
+        })
+    }
+
+    pub fn forward(&self, matvecs: &[&GpuQ8MatVec], x: &Tensor) -> Result<Vec<Tensor>, String> {
+        if matvecs.len() != self.bind_groups.len() {
+            return Err(format!(
+                "GPU Q8 shared-input batch expected {} matvecs, got {}",
+                self.bind_groups.len(),
+                matvecs.len()
+            ));
+        }
+        if x.ndim() != 2 || x.shape() != [1, self.in_features] {
+            return Err(format!(
+                "GPU Q8 shared-input batch expects [1, {}], got {:?}",
+                self.in_features,
+                x.shape()
+            ));
+        }
+        for (idx, matvec) in matvecs.iter().enumerate() {
+            if matvec.in_features != self.in_features
+                || matvec.out_features != self.out_features[idx]
+            {
+                return Err("GPU Q8 shared-input batch matvec shape mismatch".to_string());
+            }
+            if !Arc::ptr_eq(&matvec.context.inner, &self.context.inner) {
+                return Err(
+                    "GPU Q8 shared-input batch requires the original GpuContext".to_string()
+                );
+            }
+            if matvec.chunks.len() != self.bind_groups[idx].len() {
+                return Err("GPU Q8 shared-input batch chunk layout mismatch".to_string());
+            }
+        }
+
+        let x_std = x.data.as_standard_layout();
+        let input = x_std
+            .as_slice()
+            .ok_or_else(|| "GPU Q8 shared-input batch input is not contiguous".to_string())?;
+        self.context
+            .inner
+            .queue
+            .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(input));
+
+        let mut encoder =
+            self.context
+                .inner
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rsinfer-q8-shared-input-encoder"),
+                });
+        for (matvec_idx, matvec) in matvecs.iter().enumerate() {
+            for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rsinfer-q8-shared-input-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+                    pass.set_bind_group(0, &self.bind_groups[matvec_idx][chunk_idx], &[]);
+                    let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &chunk.output_buffer,
+                    0,
+                    &chunk.readback_buffer,
+                    0,
+                    bytes_len(chunk.out_features),
+                );
+            }
+        }
+        self.context.inner.queue.submit(Some(encoder.finish()));
+
+        let mut receivers = Vec::new();
+        for (matvec_idx, matvec) in matvecs.iter().enumerate() {
+            for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
+                let slice = chunk.readback_buffer.slice(..);
+                let (tx, rx) = mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send((matvec_idx, chunk_idx, result.map_err(|e| e.to_string())));
+                });
+                receivers.push(rx);
+            }
+        }
+        self.context
             .inner
             .device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1732,6 +1913,43 @@ mod tests {
         let gpu_a = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_a).unwrap();
         let gpu_b = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_b).unwrap();
         let outputs = GpuQ8MatVec::forward_many_same_input(&[&gpu_a, &gpu_b], &x).unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        for (expected, actual) in cpu_a.as_slice().iter().zip(outputs[0].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+        for (expected, actual) in cpu_b.as_slice().iter().zip(outputs[1].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+    }
+
+    #[test]
+    fn q8_shared_input_batch_matches_cpu_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("shared-input GPU Q8 batch test skipped: no usable wgpu adapter");
+            return;
+        };
+        let weight_a = [
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ];
+        let weight_b = [
+            f16::from_f32(-1.0),
+            f16::from_f32(0.5),
+            f16::from_f32(2.0),
+            f16::from_f32(-0.25),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.75, -1.25]).unwrap();
+        let q8_a = Q8LinearWeight::from_f16(&weight_a, 2, 2).unwrap();
+        let q8_b = Q8LinearWeight::from_f16(&weight_b, 2, 2).unwrap();
+        let cpu_a = linear_forward_q8(&x, &q8_a).unwrap();
+        let cpu_b = linear_forward_q8(&x, &q8_b).unwrap();
+        let gpu_a = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_a).unwrap();
+        let gpu_b = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_b).unwrap();
+        let batch = GpuQ8SameInputBatch::new(&[&gpu_a, &gpu_b]).unwrap();
+        let outputs = batch.forward(&[&gpu_a, &gpu_b], &x).unwrap();
 
         assert_eq!(outputs.len(), 2);
         for (expected, actual) in cpu_a.as_slice().iter().zip(outputs[0].as_slice()) {
