@@ -16,7 +16,7 @@ param(
     [bool]$Chat = $true,
     [switch]$ProfileTokens,
     [string[]]$RsinferDevices = @("cpu"),
-    [int]$GpuLayers = 0,
+    [Nullable[int]]$GpuLayers = $null,
     [string]$RsinferQuantization = "none",
     [string[]]$RsinferQuantizations = @(),
     [int]$LlamaBenchPromptTokens = 8,
@@ -159,7 +159,7 @@ foreach ($device in $normalizedRsinferDevices) {
         throw "Unsupported rsinfer device '$device'. Expected one of: cpu, auto, hybrid."
     }
 }
-if ($GpuLayers -lt 0) {
+if ($null -ne $GpuLayers -and $GpuLayers -lt 0) {
     throw "GpuLayers must be non-negative."
 }
 if ($LlamaBenchPromptTokens -lt 1) {
@@ -216,7 +216,7 @@ $rsinferCommands = New-Object System.Collections.Generic.List[object]
 foreach ($device in $normalizedRsinferDevices) {
     foreach ($quantization in $normalizedQuantizations) {
         $deviceArgs = $commonRsinferArgs + @("--device", $device)
-        if ($device -ne "cpu" -and $GpuLayers -gt 0) {
+        if ($device -ne "cpu" -and $null -ne $GpuLayers) {
             $deviceArgs += @("--gpu-layers", "$GpuLayers")
         }
         if ($quantization -ne "none") {
@@ -288,7 +288,7 @@ if ($DryRun) {
 }
 
 New-Item -ItemType Directory -Force -Path $outputFull | Out-Null
-$runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$runStamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
 $results = New-Object System.Collections.Generic.List[object]
 
 for ($i = 1; $i -le $Repeat; $i++) {
@@ -332,7 +332,7 @@ $summary = [pscustomobject]@{
     chat = $Chat
     profile_tokens = [bool]$ProfileTokens
     rsinfer_devices = $normalizedRsinferDevices
-    gpu_layers = $GpuLayers
+    gpu_layers = if ($null -eq $GpuLayers) { $null } else { [int]$GpuLayers }
     rsinfer_quantizations = $normalizedQuantizations
     llama_bench_prompt_tokens = $LlamaBenchPromptTokens
     results = $results

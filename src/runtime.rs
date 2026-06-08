@@ -192,7 +192,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 );
             };
 
-            let estimated = estimate_gpu_layers(config, &gpu);
+            let estimated = estimate_gpu_layers(config, &gpu, options.quantization);
             let requested = options.gpu_layers;
             let requested_or_estimated = requested.unwrap_or(estimated);
             let gpu_layers = requested_or_estimated
@@ -221,10 +221,17 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 ));
             }
             if options.gpu_layers.is_none() {
-                notes.push(
-                    "GPU layer count was conservatively estimated from visible GPU memory."
-                        .to_string(),
-                );
+                if options.quantization == QuantizationMode::Q8 {
+                    notes.push(
+                        "Q8 hybrid defaults transformer decode GPU layers to 0 because local token profiling showed partial transformer offload slower than CPU Q8 for this backend; pass --gpu-layers to override."
+                            .to_string(),
+                    );
+                } else {
+                    notes.push(
+                        "GPU layer count was conservatively estimated from visible GPU memory."
+                            .to_string(),
+                    );
+                }
             }
 
             RuntimePlan {
@@ -348,7 +355,15 @@ impl RuntimePlan {
     }
 }
 
-fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
+fn estimate_gpu_layers(
+    config: &Qwen3Config,
+    gpu: &GpuInfo,
+    quantization: QuantizationMode,
+) -> usize {
+    if quantization == QuantizationMode::Q8 {
+        return 0;
+    }
+
     let Some(memory_mib) = gpu.memory_total_mib else {
         return 0;
     };
@@ -473,7 +488,7 @@ mod tests {
             memory_total_mib: Some(8192),
             driver_version: Some("1.0".to_string()),
         };
-        let layers = estimate_gpu_layers(&config, &gpu);
+        let layers = estimate_gpu_layers(&config, &gpu, QuantizationMode::None);
         assert!(layers <= config.num_hidden_layers);
 
         let text = RuntimePlan {
@@ -495,5 +510,17 @@ mod tests {
         assert!(text.contains("cpu-execution-with-planned-gpu-placement"));
         assert!(text.contains("2 GPU / 2 CPU"));
         assert!(text.contains("runtime.quantization: none"));
+    }
+
+    #[test]
+    fn q8_auto_estimate_keeps_transformer_layers_on_cpu() {
+        let config = test_config();
+        let gpu = GpuInfo {
+            name: "Test GPU".to_string(),
+            memory_total_mib: Some(8192),
+            driver_version: Some("1.0".to_string()),
+        };
+
+        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 0);
     }
 }
