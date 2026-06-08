@@ -52,16 +52,12 @@ impl Sampler for CombinedSampler {
         }
 
         let inv_t = 1.0 / self.temperature;
-        let mut scaled: Vec<f32> = data.iter().map(|&x| x * inv_t).collect();
-
-        if self.top_k > 0 && self.top_k < scaled.len() {
-            let mut idx: Vec<usize> = (0..scaled.len()).collect();
-            idx.sort_unstable_by(|&a, &b| cmp_desc(scaled[a], scaled[b]));
-            for &i in idx.iter().skip(self.top_k) {
-                scaled[i] = f32::NEG_INFINITY;
-            }
+        if self.top_k > 0 && self.top_k < data.len() {
+            let candidates = top_k_indices(data, self.top_k);
+            return sample_ordered_candidates(data, &candidates, inv_t, self.top_p);
         }
 
+        let scaled: Vec<f32> = data.iter().map(|&x| x * inv_t).collect();
         let probs = softmax(&scaled);
         let mut order: Vec<usize> = (0..probs.len()).collect();
         order.sort_unstable_by(|&a, &b| cmp_desc(probs[a], probs[b]));
@@ -92,6 +88,51 @@ impl Sampler for CombinedSampler {
     fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
     }
+}
+
+fn top_k_indices(data: &[f32], top_k: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..data.len()).collect();
+    if top_k < idx.len() {
+        idx.select_nth_unstable_by(top_k, |&a, &b| cmp_desc(data[a], data[b]));
+        idx.truncate(top_k);
+    }
+    idx.sort_unstable_by(|&a, &b| cmp_desc(data[a], data[b]));
+    idx
+}
+
+fn sample_ordered_candidates(data: &[f32], ordered: &[usize], inv_t: f32, top_p: f32) -> u32 {
+    let max = ordered
+        .iter()
+        .map(|&i| data[i] * inv_t)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = ordered
+        .iter()
+        .map(|&i| (data[i] * inv_t - max).exp())
+        .collect();
+    let sum: f32 = exp.iter().sum();
+
+    let mut cumulative = 0.0;
+    let mut cutoff = ordered.len();
+    for (rank, &prob) in exp.iter().enumerate() {
+        cumulative += prob / sum;
+        if cumulative >= top_p {
+            cutoff = rank + 1;
+            break;
+        }
+    }
+
+    let kept = &ordered[..cutoff];
+    let kept_exp = &exp[..cutoff];
+    let kept_sum: f32 = kept_exp.iter().sum();
+    let r: f32 = rand::thread_rng().gen::<f32>() * kept_sum;
+    let mut acc = 0.0;
+    for (&i, &weight) in kept.iter().zip(kept_exp) {
+        acc += weight;
+        if r < acc {
+            return i as u32;
+        }
+    }
+    *kept.last().unwrap() as u32
 }
 
 pub fn default_sampler() -> Box<dyn Sampler> {
@@ -131,5 +172,35 @@ mod tests {
     fn zero_temperature_is_greedy() {
         let logits = Tensor::from_f32_slice(&[5], &[1.0, 2.0, 5.0, 3.0, 4.0]).unwrap();
         assert_eq!(CombinedSampler::new(0.0, 0, 1.0).sample(&logits), 2);
+    }
+
+    #[test]
+    fn top_k_indices_keep_only_highest_logits_in_order() {
+        let logits = [0.1, 3.0, -1.0, 2.5, 5.0, 4.0];
+
+        let indices = top_k_indices(&logits, 3);
+
+        assert_eq!(indices, vec![4, 5, 1]);
+    }
+
+    #[test]
+    fn top_k_sampling_never_returns_filtered_token() {
+        let logits = Tensor::from_f32_slice(&[5], &[100.0, 90.0, 80.0, -1000.0, -1000.0]).unwrap();
+        let sampler = CombinedSampler::new(0.6, 2, 1.0);
+
+        for _ in 0..64 {
+            let token = sampler.sample(&logits);
+            assert!(token == 0 || token == 1);
+        }
+    }
+
+    #[test]
+    fn top_p_can_cut_top_k_candidates_to_first_token() {
+        let logits = Tensor::from_f32_slice(&[4], &[20.0, 1.0, 0.0, -1.0]).unwrap();
+        let sampler = CombinedSampler::new(1.0, 3, 0.5);
+
+        for _ in 0..16 {
+            assert_eq!(sampler.sample(&logits), 0);
+        }
     }
 }
