@@ -275,6 +275,35 @@ pub fn softmax(x: &Tensor, dim: usize) -> Result<Tensor> {
 ///
 /// x_normalized = x / sqrt(mean(x^2) + eps) * weight
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let shape = x.shape().to_vec();
+    let Some((&last_dim, prefix)) = shape.split_last() else {
+        return Err(RsinferError::DimensionError(
+            "rms_norm expects at least 1D input".into(),
+        ));
+    };
+    if weight.shape() == [last_dim] {
+        if let (Some(input), Some(weight)) = (x.data.as_slice(), weight.data.as_slice()) {
+            let rows = prefix.iter().product::<usize>();
+            let mut output = vec![0f32; input.len()];
+            output
+                .par_chunks_mut(last_dim)
+                .zip(input.par_chunks(last_dim))
+                .take(rows)
+                .for_each(|(out_row, in_row)| {
+                    let mean_sq =
+                        in_row.iter().map(|value| value * value).sum::<f32>() / last_dim as f32;
+                    let scale = 1.0 / (mean_sq + eps).sqrt();
+                    for ((out, &value), &weight) in out_row.iter_mut().zip(in_row).zip(weight) {
+                        *out = value * scale * weight;
+                    }
+                });
+            return Ok(Tensor {
+                data: ArrayD::from_shape_vec(IxDyn(&shape), output)
+                    .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+            });
+        }
+    }
+
     let data = &x.data;
     let last_dim = x.ndim() - 1;
 
