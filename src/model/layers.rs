@@ -299,12 +299,12 @@ impl Attention {
 
         let (q, k, v) = if seq_len == 1 {
             match (
-                self.q_proj.gpu_matvec(),
-                self.k_proj.gpu_matvec(),
-                self.v_proj.gpu_matvec(),
+                self.q_proj.q8_gpu_matvec(),
+                self.k_proj.q8_gpu_matvec(),
+                self.v_proj.q8_gpu_matvec(),
             ) {
                 (Some(q_proj), Some(k_proj), Some(v_proj)) => {
-                    match GpuMatVec::forward_many_same_input(
+                    match GpuQ8MatVec::forward_many_same_input(
                         &[q_proj, k_proj, v_proj],
                         hidden_states,
                     ) {
@@ -314,18 +314,10 @@ impl Attention {
                             let q = outputs.pop().unwrap();
                             (q, k, v)
                         }
-                        _ => (
-                            self.q_proj.forward(hidden_states)?,
-                            self.k_proj.forward(hidden_states)?,
-                            self.v_proj.forward(hidden_states)?,
-                        ),
+                        _ => self.forward_qkv_decode_fallback(hidden_states)?,
                     }
                 }
-                _ => (
-                    self.q_proj.forward(hidden_states)?,
-                    self.k_proj.forward(hidden_states)?,
-                    self.v_proj.forward(hidden_states)?,
-                ),
+                _ => self.forward_qkv_decode_fallback(hidden_states)?,
             }
         } else {
             (
@@ -363,6 +355,38 @@ impl Attention {
         let attn = transpose_back(&attn, seq_len, self.num_heads)?
             .reshape(&[seq_len, self.num_heads * self.head_dim])?;
         self.o_proj.forward(&attn)
+    }
+
+    fn forward_qkv_decode_fallback(
+        &self,
+        hidden_states: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        match (
+            self.q_proj.gpu_matvec(),
+            self.k_proj.gpu_matvec(),
+            self.v_proj.gpu_matvec(),
+        ) {
+            (Some(q_proj), Some(k_proj), Some(v_proj)) => {
+                match GpuMatVec::forward_many_same_input(&[q_proj, k_proj, v_proj], hidden_states) {
+                    Ok(mut outputs) if outputs.len() == 3 => {
+                        let v = outputs.pop().unwrap();
+                        let k = outputs.pop().unwrap();
+                        let q = outputs.pop().unwrap();
+                        Ok((q, k, v))
+                    }
+                    _ => Ok((
+                        self.q_proj.forward(hidden_states)?,
+                        self.k_proj.forward(hidden_states)?,
+                        self.v_proj.forward(hidden_states)?,
+                    )),
+                }
+            }
+            _ => Ok((
+                self.q_proj.forward(hidden_states)?,
+                self.k_proj.forward(hidden_states)?,
+                self.v_proj.forward(hidden_states)?,
+            )),
+        }
     }
 }
 

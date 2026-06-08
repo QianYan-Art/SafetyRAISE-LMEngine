@@ -623,82 +623,124 @@ impl GpuQ8MatVec {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, String> {
-        if x.ndim() != 2 || x.shape() != [1, self.in_features] {
+        let mut outputs = Self::forward_many_same_input(&[self], x)?;
+        outputs
+            .pop()
+            .ok_or_else(|| "GPU Q8 matvec returned no output".to_string())
+    }
+
+    pub fn forward_many_same_input(
+        matvecs: &[&GpuQ8MatVec],
+        x: &Tensor,
+    ) -> Result<Vec<Tensor>, String> {
+        if matvecs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = matvecs[0];
+        if x.ndim() != 2 || x.shape() != [1, first.in_features] {
             return Err(format!(
                 "GPU Q8 matvec expects [1, {}], got {:?}",
-                self.in_features,
+                first.in_features,
                 x.shape()
             ));
+        }
+        if matvecs
+            .iter()
+            .any(|matvec| matvec.in_features != first.in_features)
+        {
+            return Err("GPU Q8 matvec batch requires the same input width".to_string());
+        }
+        if matvecs
+            .iter()
+            .any(|matvec| !Arc::ptr_eq(&matvec.context.inner, &first.context.inner))
+        {
+            return Err("GPU Q8 matvec batch requires a shared GpuContext".to_string());
         }
 
         let x_std = x.data.as_standard_layout();
         let input = x_std
             .as_slice()
             .ok_or_else(|| "GPU Q8 matvec input is not contiguous".to_string())?;
-        self.context
-            .inner
-            .queue
-            .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(input));
+        for matvec in matvecs {
+            matvec.context.inner.queue.write_buffer(
+                &matvec.input_buffer,
+                0,
+                bytemuck::cast_slice(input),
+            );
+        }
 
         let mut encoder =
-            self.context
+            first
+                .context
                 .inner
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("rsinfer-q8-matvec-encoder"),
                 });
-        for chunk in &self.chunks {
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("rsinfer-q8-matvec-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
-                pass.set_bind_group(0, &chunk.bind_group, &[]);
-                let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
-                pass.dispatch_workgroups(workgroups, 1, 1);
+        for matvec in matvecs {
+            for chunk in &matvec.chunks {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rsinfer-q8-matvec-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&first.context.inner.q8_matvec_pipeline);
+                    pass.set_bind_group(0, &chunk.bind_group, &[]);
+                    let workgroups = (chunk.out_features as u32).div_ceil(WORKGROUP_SIZE);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &chunk.output_buffer,
+                    0,
+                    &chunk.readback_buffer,
+                    0,
+                    bytes_len(chunk.out_features),
+                );
             }
-            encoder.copy_buffer_to_buffer(
-                &chunk.output_buffer,
-                0,
-                &chunk.readback_buffer,
-                0,
-                bytes_len(chunk.out_features),
-            );
         }
-        self.context.inner.queue.submit(Some(encoder.finish()));
+        first.context.inner.queue.submit(Some(encoder.finish()));
 
         let mut receivers = Vec::new();
-        for (chunk_idx, chunk) in self.chunks.iter().enumerate() {
-            let slice = chunk.readback_buffer.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send((chunk_idx, result.map_err(|e| e.to_string())));
-            });
-            receivers.push(rx);
+        for (matvec_idx, matvec) in matvecs.iter().enumerate() {
+            for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
+                let slice = chunk.readback_buffer.slice(..);
+                let (tx, rx) = mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send((matvec_idx, chunk_idx, result.map_err(|e| e.to_string())));
+                });
+                receivers.push(rx);
+            }
         }
-        self.context
+        first
+            .context
             .inner
             .device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| format!("device poll failed: {e}"))?;
 
         for rx in receivers {
-            let (_, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
+            let (_, _, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
             result?;
         }
 
-        let mut output = vec![0f32; self.out_features];
-        for chunk in &self.chunks {
-            let slice = chunk.readback_buffer.slice(..);
-            let mapped = slice.get_mapped_range();
-            let values = bytemuck::cast_slice::<u8, f32>(&mapped);
-            output[chunk.out_offset..chunk.out_offset + chunk.out_features].copy_from_slice(values);
-            drop(mapped);
-            chunk.readback_buffer.unmap();
+        let mut outputs = Vec::with_capacity(matvecs.len());
+        for matvec in matvecs {
+            let mut output = vec![0f32; matvec.out_features];
+            for chunk in &matvec.chunks {
+                let slice = chunk.readback_buffer.slice(..);
+                let mapped = slice.get_mapped_range();
+                let values = bytemuck::cast_slice::<u8, f32>(&mapped);
+                output[chunk.out_offset..chunk.out_offset + chunk.out_features]
+                    .copy_from_slice(values);
+                drop(mapped);
+                chunk.readback_buffer.unmap();
+            }
+            outputs.push(
+                Tensor::from_f32_slice(&[1, matvec.out_features], &output)
+                    .map_err(|e| e.to_string())?,
+            );
         }
-
-        Tensor::from_f32_slice(&[1, self.out_features], &output).map_err(|e| e.to_string())
+        Ok(outputs)
     }
 }
 
@@ -1352,6 +1394,42 @@ mod tests {
             max_abs <= 1e-4,
             "GPU Q8 matvec max abs diff {max_abs} exceeded tolerance"
         );
+    }
+
+    #[test]
+    fn q8_batched_same_input_matvecs_match_cpu_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("batched GPU Q8 matvec test skipped: no usable wgpu adapter");
+            return;
+        };
+        let weight_a = [
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ];
+        let weight_b = [
+            f16::from_f32(-1.0),
+            f16::from_f32(0.5),
+            f16::from_f32(2.0),
+            f16::from_f32(-0.25),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.75, -1.25]).unwrap();
+        let q8_a = Q8LinearWeight::from_f16(&weight_a, 2, 2).unwrap();
+        let q8_b = Q8LinearWeight::from_f16(&weight_b, 2, 2).unwrap();
+        let cpu_a = linear_forward_q8(&x, &q8_a).unwrap();
+        let cpu_b = linear_forward_q8(&x, &q8_b).unwrap();
+        let gpu_a = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_a).unwrap();
+        let gpu_b = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8_b).unwrap();
+        let outputs = GpuQ8MatVec::forward_many_same_input(&[&gpu_a, &gpu_b], &x).unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        for (expected, actual) in cpu_a.as_slice().iter().zip(outputs[0].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+        for (expected, actual) in cpu_b.as_slice().iter().zip(outputs[1].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
     }
 
     #[test]
