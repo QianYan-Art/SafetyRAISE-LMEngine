@@ -3,6 +3,9 @@
 //! 支持 f32、f16、bf16 数据类型的转换。
 
 use half::{bf16, f16};
+use rayon::prelude::*;
+
+const PARALLEL_CONVERT_THRESHOLD: usize = 1 << 20;
 
 /// 支持的数值类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,14 +30,22 @@ impl DType {
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     let f16_slice =
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f16, bytes.len() / 2) };
-    f16_slice.iter().map(|x| x.to_f32()).collect()
+    if f16_slice.len() >= PARALLEL_CONVERT_THRESHOLD {
+        f16_slice.par_iter().map(|x| x.to_f32()).collect()
+    } else {
+        f16_slice.iter().map(|x| x.to_f32()).collect()
+    }
 }
 
 /// 将 bf16 字节切片转换为 f32 向量
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     let bf16_slice =
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const bf16, bytes.len() / 2) };
-    bf16_slice.iter().map(|x| x.to_f32()).collect()
+    if bf16_slice.len() >= PARALLEL_CONVERT_THRESHOLD {
+        bf16_slice.par_iter().map(|x| x.to_f32()).collect()
+    } else {
+        bf16_slice.iter().map(|x| x.to_f32()).collect()
+    }
 }
 
 /// 将 f32 字节切片转换为 f32 向量
