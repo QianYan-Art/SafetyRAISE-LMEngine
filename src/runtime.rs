@@ -8,6 +8,8 @@ use std::process::Command;
 
 use crate::model::Qwen3Config;
 
+const MAX_ACTIVE_TRANSFORMER_GPU_LAYERS: usize = 4;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevicePreference {
     Cpu,
@@ -68,6 +70,7 @@ pub struct RuntimePlan {
     pub compute_backend: String,
     pub gpu: Option<GpuInfo>,
     pub layer_devices: Vec<LayerDevice>,
+    pub transformer_decode_gpu_layers: usize,
     pub lm_head_device: LayerDevice,
     pub notes: Vec<String>,
 }
@@ -79,6 +82,7 @@ impl RuntimePlan {
             compute_backend: "cpu".to_string(),
             gpu: None,
             layer_devices: vec![LayerDevice::Cpu; num_layers],
+            transformer_decode_gpu_layers: 0,
             lm_head_device: LayerDevice::Cpu,
             notes: vec![note],
         }
@@ -116,6 +120,11 @@ impl fmt::Display for RuntimePlan {
                 .len()
                 .saturating_sub(self.gpu_layer_count())
         )?;
+        writeln!(
+            f,
+            "runtime.transformer_decode_gpu_layers: {}",
+            self.transformer_decode_gpu_layers
+        )?;
         writeln!(f, "runtime.lm_head: {}", self.lm_head_device)?;
         for note in &self.notes {
             writeln!(f, "runtime.note: {note}")?;
@@ -142,25 +151,32 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 );
             };
 
-            let requested = options
-                .gpu_layers
-                .unwrap_or_else(|| estimate_gpu_layers(config, &gpu));
-            let gpu_layers = requested.min(config.num_hidden_layers);
+            let estimated = estimate_gpu_layers(config, &gpu);
+            let requested = options.gpu_layers.unwrap_or(estimated);
+            let gpu_layers = requested
+                .min(estimated.max(options.gpu_layers.unwrap_or(0).min(1)))
+                .min(config.num_hidden_layers)
+                .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS);
             let mut layer_devices = vec![LayerDevice::Cpu; config.num_hidden_layers];
             for device in layer_devices.iter_mut().take(gpu_layers) {
                 *device = LayerDevice::Gpu;
             }
 
             let mut notes = vec![
-                "Transformer layer GPU kernels are not implemented yet; planned layer placement is not active acceleration."
+                "Transformer attention/KV/prefill GPU kernels are not implemented yet; only selected decode linear matvecs can be active GPU work."
                     .to_string(),
-                "Layer placement is a forward-compatible plan for the upcoming GPU linear/attention kernels."
+                "Layer placement controls optional decode linear GPU offload and remains CPU fallback compatible."
                     .to_string(),
             ];
             if requested > config.num_hidden_layers {
                 notes.push(format!(
                     "--gpu-layers requested {requested}, clamped to {} transformer layers.",
                     config.num_hidden_layers
+                ));
+            }
+            if requested > gpu_layers {
+                notes.push(format!(
+                    "--gpu-layers requested {requested}, active transformer GPU layers capped to {gpu_layers} for this wgpu/f32 backend."
                 ));
             }
             if options.gpu_layers.is_none() {
@@ -172,6 +188,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 compute_backend: "cpu-execution-with-planned-gpu-placement".to_string(),
                 gpu: Some(gpu),
                 layer_devices,
+                transformer_decode_gpu_layers: 0,
                 lm_head_device: LayerDevice::Cpu,
                 notes,
             }
@@ -182,7 +199,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
 impl RuntimePlan {
     pub fn mark_lm_head_gpu(&mut self) {
         self.lm_head_device = LayerDevice::Gpu;
-        self.compute_backend = "cpu-transformer-gpu-lm-head".to_string();
+        self.refresh_compute_backend();
         self.notes
             .push("lm_head matvec is using the optional wgpu backend.".to_string());
     }
@@ -198,6 +215,40 @@ impl RuntimePlan {
     pub fn should_try_lm_head_gpu(&self) -> bool {
         self.requested_device != DevicePreference::Cpu && self.gpu.is_some()
     }
+
+    pub fn planned_transformer_gpu_layers(&self) -> usize {
+        self.gpu_layer_count()
+    }
+
+    pub fn mark_transformer_decode_gpu_layers(&mut self, active_layers: usize, attached: usize) {
+        self.transformer_decode_gpu_layers = active_layers;
+        self.refresh_compute_backend();
+        if active_layers > 0 {
+            self.notes.push(format!(
+                "decode matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels; prefill still falls back to CPU."
+            ));
+        }
+    }
+
+    pub fn mark_transformer_gpu_fallback(&mut self, reason: impl Into<String>) {
+        self.notes.push(format!(
+            "transformer decode GPU backend unavailable or partial; using CPU fallback where needed: {}",
+            reason.into()
+        ));
+    }
+
+    fn refresh_compute_backend(&mut self) {
+        self.compute_backend = match (
+            self.transformer_decode_gpu_layers > 0,
+            self.lm_head_device == LayerDevice::Gpu,
+        ) {
+            (true, true) => "cpu-prefill-gpu-decode-linears-gpu-lm-head".to_string(),
+            (true, false) => "cpu-prefill-gpu-decode-linears".to_string(),
+            (false, true) => "cpu-transformer-gpu-lm-head".to_string(),
+            (false, false) if self.requested_device == DevicePreference::Cpu => "cpu".to_string(),
+            (false, false) => "cpu-execution-with-planned-gpu-placement".to_string(),
+        };
+    }
 }
 
 fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
@@ -208,8 +259,9 @@ fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
         return 0;
     }
 
-    let reserve_mib = 1536usize;
-    let usable_mib = memory_mib.saturating_sub(reserve_mib);
+    let reserve_mib = 2048usize;
+    let lm_head_mib = estimate_lm_head_bytes(config) / (1024 * 1024);
+    let usable_mib = memory_mib.saturating_sub(reserve_mib + lm_head_mib);
     let bytes_per_layer = estimate_transformer_layer_bytes(config);
     if bytes_per_layer == 0 {
         return 0;
@@ -217,6 +269,7 @@ fn estimate_gpu_layers(config: &Qwen3Config, gpu: &GpuInfo) -> usize {
 
     let fit = (usable_mib * 1024 * 1024) / bytes_per_layer;
     fit.min(config.num_hidden_layers)
+        .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS)
 }
 
 fn estimate_transformer_layer_bytes(config: &Qwen3Config) -> usize {
@@ -232,7 +285,11 @@ fn estimate_transformer_layer_bytes(config: &Qwen3Config) -> usize {
     let up_proj = intermediate * hidden;
     let down_proj = hidden * intermediate;
 
-    (q_proj + k_proj + v_proj + o_proj + gate_proj + up_proj + down_proj) * 2
+    (q_proj + k_proj + v_proj + o_proj + gate_proj + up_proj + down_proj) * 4
+}
+
+fn estimate_lm_head_bytes(config: &Qwen3Config) -> usize {
+    config.vocab_size * config.hidden_size * 4
 }
 
 fn detect_nvidia_gpu() -> Option<GpuInfo> {
@@ -331,6 +388,7 @@ mod tests {
                 LayerDevice::Cpu,
                 LayerDevice::Cpu,
             ],
+            transformer_decode_gpu_layers: 0,
             lm_head_device: LayerDevice::Cpu,
             notes: vec!["GPU kernels are not implemented yet.".to_string()],
         }

@@ -145,6 +145,23 @@ pub struct Attention {
 }
 
 impl Attention {
+    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
+        let mut attached = 0usize;
+        let mut errors = Vec::new();
+        for (name, linear) in [
+            ("q_proj", &mut self.q_proj),
+            ("k_proj", &mut self.k_proj),
+            ("v_proj", &mut self.v_proj),
+            ("o_proj", &mut self.o_proj),
+        ] {
+            match linear.try_enable_gpu_matvec() {
+                Ok(()) => attached += 1,
+                Err(err) => errors.push(format!("attention.{name}: {err}")),
+            }
+        }
+        (attached, errors)
+    }
+
     /// 前向传播
     ///
     /// hidden_states: [seq_len, hidden_size]
@@ -262,6 +279,22 @@ impl Mlp {
         let hidden = gate.mul(&up)?;
         self.down_proj.forward(&hidden)
     }
+
+    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
+        let mut attached = 0usize;
+        let mut errors = Vec::new();
+        for (name, linear) in [
+            ("gate_proj", &mut self.gate_proj),
+            ("up_proj", &mut self.up_proj),
+            ("down_proj", &mut self.down_proj),
+        ] {
+            match linear.try_enable_gpu_matvec() {
+                Ok(()) => attached += 1,
+                Err(err) => errors.push(format!("mlp.{name}: {err}")),
+            }
+        }
+        (attached, errors)
+    }
 }
 
 /// Transformer Block
@@ -314,6 +347,13 @@ impl TransformerBlock {
 
         // Residual connection
         hidden_states.add(&mlp_output)
+    }
+
+    pub fn try_enable_gpu_matvecs(&mut self) -> (usize, Vec<String>) {
+        let (attn_count, mut errors) = self.attention.try_enable_gpu_matvecs();
+        let (mlp_count, mlp_errors) = self.mlp.try_enable_gpu_matvecs();
+        errors.extend(mlp_errors);
+        (attn_count + mlp_count, errors)
     }
 }
 

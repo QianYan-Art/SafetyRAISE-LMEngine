@@ -52,6 +52,26 @@ impl Qwen3Model {
         for layer_idx in 0..config.num_hidden_layers {
             layers.push(build_transformer_block(weights, config, layer_idx)?);
         }
+        let planned_gpu_layers = runtime_plan.planned_transformer_gpu_layers();
+        if planned_gpu_layers > 0 {
+            let mut active_layers = 0usize;
+            let mut attached_linears = 0usize;
+            let mut fallback_errors = Vec::new();
+            for (layer_idx, layer) in layers.iter_mut().enumerate().take(planned_gpu_layers) {
+                let (attached, errors) = layer.try_enable_gpu_matvecs();
+                if attached > 0 {
+                    active_layers += 1;
+                    attached_linears += attached;
+                }
+                if !errors.is_empty() {
+                    fallback_errors.push(format!("layer {layer_idx}: {}", errors.join("; ")));
+                }
+            }
+            runtime_plan.mark_transformer_decode_gpu_layers(active_layers, attached_linears);
+            if !fallback_errors.is_empty() {
+                runtime_plan.mark_transformer_gpu_fallback(fallback_errors.join(" | "));
+            }
+        }
 
         let norm = RmsNorm::new(
             get_weight(weights, "model.norm.weight")?,
