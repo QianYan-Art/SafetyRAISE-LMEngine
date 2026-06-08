@@ -16,6 +16,7 @@ param(
     [bool]$Chat = $true,
     [string[]]$RsinferDevices = @("cpu"),
     [int]$GpuLayers = 0,
+    [string]$RsinferQuantization = "none",
     [int]$LlamaBenchPromptTokens = 8,
     [string[]]$LlamaExtraArgs = @(),
     [string]$OutputDir = "target\benchmarks",
@@ -162,6 +163,10 @@ if ($GpuLayers -lt 0) {
 if ($LlamaBenchPromptTokens -lt 1) {
     throw "LlamaBenchPromptTokens must be positive."
 }
+$normalizedQuantization = $RsinferQuantization.Trim().ToLowerInvariant()
+if ($normalizedQuantization -notin @("none", "q8")) {
+    throw "Unsupported rsinfer quantization '$RsinferQuantization'. Expected one of: none, q8."
+}
 
 $outputFull = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDir))
 if (Test-IsUnderPath -Candidate $outputFull -Parent $safetensorsDir) {
@@ -192,6 +197,9 @@ foreach ($device in $normalizedRsinferDevices) {
     $deviceArgs = $commonRsinferArgs + @("--device", $device)
     if ($device -ne "cpu" -and $GpuLayers -gt 0) {
         $deviceArgs += @("--gpu-layers", "$GpuLayers")
+    }
+    if ($normalizedQuantization -ne "none") {
+        $deviceArgs += @("--quantization", $normalizedQuantization)
     }
 
     if ($resolvedRsinferExe) {
@@ -301,6 +309,7 @@ $summary = [pscustomobject]@{
     chat = $Chat
     rsinfer_devices = $normalizedRsinferDevices
     gpu_layers = $GpuLayers
+    rsinfer_quantization = $normalizedQuantization
     llama_bench_prompt_tokens = $LlamaBenchPromptTokens
     results = $results
 }

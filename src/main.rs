@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use rsinfer::engine::{CombinedSampler, Generator, GreedySampler, Sampler};
-use rsinfer::runtime::{DevicePreference, RuntimeOptions};
+use rsinfer::runtime::{DevicePreference, QuantizationMode, RuntimeOptions};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DeviceArg {
@@ -14,12 +14,27 @@ enum DeviceArg {
     Hybrid,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum QuantizationArg {
+    None,
+    Q8,
+}
+
 impl From<DeviceArg> for DevicePreference {
     fn from(value: DeviceArg) -> Self {
         match value {
             DeviceArg::Cpu => DevicePreference::Cpu,
             DeviceArg::Auto => DevicePreference::Auto,
             DeviceArg::Hybrid => DevicePreference::Hybrid,
+        }
+    }
+}
+
+impl From<QuantizationArg> for QuantizationMode {
+    fn from(value: QuantizationArg) -> Self {
+        match value {
+            QuantizationArg::None => Self::None,
+            QuantizationArg::Q8 => Self::Q8,
         }
     }
 }
@@ -71,6 +86,10 @@ struct Args {
     /// 计划放到 GPU 的 Transformer 层数；当前 GPU kernel 未接入，执行仍会明确标注为 CPU
     #[arg(long)]
     gpu_layers: Option<usize>,
+
+    /// 权重量化路径: none 保持 f16；q8 启用行级 Q8 CPU linear fallback
+    #[arg(long, value_enum, default_value_t = QuantizationArg::None)]
+    quantization: QuantizationArg,
 }
 
 const IM_START: &str = "\x3c|im_start|>";
@@ -117,6 +136,7 @@ fn main() -> rsinfer::Result<()> {
     let runtime_options = RuntimeOptions {
         device: args.device.into(),
         gpu_layers: args.gpu_layers,
+        quantization: args.quantization.into(),
     };
     let generator = Generator::from_pretrained_with_options(&args.model_path, &runtime_options)?;
     println!("模型加载完成，耗时: {:.2}s", start.elapsed().as_secs_f32());

@@ -178,6 +178,20 @@ pub struct Attention {
 }
 
 impl Attention {
+    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
+        let mut attached = 0usize;
+        for linear in [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+        ] {
+            linear.try_enable_q8_weight()?;
+            attached += 1;
+        }
+        Ok(attached)
+    }
+
     pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
         let mut attached = 0usize;
         let mut errors = Vec::new();
@@ -370,6 +384,15 @@ impl Mlp {
         self.down_proj.forward(&hidden)
     }
 
+    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
+        let mut attached = 0usize;
+        for linear in [&mut self.gate_proj, &mut self.up_proj, &mut self.down_proj] {
+            linear.try_enable_q8_weight()?;
+            attached += 1;
+        }
+        Ok(attached)
+    }
+
     pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {
         let mut attached = 0usize;
         let mut errors = Vec::new();
@@ -460,6 +483,10 @@ impl TransformerBlock {
         let (mlp_count, mlp_errors) = self.mlp.try_enable_gpu_matvecs(context);
         errors.extend(mlp_errors);
         (attn_count + mlp_count, errors)
+    }
+
+    pub fn try_enable_q8_weights(&mut self) -> Result<usize> {
+        Ok(self.attention.try_enable_q8_weights()? + self.mlp.try_enable_q8_weights()?)
     }
 }
 

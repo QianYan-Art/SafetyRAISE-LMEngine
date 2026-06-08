@@ -33,6 +33,21 @@ pub enum LayerDevice {
     Gpu,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizationMode {
+    None,
+    Q8,
+}
+
+impl QuantizationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Q8 => "q8",
+        }
+    }
+}
+
 impl fmt::Display for LayerDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -46,6 +61,7 @@ impl fmt::Display for LayerDevice {
 pub struct RuntimeOptions {
     pub device: DevicePreference,
     pub gpu_layers: Option<usize>,
+    pub quantization: QuantizationMode,
 }
 
 impl Default for RuntimeOptions {
@@ -53,6 +69,7 @@ impl Default for RuntimeOptions {
         Self {
             device: DevicePreference::Cpu,
             gpu_layers: None,
+            quantization: QuantizationMode::None,
         }
     }
 }
@@ -72,6 +89,7 @@ pub struct RuntimePlan {
     pub layer_devices: Vec<LayerDevice>,
     pub transformer_decode_gpu_layers: usize,
     pub lm_head_device: LayerDevice,
+    pub quantization: QuantizationMode,
     pub notes: Vec<String>,
 }
 
@@ -84,6 +102,7 @@ impl RuntimePlan {
             layer_devices: vec![LayerDevice::Cpu; num_layers],
             transformer_decode_gpu_layers: 0,
             lm_head_device: LayerDevice::Cpu,
+            quantization: QuantizationMode::None,
             notes: vec![note],
         }
     }
@@ -126,6 +145,7 @@ impl fmt::Display for RuntimePlan {
             self.transformer_decode_gpu_layers
         )?;
         writeln!(f, "runtime.lm_head: {}", self.lm_head_device)?;
+        writeln!(f, "runtime.quantization: {}", self.quantization.as_str())?;
         for note in &self.notes {
             writeln!(f, "runtime.note: {note}")?;
         }
@@ -190,6 +210,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
                 layer_devices,
                 transformer_decode_gpu_layers: 0,
                 lm_head_device: LayerDevice::Cpu,
+                quantization: options.quantization,
                 notes,
             }
         }
@@ -238,6 +259,13 @@ impl RuntimePlan {
         self.notes.push(format!(
             "transformer decode GPU backend unavailable or partial; using CPU fallback where needed: {}",
             reason.into()
+        ));
+    }
+
+    pub fn mark_q8_quantization(&mut self, attached_linears: usize) {
+        self.quantization = QuantizationMode::Q8;
+        self.notes.push(format!(
+            "Q8 linear CPU path enabled for {attached_linears} bias-free linear layer(s); GPU matvecs still take priority where attached."
         ));
     }
 
@@ -394,10 +422,12 @@ mod tests {
             ],
             transformer_decode_gpu_layers: 0,
             lm_head_device: LayerDevice::Cpu,
+            quantization: QuantizationMode::None,
             notes: vec!["GPU kernels are not implemented yet.".to_string()],
         }
         .to_string();
         assert!(text.contains("cpu-execution-with-planned-gpu-placement"));
         assert!(text.contains("2 GPU / 2 CPU"));
+        assert!(text.contains("runtime.quantization: none"));
     }
 }

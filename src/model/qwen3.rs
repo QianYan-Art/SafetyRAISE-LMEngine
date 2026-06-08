@@ -10,7 +10,7 @@ use crate::gpu::GpuContext;
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
 use crate::model::weights::{get_weight, load_weights, WeightMap};
-use crate::runtime::{build_runtime_plan, RuntimeOptions, RuntimePlan};
+use crate::runtime::{build_runtime_plan, QuantizationMode, RuntimeOptions, RuntimePlan};
 use crate::tensor::Tensor;
 
 pub struct Qwen3Model {
@@ -109,6 +109,16 @@ impl Qwen3Model {
                 Ok(()) => runtime_plan.mark_lm_head_gpu_fallback("backend was not attached"),
                 Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
             }
+        }
+
+        if runtime_options.quantization == QuantizationMode::Q8 {
+            let mut attached_linears = 0usize;
+            for layer in &mut layers {
+                attached_linears += layer.try_enable_q8_weights()?;
+            }
+            lm_head.try_enable_q8_weight()?;
+            attached_linears += 1;
+            runtime_plan.mark_q8_quantization(attached_linears);
         }
 
         Ok(Self {
