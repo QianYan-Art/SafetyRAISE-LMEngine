@@ -147,27 +147,33 @@ fn concat_along_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let head_dim = a_shape[2];
     let total_seq_len = seq_len_a + seq_len_b;
 
-    let mut result = ArrayD::zeros(IxDyn(&[num_heads, total_seq_len, head_dim]));
+    let a_std = a.data.as_standard_layout();
+    let b_std = b.data.as_standard_layout();
+    let a_slice = a_std.as_slice().ok_or_else(|| {
+        RsinferError::DimensionError("K cache old tensor is not contiguous".into())
+    })?;
+    let b_slice = b_std.as_slice().ok_or_else(|| {
+        RsinferError::DimensionError("K cache new tensor is not contiguous".into())
+    })?;
 
-    // 复制 a
+    let old_head_len = seq_len_a * head_dim;
+    let new_head_len = seq_len_b * head_dim;
+    let total_head_len = total_seq_len * head_dim;
+    let mut output = vec![0f32; num_heads * total_head_len];
     for h in 0..num_heads {
-        for s in 0..seq_len_a {
-            for d in 0..head_dim {
-                result[[h, s, d]] = a.data[[h, s, d]];
-            }
-        }
+        let out_start = h * total_head_len;
+        let old_start = h * old_head_len;
+        let new_start = h * new_head_len;
+        output[out_start..out_start + old_head_len]
+            .copy_from_slice(&a_slice[old_start..old_start + old_head_len]);
+        output[out_start + old_head_len..out_start + total_head_len]
+            .copy_from_slice(&b_slice[new_start..new_start + new_head_len]);
     }
 
-    // 复制 b
-    for h in 0..num_heads {
-        for s in 0..seq_len_b {
-            for d in 0..head_dim {
-                result[[h, seq_len_a + s, d]] = b.data[[h, s, d]];
-            }
-        }
-    }
-
-    Ok(Tensor { data: result })
+    Ok(Tensor {
+        data: ArrayD::from_shape_vec(IxDyn(&[num_heads, total_seq_len, head_dim]), output)
+            .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+    })
 }
 
 #[cfg(test)]
@@ -184,16 +190,28 @@ mod tests {
     fn test_kv_cache_append() {
         let mut cache = KVCache::new(2, 1024);
 
-        let k = Tensor::zeros(&[4, 3, 64]); // [num_heads, seq_len, head_dim]
-        let v = Tensor::zeros(&[4, 3, 64]);
+        let k = Tensor::from_f32_slice(&[2, 2, 2], &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])
+            .unwrap();
+        let v = Tensor::from_f32_slice(&[2, 2, 2], &[5.0, 6.0, 7.0, 8.0, 50.0, 60.0, 70.0, 80.0])
+            .unwrap();
 
         cache.append(0, &k, &v).unwrap();
+        assert_eq!(cache.current_len(), 2);
+
+        let k2 = Tensor::from_f32_slice(&[2, 1, 2], &[9.0, 10.0, 90.0, 100.0]).unwrap();
+        let v2 = Tensor::from_f32_slice(&[2, 1, 2], &[11.0, 12.0, 110.0, 120.0]).unwrap();
+        cache.append(0, &k2, &v2).unwrap();
         assert_eq!(cache.current_len(), 3);
 
-        // 追加更多
-        let k2 = Tensor::zeros(&[4, 2, 64]);
-        let v2 = Tensor::zeros(&[4, 2, 64]);
-        cache.append(0, &k2, &v2).unwrap();
-        assert_eq!(cache.current_len(), 5);
+        let (cached_k, cached_v) = cache.get(0).unwrap();
+        assert_eq!(cached_k.shape(), &[2, 3, 2]);
+        assert_eq!(
+            cached_k.as_slice(),
+            &[1.0, 2.0, 3.0, 4.0, 9.0, 10.0, 10.0, 20.0, 30.0, 40.0, 90.0, 100.0]
+        );
+        assert_eq!(
+            cached_v.as_slice(),
+            &[5.0, 6.0, 7.0, 8.0, 11.0, 12.0, 50.0, 60.0, 70.0, 80.0, 110.0, 120.0]
+        );
     }
 }
