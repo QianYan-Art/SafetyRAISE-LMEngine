@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::engine::sampler::{default_sampler, Sampler};
+use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
 use crate::model::Qwen3Model;
 use crate::runtime::RuntimeOptions;
@@ -95,8 +96,7 @@ impl Generator {
         let input_ids = self.encode(prompt)?;
         let mut kv_cache = self.model.create_kv_cache();
 
-        let logits = self.model.forward(&input_ids, &mut kv_cache, 0)?;
-        let mut next = self.sampler.sample(&logits.to_1d()?);
+        let mut next = self.next_token(&input_ids, &mut kv_cache, 0)?;
         let prompt_len = input_ids.len();
 
         // 逐 token 解码会截断多字节字符，故每步解码整段、只刷出已完整的新增后缀。
@@ -115,10 +115,7 @@ impl Generator {
                 printed = text.len();
             }
 
-            let logits = self
-                .model
-                .forward(&[next], &mut kv_cache, prompt_len + step)?;
-            next = self.sampler.sample(&logits.to_1d()?);
+            next = self.next_token(&[next], &mut kv_cache, prompt_len + step)?;
         }
 
         let text = self.decode(&tokens)?;
@@ -126,5 +123,26 @@ impl Generator {
             on_text(&text[printed..]);
         }
         Ok(text)
+    }
+
+    fn next_token(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KVCache,
+        position_offset: usize,
+    ) -> Result<u32> {
+        if self.sampler.is_greedy() && self.model.has_greedy_token_fast_path() {
+            let mut fast_cache = kv_cache.clone();
+            if let Ok(token) =
+                self.model
+                    .forward_greedy_token(input_ids, &mut fast_cache, position_offset)
+            {
+                *kv_cache = fast_cache;
+                return Ok(token);
+            }
+        }
+
+        let logits = self.model.forward(input_ids, kv_cache, position_offset)?;
+        Ok(self.sampler.sample(&logits.to_1d()?))
     }
 }

@@ -139,6 +139,10 @@ impl Linear {
         self.q8_gpu_matvec.as_ref()
     }
 
+    pub fn has_q8_gpu_argmax(&self) -> bool {
+        self.bias.is_none() && self.q8_gpu_matvec.is_some()
+    }
+
     pub fn try_enable_q8_gpu_matvec_with_context(
         &mut self,
         context: &GpuContext,
@@ -208,6 +212,17 @@ impl Linear {
         } else {
             Ok(result)
         }
+    }
+
+    pub fn try_forward_q8_gpu_argmax(&self, x: &Tensor) -> std::result::Result<u32, String> {
+        if !self.has_q8_gpu_argmax() {
+            return Err("Q8 GPU argmax does not support bias".to_string());
+        }
+        let q8_gpu_matvec = self
+            .q8_gpu_matvec
+            .as_ref()
+            .ok_or_else(|| "Q8 GPU matvec is not attached".to_string())?;
+        q8_gpu_matvec.forward_argmax(x)
     }
 }
 

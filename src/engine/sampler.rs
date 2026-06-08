@@ -6,6 +6,10 @@ use rand::Rng;
 pub trait Sampler: Send + Sync {
     /// logits: [vocab_size] 一维张量
     fn sample(&self, logits: &Tensor) -> u32;
+
+    fn is_greedy(&self) -> bool {
+        false
+    }
 }
 
 /// 贪心采样：取 argmax，确定性输出。
@@ -14,6 +18,10 @@ pub struct GreedySampler;
 impl Sampler for GreedySampler {
     fn sample(&self, logits: &Tensor) -> u32 {
         argmax(logits.as_slice())
+    }
+
+    fn is_greedy(&self) -> bool {
+        true
     }
 }
 
@@ -79,6 +87,10 @@ impl Sampler for CombinedSampler {
             }
         }
         *kept.last().unwrap() as u32
+    }
+
+    fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
     }
 }
 

@@ -253,7 +253,7 @@ impl RuntimePlan {
         self.lm_head_device = LayerDevice::Gpu;
         self.refresh_compute_backend();
         self.notes
-            .push("lm_head Q8 matvec is using the optional wgpu backend.".to_string());
+            .push("lm_head Q8 matvec is using the optional wgpu backend; greedy temperature<=0 can use fused Q8 GPU argmax.".to_string());
     }
 
     pub fn mark_lm_head_gpu_fallback(&mut self, reason: impl Into<String>) {

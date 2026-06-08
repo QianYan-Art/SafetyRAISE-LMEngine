@@ -200,6 +200,10 @@ impl Qwen3Model {
         })
     }
 
+    pub fn has_greedy_token_fast_path(&self) -> bool {
+        self.lm_head.has_q8_gpu_argmax()
+    }
+
     /// 返回最后一个位置的 logits: [1, vocab_size]。
     /// 自回归只需最后一步，prefill 时也借此跳过对整段序列的 lm_head。
     pub fn forward(
@@ -214,6 +218,24 @@ impl Qwen3Model {
         }
         let last = self.norm.forward(&hidden.last_row()?)?;
         self.lm_head.forward(&last)
+    }
+
+    /// Greedy-only fast path: return the lm_head argmax token without reading full logits when
+    /// the active lm_head backend can do that directly. Callers must fall back to `forward` on error.
+    pub fn forward_greedy_token(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KVCache,
+        position_offset: usize,
+    ) -> Result<u32> {
+        let mut hidden = self.embedding(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, kv_cache, layer_idx, position_offset)?;
+        }
+        let last = self.norm.forward(&hidden.last_row()?)?;
+        self.lm_head
+            .try_forward_q8_gpu_argmax(&last)
+            .map_err(RsinferError::DimensionError)
     }
 
     fn embedding(&self, input_ids: &[u32]) -> Result<Tensor> {

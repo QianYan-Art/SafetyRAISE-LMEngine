@@ -99,6 +99,93 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const ARGMAX_SHADER: &str = r#"
+struct Params {
+    in_features: u32,
+    out_features: u32,
+    words_per_row: u32,
+    out_offset: u32,
+};
+
+struct ArgmaxResult {
+    index: u32,
+    value: f32,
+};
+
+@group(0) @binding(0)
+var<storage, read> input: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> qweight: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> scales: array<f32>;
+
+@group(0) @binding(3)
+var<storage, read_write> result: array<ArgmaxResult>;
+
+@group(0) @binding(4)
+var<uniform> params: Params;
+
+fn unpack_i8(word: u32, lane: u32) -> i32 {
+    let byte = (word >> (lane * 8u)) & 0xffu;
+    var signed = i32(byte);
+    if (byte >= 128u) {
+        signed = signed - 256;
+    }
+    return signed;
+}
+
+var<workgroup> local_idx: array<u32, 64>;
+var<workgroup> local_value: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {
+    let idx = global_id.x;
+    let lane = local_id.x;
+    if (idx < params.out_features) {
+        var sum = 0.0;
+        let base = idx * params.words_per_row;
+        for (var i = 0u; i < params.in_features; i = i + 1u) {
+            let word = qweight[base + (i / 4u)];
+            let q = unpack_i8(word, i & 3u);
+            sum = sum + input[i] * f32(q);
+        }
+        local_idx[lane] = params.out_offset + idx;
+        local_value[lane] = sum * scales[idx];
+    } else {
+        local_idx[lane] = params.out_offset;
+        local_value[lane] = -3.4028234663852886e38;
+    }
+    workgroupBarrier();
+
+    var stride = 32u;
+    loop {
+        if (lane < stride) {
+            let other_lane = lane + stride;
+            if (local_value[other_lane] > local_value[lane]) {
+                local_value[lane] = local_value[other_lane];
+                local_idx[lane] = local_idx[other_lane];
+            }
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+        result[workgroup_id.x].index = local_idx[0];
+        result[workgroup_id.x].value = local_value[0];
+    }
+}
+"#;
+
 const SWIGLU_SHADER: &str = r#"
 struct Params {
     offset: u32,
@@ -143,6 +230,8 @@ struct GpuContextInner {
     matvec_bind_group_layout: wgpu::BindGroupLayout,
     q8_matvec_pipeline: wgpu::ComputePipeline,
     q8_matvec_bind_group_layout: wgpu::BindGroupLayout,
+    argmax_pipeline: wgpu::ComputePipeline,
+    argmax_bind_group_layout: wgpu::BindGroupLayout,
     swiglu_pipeline: wgpu::ComputePipeline,
     swiglu_bind_group_layout: wgpu::BindGroupLayout,
     max_chunk_bytes: wgpu::BufferAddress,
@@ -193,14 +282,29 @@ struct GpuMatVecChunk {
 
 struct GpuQ8MatVecChunk {
     bind_group: wgpu::BindGroup,
+    argmax_bind_group: wgpu::BindGroup,
     _qweight_buffer: wgpu::Buffer,
     _scales_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
     readback_buffer: wgpu::Buffer,
+    argmax_buffer: wgpu::Buffer,
+    argmax_readback_buffer: wgpu::Buffer,
     _params_buffer: wgpu::Buffer,
+    _argmax_params_buffer: wgpu::Buffer,
+    argmax_results: usize,
     out_offset: usize,
     out_features: usize,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuArgmaxResult {
+    index: u32,
+    value: f32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuArgmaxResult {}
+unsafe impl bytemuck::Pod for GpuArgmaxResult {}
 
 impl GpuContext {
     pub fn new() -> Result<Self, String> {
@@ -297,6 +401,45 @@ impl GpuContext {
             cache: None,
         });
 
+        let argmax_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rsinfer-argmax"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(ARGMAX_SHADER)),
+        });
+        let argmax_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rsinfer-argmax-bind-layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, false),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let argmax_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rsinfer-argmax-pipeline-layout"),
+                bind_group_layouts: &[Some(&argmax_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let argmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rsinfer-argmax-pipeline"),
+            layout: Some(&argmax_pipeline_layout),
+            module: &argmax_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let swiglu_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rsinfer-swiglu"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SWIGLU_SHADER)),
@@ -347,6 +490,8 @@ impl GpuContext {
                 matvec_bind_group_layout,
                 q8_matvec_pipeline,
                 q8_matvec_bind_group_layout,
+                argmax_pipeline,
+                argmax_bind_group_layout,
                 swiglu_pipeline,
                 swiglu_bind_group_layout,
                 max_chunk_bytes,
@@ -602,8 +747,7 @@ impl GpuQ8MatVec {
         while out_offset < weight.out_features {
             let rows = rows_per_chunk.min(weight.out_features - out_offset);
             chunks.push(create_q8_chunk(
-                &context.inner.device,
-                &context.inner.q8_matvec_bind_group_layout,
+                &context.inner,
                 &input_buffer,
                 weight,
                 words_per_row,
@@ -627,6 +771,91 @@ impl GpuQ8MatVec {
         outputs
             .pop()
             .ok_or_else(|| "GPU Q8 matvec returned no output".to_string())
+    }
+
+    pub fn forward_argmax(&self, x: &Tensor) -> Result<u32, String> {
+        if x.ndim() != 2 || x.shape() != [1, self.in_features] {
+            return Err(format!(
+                "GPU Q8 argmax expects [1, {}], got {:?}",
+                self.in_features,
+                x.shape()
+            ));
+        }
+
+        let x_std = x.data.as_standard_layout();
+        let input = x_std
+            .as_slice()
+            .ok_or_else(|| "GPU Q8 argmax input is not contiguous".to_string())?;
+        self.context
+            .inner
+            .queue
+            .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(input));
+
+        let mut encoder =
+            self.context
+                .inner
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rsinfer-q8-argmax-encoder"),
+                });
+        for chunk in &self.chunks {
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rsinfer-q8-argmax-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.context.inner.argmax_pipeline);
+                pass.set_bind_group(0, &chunk.argmax_bind_group, &[]);
+                pass.dispatch_workgroups(chunk.argmax_results as u32, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &chunk.argmax_buffer,
+                0,
+                &chunk.argmax_readback_buffer,
+                0,
+                argmax_bytes_len(chunk.argmax_results),
+            );
+        }
+        self.context.inner.queue.submit(Some(encoder.finish()));
+
+        let mut receivers = Vec::new();
+        for (chunk_idx, chunk) in self.chunks.iter().enumerate() {
+            let slice = chunk.argmax_readback_buffer.slice(..);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send((chunk_idx, result.map_err(|e| e.to_string())));
+            });
+            receivers.push(rx);
+        }
+        self.context
+            .inner
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("device poll failed: {e}"))?;
+
+        for rx in receivers {
+            let (_, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
+            result?;
+        }
+
+        let mut best: Option<GpuArgmaxResult> = None;
+        for chunk in &self.chunks {
+            let slice = chunk.argmax_readback_buffer.slice(..);
+            let mapped = slice.get_mapped_range();
+            let results = bytemuck::cast_slice::<u8, GpuArgmaxResult>(&mapped);
+            for &result in results {
+                if best
+                    .map(|current| result.value > current.value)
+                    .unwrap_or(true)
+                {
+                    best = Some(result);
+                }
+            }
+            drop(mapped);
+            chunk.argmax_readback_buffer.unmap();
+        }
+        best.map(|result| result.index)
+            .ok_or_else(|| "GPU Q8 argmax has no chunks".to_string())
     }
 
     pub fn forward_many_same_input(
@@ -1164,6 +1393,10 @@ fn bytes_len_u32(items: usize) -> wgpu::BufferAddress {
     (items * std::mem::size_of::<u32>()) as wgpu::BufferAddress
 }
 
+fn argmax_bytes_len(items: usize) -> wgpu::BufferAddress {
+    (items * std::mem::size_of::<GpuArgmaxResult>()) as wgpu::BufferAddress
+}
+
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -1244,14 +1477,14 @@ fn create_chunk(
 }
 
 fn create_q8_chunk(
-    device: &wgpu::Device,
-    bind_group_layout: &wgpu::BindGroupLayout,
+    context: &GpuContextInner,
     input_buffer: &wgpu::Buffer,
     weight: &Q8LinearWeight,
     words_per_row: usize,
     out_offset: usize,
     out_features: usize,
 ) -> GpuQ8MatVecChunk {
+    let device = &context.device;
     let mut packed = vec![0u32; out_features * words_per_row];
     for row in 0..out_features {
         let src_row = out_offset + row;
@@ -1284,6 +1517,19 @@ fn create_q8_chunk(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let argmax_results = (out_features as u32).div_ceil(WORKGROUP_SIZE) as usize;
+    let argmax_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rsinfer-q8-argmax-result-chunk"),
+        size: argmax_bytes_len(argmax_results),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let argmax_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rsinfer-q8-argmax-readback-chunk"),
+        size: argmax_bytes_len(argmax_results),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let params = [
         weight.in_features as u32,
         out_features as u32,
@@ -1295,9 +1541,20 @@ fn create_q8_chunk(
         contents: bytemuck::cast_slice(&params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let argmax_params = [
+        weight.in_features as u32,
+        out_features as u32,
+        words_per_row as u32,
+        out_offset as u32,
+    ];
+    let argmax_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rsinfer-q8-argmax-params-chunk"),
+        contents: bytemuck::cast_slice(&argmax_params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rsinfer-q8-matvec-bind-group-chunk"),
-        layout: bind_group_layout,
+        layout: &context.q8_matvec_bind_group_layout,
         entries: &[
             buffer_entry(0, input_buffer),
             buffer_entry(1, &qweight_buffer),
@@ -1306,14 +1563,30 @@ fn create_q8_chunk(
             buffer_entry(4, &params_buffer),
         ],
     });
+    let argmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rsinfer-q8-argmax-bind-group-chunk"),
+        layout: &context.argmax_bind_group_layout,
+        entries: &[
+            buffer_entry(0, input_buffer),
+            buffer_entry(1, &qweight_buffer),
+            buffer_entry(2, &scales_buffer),
+            buffer_entry(3, &argmax_buffer),
+            buffer_entry(4, &argmax_params_buffer),
+        ],
+    });
 
     GpuQ8MatVecChunk {
         bind_group,
+        argmax_bind_group,
         _qweight_buffer: qweight_buffer,
         _scales_buffer: scales_buffer,
         output_buffer,
         readback_buffer,
+        argmax_buffer,
+        argmax_readback_buffer,
         _params_buffer: params_buffer,
+        _argmax_params_buffer: argmax_params_buffer,
+        argmax_results,
         out_offset,
         out_features,
     }
@@ -1394,6 +1667,43 @@ mod tests {
             max_abs <= 1e-4,
             "GPU Q8 matvec max abs diff {max_abs} exceeded tolerance"
         );
+    }
+
+    #[test]
+    fn gpu_q8_argmax_matches_cpu_q8_when_available() {
+        let weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+            f16::from_f32(1.25),
+            f16::from_f32(-0.125),
+            f16::from_f32(0.875),
+            f16::from_f32(-1.5),
+            f16::from_f32(2.0),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.5),
+            f16::from_f32(1.0),
+            f16::from_f32(0.75),
+        ];
+        let q8 = Q8LinearWeight::from_f16(&weight, 3, 5).unwrap();
+        let x = Tensor::from_f32_slice(&[1, 5], &[0.6, -1.4, 1.0, 0.25, -0.5]).unwrap();
+        let cpu = linear_forward_q8(&x, &q8).unwrap();
+        let expected = cpu
+            .as_slice()
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        let Ok(gpu) = GpuQ8MatVec::from_q8_weight(&q8) else {
+            eprintln!("GPU Q8 argmax test skipped: no usable wgpu adapter");
+            return;
+        };
+
+        assert_eq!(gpu.forward_argmax(&x).unwrap(), expected);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use ndarray::{ArrayD, IxDyn};
 /// KV Cache 数据结构
 ///
 /// 为每一层 Transformer 维护独立的 Key 和 Value 缓存。
+#[derive(Clone)]
 pub struct KVCache {
     /// 每层的 Key 缓存: [num_heads, seq_len, head_dim]
     key_cache: Vec<Option<Tensor>>,
