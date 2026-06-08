@@ -79,7 +79,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\benchmark-local.ps1 `
   -SafetensorsModelDir D:\MCP_Server\root\autodl-tmp\TS-Qwen3 `
   -GgufModelPath D:\MCP_Server\root\TS_Qwen3_Finetuned\TS-Qwen3-Finetuned.gguf `
   -LlamaBenchExe D:\MCP_Server\llamacpp\llama.cpp\build\bin\Release\llama-bench.exe `
-  -RsinferDevices cpu,hybrid -GpuLayers 1 -RsinferQuantization q8 -MaxTokens 1 -Repeat 1
+  -RsinferDevices cpu,hybrid -RsinferQuantizations none,q8 -GpuLayers 1 -MaxTokens 1 -Repeat 1
 ```
 
 短基准主要用于选择下一步优化方向；除非有同提示词、同采样、足够 token 数和多轮重复数据，否则不要把它解释成质量或速度领先证明。

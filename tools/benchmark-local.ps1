@@ -17,6 +17,7 @@ param(
     [string[]]$RsinferDevices = @("cpu"),
     [int]$GpuLayers = 0,
     [string]$RsinferQuantization = "none",
+    [string[]]$RsinferQuantizations = @(),
     [int]$LlamaBenchPromptTokens = 8,
     [string[]]$LlamaExtraArgs = @(),
     [string]$OutputDir = "target\benchmarks",
@@ -163,9 +164,24 @@ if ($GpuLayers -lt 0) {
 if ($LlamaBenchPromptTokens -lt 1) {
     throw "LlamaBenchPromptTokens must be positive."
 }
-$normalizedQuantization = $RsinferQuantization.Trim().ToLowerInvariant()
-if ($normalizedQuantization -notin @("none", "q8")) {
-    throw "Unsupported rsinfer quantization '$RsinferQuantization'. Expected one of: none, q8."
+$quantizationInputs = if (@($RsinferQuantizations).Count -gt 0) {
+    $RsinferQuantizations
+} else {
+    @($RsinferQuantization)
+}
+[string[]]$normalizedQuantizations = @(
+    $quantizationInputs |
+        ForEach-Object { $_ -split "," } |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ }
+) | Select-Object -Unique
+if (@($normalizedQuantizations).Count -eq 0) {
+    throw "RsinferQuantizations must contain at least one quantization mode."
+}
+foreach ($quantization in $normalizedQuantizations) {
+    if ($quantization -notin @("none", "q8")) {
+        throw "Unsupported rsinfer quantization '$quantization'. Expected one of: none, q8."
+    }
 }
 
 $outputFull = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDir))
@@ -194,18 +210,21 @@ if ($Chat) {
 
 $rsinferCommands = New-Object System.Collections.Generic.List[object]
 foreach ($device in $normalizedRsinferDevices) {
-    $deviceArgs = $commonRsinferArgs + @("--device", $device)
-    if ($device -ne "cpu" -and $GpuLayers -gt 0) {
-        $deviceArgs += @("--gpu-layers", "$GpuLayers")
-    }
-    if ($normalizedQuantization -ne "none") {
-        $deviceArgs += @("--quantization", $normalizedQuantization)
-    }
+    foreach ($quantization in $normalizedQuantizations) {
+        $deviceArgs = $commonRsinferArgs + @("--device", $device)
+        if ($device -ne "cpu" -and $GpuLayers -gt 0) {
+            $deviceArgs += @("--gpu-layers", "$GpuLayers")
+        }
+        if ($quantization -ne "none") {
+            $deviceArgs += @("--quantization", $quantization)
+        }
 
-    if ($resolvedRsinferExe) {
-        $rsinferCommands.Add([pscustomobject]@{ name = "rsinfer-$device"; file = $resolvedRsinferExe; args = $deviceArgs })
-    } else {
-        $rsinferCommands.Add([pscustomobject]@{ name = "rsinfer-$device"; file = "cargo"; args = @("run", "--release", "--") + $deviceArgs })
+        $commandName = "rsinfer-$device-$quantization"
+        if ($resolvedRsinferExe) {
+            $rsinferCommands.Add([pscustomobject]@{ name = $commandName; file = $resolvedRsinferExe; args = $deviceArgs })
+        } else {
+            $rsinferCommands.Add([pscustomobject]@{ name = $commandName; file = "cargo"; args = @("run", "--release", "--") + $deviceArgs })
+        }
     }
 }
 
@@ -309,7 +328,7 @@ $summary = [pscustomobject]@{
     chat = $Chat
     rsinfer_devices = $normalizedRsinferDevices
     gpu_layers = $GpuLayers
-    rsinfer_quantization = $normalizedQuantization
+    rsinfer_quantizations = $normalizedQuantizations
     llama_bench_prompt_tokens = $LlamaBenchPromptTokens
     results = $results
 }
