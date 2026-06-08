@@ -151,10 +151,17 @@ pub fn linear_forward_q8(x: &Tensor, weight: &Q8LinearWeight) -> Result<Tensor> 
     if m == 1 {
         let input = &xs[..k];
         let mut out = vec![0f32; n];
-        out.par_iter_mut().enumerate().for_each(|(j, dst)| {
-            let w_row = &weight.qweight[j * k..(j + 1) * k];
-            *dst = dot_q8(input, w_row, weight.scales[j]);
-        });
+        const JCHUNK: usize = 16;
+        out.par_chunks_mut(JCHUNK)
+            .enumerate()
+            .for_each(|(c, block)| {
+                let jbase = c * JCHUNK;
+                for (jj, dst) in block.iter_mut().enumerate() {
+                    let j = jbase + jj;
+                    let w_row = &weight.qweight[j * k..(j + 1) * k];
+                    *dst = dot_q8(input, w_row, weight.scales[j]);
+                }
+            });
         return Tensor::from_f32_vec(&[1, n], out);
     }
 
