@@ -95,7 +95,7 @@ src/
 ## 已知限制与后续方向
 
 - 当前 prefill、attention 与 KV cache 仍走 CPU；选中 Transformer 层的 decode 线性 matvec、MLP fused SwiGLU/down 路径与 `lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
-- 无 batch、无 prompt 缓存复用、无量化（int8/int4）。
+- 无 batch、无 prompt 缓存复用；已具备行级 Q8 线性权重 primitive，但完整 sidecar 量化模型生成/加载尚未接入 CLI。
 - KV cache 用简单拼接（短序列下非瓶颈）。
 - 已有 GPU/CPU 运行时规划入口、decode 线性层 GPU matvec 和 `lm_head` GPU matvec；还没有 attention/KV/prefill GPU kernel。要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 

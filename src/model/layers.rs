@@ -10,7 +10,8 @@ use crate::gpu::{GpuContext, GpuMatVec, GpuSwiGluDown};
 use crate::model::config::Qwen3Config;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
-    linear_forward_f16, repeat_kv, rms_norm, rope, scaled_dot_product_attention, silu, Tensor,
+    linear_forward_f16, linear_forward_q8, repeat_kv, rms_norm, rope, scaled_dot_product_attention,
+    silu, Q8LinearWeight, Tensor,
 };
 
 /// RMS 归一化层
@@ -39,6 +40,7 @@ pub struct Linear {
     pub in_features: usize,
     pub bias: Option<Tensor>,
     gpu_matvec: Option<GpuMatVec>,
+    q8_weight: Option<Q8LinearWeight>,
 }
 
 impl Linear {
@@ -57,6 +59,7 @@ impl Linear {
             in_features,
             bias,
             gpu_matvec: None,
+            q8_weight: None,
         }
     }
 
@@ -85,6 +88,7 @@ impl Linear {
             in_features,
             bias,
             gpu_matvec: None,
+            q8_weight: None,
         })
     }
 
@@ -122,6 +126,12 @@ impl Linear {
         self.gpu_matvec.as_ref()
     }
 
+    pub fn try_enable_q8_weight(&mut self) -> Result<()> {
+        let q8 = Q8LinearWeight::from_f16(&self.weight, self.out_features, self.in_features)?;
+        self.q8_weight = Some(q8);
+        Ok(())
+    }
+
     /// 前向传播: x @ W^T + b
     ///
     /// x: [batch, in_features] -> result: [batch, out_features]
@@ -129,6 +139,11 @@ impl Linear {
         if self.bias.is_none() {
             if let Some(gpu_matvec) = &self.gpu_matvec {
                 if let Ok(result) = gpu_matvec.forward(x) {
+                    return Ok(result);
+                }
+            }
+            if let Some(q8_weight) = &self.q8_weight {
+                if let Ok(result) = linear_forward_q8(x, q8_weight) {
                     return Ok(result);
                 }
             }
@@ -485,4 +500,35 @@ pub fn build_transformer_block(
         RmsNorm::new(get("post_attention_layernorm.weight")?, eps),
         mlp,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_q8_optional_weight_matches_f16_path() {
+        let weight = vec![
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let f16_linear = Linear::from_f16_weight(&[3, 2], weight.clone(), None).unwrap();
+        let mut q8_linear = Linear::from_f16_weight(&[3, 2], weight, None).unwrap();
+        q8_linear.try_enable_q8_weight().unwrap();
+
+        let expected = f16_linear.forward(&x).unwrap();
+        let actual = q8_linear.forward(&x).unwrap();
+
+        for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
+            assert!(
+                (expected - actual).abs() <= 0.02,
+                "q8 Linear output {actual} too far from f16 {expected}"
+            );
+        }
+    }
 }

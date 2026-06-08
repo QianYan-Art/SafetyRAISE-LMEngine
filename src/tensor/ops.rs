@@ -10,6 +10,53 @@ use rayon::prelude::*;
 use super::Tensor;
 use crate::error::{Result, RsinferError};
 
+/// 行级对称 Q8 线性权重。
+///
+/// 每个输出行独立 scale：`w ~= q * scale`，q 存 i8 行主序 `[out_features, in_features]`。
+#[derive(Clone, Debug)]
+pub struct Q8LinearWeight {
+    pub qweight: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub out_features: usize,
+    pub in_features: usize,
+}
+
+impl Q8LinearWeight {
+    pub fn from_f16(weight: &[f16], out_features: usize, in_features: usize) -> Result<Self> {
+        let expected = out_features * in_features;
+        if weight.len() != expected {
+            return Err(RsinferError::ShapeMismatch {
+                expected: vec![expected],
+                actual: vec![weight.len()],
+            });
+        }
+
+        let mut qweight = vec![0i8; expected];
+        let mut scales = vec![0f32; out_features];
+        for (row, scale_slot) in scales.iter_mut().enumerate() {
+            let start = row * in_features;
+            let end = start + in_features;
+            let max_abs = weight[start..end]
+                .iter()
+                .map(|value| value.to_f32().abs())
+                .fold(0.0_f32, f32::max);
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            *scale_slot = scale;
+            for (dst, value) in qweight[start..end].iter_mut().zip(&weight[start..end]) {
+                let quantized = (value.to_f32() / scale).round().clamp(-127.0, 127.0);
+                *dst = quantized as i8;
+            }
+        }
+
+        Ok(Self {
+            qweight,
+            scales,
+            out_features,
+            in_features,
+        })
+    }
+}
+
 /// 线性层矩阵乘法：out = x @ W^T，权重以 **f16** 存储。
 ///
 /// HuggingFace 的线性层权重存为 `[out_features, in_features]`，计算 `y = x @ W^T`。
@@ -79,6 +126,56 @@ pub fn linear_forward_f16(
     Tensor::from_f32_slice(&[m, n], &out)
 }
 
+/// 线性层矩阵乘法：out = x @ W^T，权重以行级 Q8 存储。
+pub fn linear_forward_q8(x: &Tensor, weight: &Q8LinearWeight) -> Result<Tensor> {
+    if x.ndim() != 2 {
+        return Err(RsinferError::DimensionError(format!(
+            "linear_forward_q8 需要 2D 输入, got {}D",
+            x.ndim()
+        )));
+    }
+    let (m, k) = (x.shape()[0], x.shape()[1]);
+    if k != weight.in_features {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![m, weight.in_features],
+            actual: vec![m, k],
+        });
+    }
+
+    let x_std = x.data.as_standard_layout();
+    let xs = x_std
+        .as_slice()
+        .ok_or_else(|| RsinferError::DimensionError("x 非连续内存".into()))?;
+
+    let n = weight.out_features;
+    let mut out_t = vec![0f32; n * m];
+    const JCHUNK: usize = 16;
+    out_t
+        .par_chunks_mut(m * JCHUNK)
+        .enumerate()
+        .for_each(|(c, block)| {
+            let jbase = c * JCHUNK;
+            let feats = block.len() / m;
+            for jj in 0..feats {
+                let j = jbase + jj;
+                let w_row = &weight.qweight[j * k..(j + 1) * k];
+                let scale = weight.scales[j];
+                let dst = &mut block[jj * m..(jj + 1) * m];
+                for i in 0..m {
+                    dst[i] = dot_q8(&xs[i * k..(i + 1) * k], w_row, scale);
+                }
+            }
+        });
+
+    let mut out = vec![0f32; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            out[i * n + j] = out_t[j * m + i];
+        }
+    }
+    Tensor::from_f32_slice(&[m, n], &out)
+}
+
 /// 两个等长切片的点积。
 ///
 /// 用 8 路独立累加器打断 f32 求和的串行依赖，配合 `target-cpu=native`
@@ -101,6 +198,26 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
         .map(|(&x, &y)| x * y)
         .sum();
     acc.iter().sum::<f32>() + tail
+}
+
+#[inline]
+fn dot_q8(x: &[f32], q: &[i8], scale: f32) -> f32 {
+    const LANES: usize = 8;
+    let mut acc = [0f32; LANES];
+    let mut cx = x.chunks_exact(LANES);
+    let mut cq = q.chunks_exact(LANES);
+    for (xs, qs) in cx.by_ref().zip(cq.by_ref()) {
+        for ((acc, &x), &q) in acc.iter_mut().zip(xs).zip(qs) {
+            *acc += x * q as f32;
+        }
+    }
+    let tail: f32 = cx
+        .remainder()
+        .iter()
+        .zip(cq.remainder())
+        .map(|(&x, &q)| x * q as f32)
+        .sum();
+    (acc.iter().sum::<f32>() + tail) * scale
 }
 
 /// Softmax 操作
@@ -391,5 +508,28 @@ mod tests {
         let weight = Tensor::from_f32_slice(&[4], &[1.0, 1.0, 1.0, 1.0]).unwrap();
         let result = rms_norm(&x, &weight, 1e-5).unwrap();
         assert_eq!(result.shape(), &[1, 4]);
+    }
+
+    #[test]
+    fn test_linear_forward_q8_close_to_f16() {
+        let weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let x = Tensor::from_f32_slice(&[2, 2], &[0.6, -1.4, 1.0, 0.25]).unwrap();
+        let f16_out = linear_forward_f16(&x, &weight, 3, 2).unwrap();
+        let q8 = Q8LinearWeight::from_f16(&weight, 3, 2).unwrap();
+        let q8_out = linear_forward_q8(&x, &q8).unwrap();
+
+        for (expected, actual) in f16_out.as_slice().iter().zip(q8_out.as_slice()) {
+            assert!(
+                (expected - actual).abs() <= 0.02,
+                "q8 output {actual} too far from f16 {expected}"
+            );
+        }
     }
 }
