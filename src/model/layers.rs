@@ -118,6 +118,10 @@ impl Linear {
         self.gpu_matvec.is_some()
     }
 
+    pub fn gpu_matvec(&self) -> Option<&GpuMatVec> {
+        self.gpu_matvec.as_ref()
+    }
+
     /// 前向传播: x @ W^T + b
     ///
     /// x: [batch, in_features] -> result: [batch, out_features]
@@ -189,21 +193,47 @@ impl Attention {
     ) -> Result<Tensor> {
         let seq_len = hidden_states.shape()[0];
 
-        let q = self.q_proj.forward(hidden_states)?.reshape(&[
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ])?;
-        let k = self.k_proj.forward(hidden_states)?.reshape(&[
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ])?;
-        let v = self.v_proj.forward(hidden_states)?.reshape(&[
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ])?;
+        let (q, k, v) = if seq_len == 1 {
+            match (
+                self.q_proj.gpu_matvec(),
+                self.k_proj.gpu_matvec(),
+                self.v_proj.gpu_matvec(),
+            ) {
+                (Some(q_proj), Some(k_proj), Some(v_proj)) => {
+                    match GpuMatVec::forward_many_same_input(
+                        &[q_proj, k_proj, v_proj],
+                        hidden_states,
+                    ) {
+                        Ok(mut outputs) if outputs.len() == 3 => {
+                            let v = outputs.pop().unwrap();
+                            let k = outputs.pop().unwrap();
+                            let q = outputs.pop().unwrap();
+                            (q, k, v)
+                        }
+                        _ => (
+                            self.q_proj.forward(hidden_states)?,
+                            self.k_proj.forward(hidden_states)?,
+                            self.v_proj.forward(hidden_states)?,
+                        ),
+                    }
+                }
+                _ => (
+                    self.q_proj.forward(hidden_states)?,
+                    self.k_proj.forward(hidden_states)?,
+                    self.v_proj.forward(hidden_states)?,
+                ),
+            }
+        } else {
+            (
+                self.q_proj.forward(hidden_states)?,
+                self.k_proj.forward(hidden_states)?,
+                self.v_proj.forward(hidden_states)?,
+            )
+        };
+
+        let q = q.reshape(&[seq_len, self.num_heads, self.head_dim])?;
+        let k = k.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
+        let v = v.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
 
         // Qwen3 QK-Norm：每个 head 沿 head_dim 做 RMSNorm，必须在 RoPE 之前
         let q = self.q_norm.forward(&q)?;
@@ -287,9 +317,24 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
+        let (gate, up) = if x.shape()[0] == 1 {
+            match (self.gate_proj.gpu_matvec(), self.up_proj.gpu_matvec()) {
+                (Some(gate_proj), Some(up_proj)) => {
+                    match GpuMatVec::forward_many_same_input(&[gate_proj, up_proj], x) {
+                        Ok(mut outputs) if outputs.len() == 2 => {
+                            let up = outputs.pop().unwrap();
+                            let gate = outputs.pop().unwrap();
+                            (gate, up)
+                        }
+                        _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
+                    }
+                }
+                _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
+            }
+        } else {
+            (self.gate_proj.forward(x)?, self.up_proj.forward(x)?)
+        };
         let gate = silu(&gate);
-        let up = self.up_proj.forward(x)?;
         let hidden = gate.mul(&up)?;
         self.down_proj.forward(&hidden)
     }

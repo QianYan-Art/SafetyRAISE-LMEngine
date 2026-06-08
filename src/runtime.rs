@@ -229,7 +229,7 @@ impl RuntimePlan {
         self.refresh_compute_backend();
         if active_layers > 0 {
             self.notes.push(format!(
-                "decode matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; prefill still falls back to CPU."
+                "decode matvec for {active_layers} transformer layer(s) attached {attached} linear GPU kernels through the shared wgpu context; q/k/v and gate/up same-input groups are batched; prefill still falls back to CPU."
             ));
         }
     }
