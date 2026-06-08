@@ -587,6 +587,17 @@ pub fn scaled_dot_product_attention_gqa_cached(
         .as_slice()
         .ok_or_else(|| RsinferError::DimensionError("q tensor is not contiguous".into()))?;
 
+    if seq_len_q == 1 {
+        return scaled_dot_product_attention_gqa_cached_decode_one(
+            qs,
+            cache,
+            num_heads,
+            kv_group_size,
+            head_dim,
+            scale,
+        );
+    }
+
     let mut output = vec![0f32; num_heads * seq_len_q * head_dim];
     let head_stride_q = seq_len_q * head_dim;
     let cache_head_stride = cache.max_len * head_dim;
@@ -637,6 +648,66 @@ pub fn scaled_dot_product_attention_gqa_cached(
 
     Ok(Tensor {
         data: ArrayD::from_shape_vec(IxDyn(&[num_heads, seq_len_q, head_dim]), output)
+            .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
+    })
+}
+
+fn scaled_dot_product_attention_gqa_cached_decode_one(
+    qs: &[f32],
+    cache: CachedAttention<'_>,
+    num_heads: usize,
+    kv_group_size: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let mut output = vec![0f32; num_heads * head_dim];
+    let cache_head_stride = cache.max_len * head_dim;
+
+    output
+        .par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(h, out_row)| {
+            let kv_head_idx = h / kv_group_size;
+            let q_row = &qs[h * head_dim..(h + 1) * head_dim];
+            let k_head =
+                &cache.key[kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+            let v_head = &cache.value
+                [kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+
+            let mut max_score = f32::NEG_INFINITY;
+            let mut sum_exp = 0f32;
+            for j in 0..cache.seq_len_k {
+                let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                let score = dot(q_row, k_row) * scale;
+                if score <= max_score {
+                    let weight = (score - max_score).exp();
+                    sum_exp += weight;
+                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                    for d in 0..head_dim {
+                        out_row[d] += weight * v_row[d];
+                    }
+                } else {
+                    let rescale = (max_score - score).exp();
+                    for value in out_row.iter_mut() {
+                        *value *= rescale;
+                    }
+                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                    for d in 0..head_dim {
+                        out_row[d] += v_row[d];
+                    }
+                    sum_exp = sum_exp * rescale + 1.0;
+                    max_score = score;
+                }
+            }
+
+            let inv_sum = 1.0 / sum_exp;
+            for value in out_row.iter_mut() {
+                *value *= inv_sum;
+            }
+        });
+
+    Ok(Tensor {
+        data: ArrayD::from_shape_vec(IxDyn(&[num_heads, 1, head_dim]), output)
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
     })
 }
@@ -748,6 +819,59 @@ mod tests {
             ],
         )
         .unwrap();
+        let k = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.2, -0.1, 0.4, 0.3, -0.2, 0.7, 0.5, 0.6, -0.3, 0.2, 0.8, -0.4,
+            ],
+        )
+        .unwrap();
+        let v = Tensor::from_f32_slice(
+            &[2, 3, 2],
+            &[
+                0.3, 0.1, -0.2, 0.4, 0.7, -0.5, -0.1, 0.8, 0.6, -0.3, 0.2, 0.5,
+            ],
+        )
+        .unwrap();
+        let max_len = 5;
+        let head_dim = 2;
+        let mut key = vec![0.0; 2 * max_len * head_dim];
+        let mut value = vec![0.0; key.len()];
+        for h in 0..2 {
+            let compact_start = h * 3 * head_dim;
+            let cache_start = h * max_len * head_dim;
+            key[cache_start..cache_start + 3 * head_dim]
+                .copy_from_slice(&k.as_slice()[compact_start..compact_start + 3 * head_dim]);
+            value[cache_start..cache_start + 3 * head_dim]
+                .copy_from_slice(&v.as_slice()[compact_start..compact_start + 3 * head_dim]);
+        }
+
+        let expected = scaled_dot_product_attention_gqa(&q, &k, &v, 2, 0.5).unwrap();
+        let actual = scaled_dot_product_attention_gqa_cached(
+            &q,
+            CachedAttention {
+                key: &key,
+                value: &value,
+                num_kv_heads: 2,
+                seq_len_k: 3,
+                head_dim,
+                max_len,
+            },
+            2,
+            0.5,
+        )
+        .unwrap();
+
+        assert_eq!(expected.shape(), actual.shape());
+        for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn cached_gqa_decode_one_matches_compact_gqa_path() {
+        let q = Tensor::from_f32_slice(&[4, 1, 2], &[0.1, 0.2, -0.2, 0.5, 0.6, 0.2, 0.9, -0.5])
+            .unwrap();
         let k = Tensor::from_f32_slice(
             &[2, 3, 2],
             &[
