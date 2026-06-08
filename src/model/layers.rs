@@ -450,6 +450,9 @@ fn transpose_for_attention(x: &Tensor, num_heads: usize) -> Result<Tensor> {
     let shape = x.shape();
     let seq_len = shape[0];
     let head_dim = shape[2];
+    if seq_len == 1 {
+        return x.reshape(&[num_heads, 1, head_dim]);
+    }
 
     let mut result = ndarray::ArrayD::zeros(ndarray::IxDyn(&[num_heads, seq_len, head_dim]));
 
@@ -467,6 +470,9 @@ fn transpose_for_attention(x: &Tensor, num_heads: usize) -> Result<Tensor> {
 /// 将 [num_heads, seq_len, head_dim] 转置回 [seq_len, num_heads, head_dim]
 fn transpose_back(x: &Tensor, seq_len: usize, num_heads: usize) -> Result<Tensor> {
     let head_dim = x.shape()[2];
+    if seq_len == 1 {
+        return x.reshape(&[1, num_heads, head_dim]);
+    }
 
     let mut result = ndarray::ArrayD::zeros(ndarray::IxDyn(&[seq_len, num_heads, head_dim]));
 
@@ -781,5 +787,39 @@ mod tests {
                 "q8 Linear output {actual} too far from f16 {expected}"
             );
         }
+    }
+
+    #[test]
+    fn transpose_for_attention_single_token_uses_same_element_order() {
+        let x = Tensor::from_f32_slice(&[1, 3, 2], &[0.1, 0.2, 1.1, 1.2, 2.1, 2.2]).unwrap();
+
+        let transposed = transpose_for_attention(&x, 3).unwrap();
+
+        assert_eq!(transposed.shape(), &[3, 1, 2]);
+        assert_eq!(transposed.as_slice(), x.as_slice());
+    }
+
+    #[test]
+    fn transpose_back_single_token_uses_same_element_order() {
+        let x = Tensor::from_f32_slice(&[3, 1, 2], &[0.1, 0.2, 1.1, 1.2, 2.1, 2.2]).unwrap();
+
+        let transposed = transpose_back(&x, 1, 3).unwrap();
+
+        assert_eq!(transposed.shape(), &[1, 3, 2]);
+        assert_eq!(transposed.as_slice(), x.as_slice());
+    }
+
+    #[test]
+    fn transpose_for_attention_multi_token_still_reorders_axes() {
+        let x = Tensor::from_f32_slice(&[2, 2, 2], &[0.0, 0.1, 1.0, 1.1, 10.0, 10.1, 11.0, 11.1])
+            .unwrap();
+
+        let transposed = transpose_for_attention(&x, 2).unwrap();
+
+        assert_eq!(transposed.shape(), &[2, 2, 2]);
+        assert_eq!(
+            transposed.as_slice(),
+            &[0.0, 0.1, 10.0, 10.1, 1.0, 1.1, 11.0, 11.1]
+        );
     }
 }
