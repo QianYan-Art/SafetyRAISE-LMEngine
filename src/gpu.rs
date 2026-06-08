@@ -1110,17 +1110,21 @@ impl GpuQ8SameInputBatch {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("rsinfer-q8-shared-input-encoder"),
                 });
-        for (matvec_idx, matvec) in matvecs.iter().enumerate() {
-            for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("rsinfer-q8-shared-input-pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-q8-shared-input-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+            for (matvec_idx, matvec) in matvecs.iter().enumerate() {
+                for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
                     pass.set_bind_group(0, &self.bind_groups[matvec_idx][chunk_idx], &[]);
                     pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
                 }
+            }
+        }
+        for matvec in matvecs {
+            for chunk in &matvec.chunks {
                 encoder.copy_buffer_to_buffer(
                     &chunk.output_buffer,
                     0,
