@@ -2,6 +2,8 @@
 
 use crate::tensor::Tensor;
 use rand::Rng;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 pub trait Sampler: Send + Sync {
     /// logits: [vocab_size] 一维张量
@@ -91,13 +93,79 @@ impl Sampler for CombinedSampler {
 }
 
 fn top_k_indices(data: &[f32], top_k: usize) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..data.len()).collect();
-    if top_k < idx.len() {
-        idx.select_nth_unstable_by(top_k, |&a, &b| cmp_desc(data[a], data[b]));
-        idx.truncate(top_k);
+    if top_k == 0 {
+        return Vec::new();
     }
-    idx.sort_unstable_by(|&a, &b| cmp_desc(data[a], data[b]));
-    idx
+    if top_k > 64 {
+        return top_k_indices_heap(data, top_k);
+    }
+    let mut candidates = Vec::with_capacity(top_k.min(data.len()));
+    for i in 0..data.len() {
+        if candidates.len() < top_k {
+            insert_desc(&mut candidates, i, data);
+        } else if cmp_desc(data[i], data[*candidates.last().unwrap()]).is_lt() {
+            insert_desc(&mut candidates, i, data);
+            candidates.pop();
+        }
+    }
+    candidates
+}
+
+fn insert_desc(candidates: &mut Vec<usize>, idx: usize, data: &[f32]) {
+    let pos = candidates
+        .iter()
+        .position(|&candidate| cmp_desc(data[idx], data[candidate]).is_lt())
+        .unwrap_or(candidates.len());
+    candidates.insert(pos, idx);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    index: usize,
+    value: f32,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.value.to_bits() == other.value.to_bits()
+    }
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.value
+            .partial_cmp(&other.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+fn top_k_indices_heap(data: &[f32], top_k: usize) -> Vec<usize> {
+    let mut candidates = BinaryHeap::with_capacity(top_k.min(data.len()));
+    for (index, &value) in data.iter().enumerate() {
+        let candidate = Reverse(Candidate { index, value });
+        if candidates.len() < top_k {
+            candidates.push(candidate);
+        } else if candidate.0 > candidates.peek().unwrap().0 {
+            candidates.pop();
+            candidates.push(candidate);
+        }
+    }
+
+    let mut indices: Vec<usize> = candidates
+        .into_iter()
+        .map(|candidate| candidate.0.index)
+        .collect();
+    indices.sort_unstable_by(|&a, &b| cmp_desc(data[a], data[b]));
+    indices
 }
 
 fn sample_ordered_candidates(data: &[f32], ordered: &[usize], inv_t: f32, top_p: f32) -> u32 {
@@ -181,6 +249,28 @@ mod tests {
         let indices = top_k_indices(&logits, 3);
 
         assert_eq!(indices, vec![4, 5, 1]);
+    }
+
+    #[test]
+    fn top_k_indices_handle_zero_and_full_vocab() {
+        let logits = [0.1, 3.0, -1.0, 2.5];
+
+        assert!(top_k_indices(&logits, 0).is_empty());
+        assert_eq!(top_k_indices(&logits, 4), vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn top_k_indices_large_k_uses_heap_path() {
+        let logits: Vec<f32> = (0..128).map(|i| ((i * 37) % 128) as f32).collect();
+
+        let indices = top_k_indices(&logits, 80);
+
+        assert_eq!(indices.len(), 80);
+        assert_eq!(indices[0], 83);
+        assert_eq!(logits[indices[79]], 48.0);
+        for pair in indices.windows(2) {
+            assert!(logits[pair[0]] >= logits[pair[1]]);
+        }
     }
 
     #[test]
