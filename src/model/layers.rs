@@ -3,6 +3,7 @@
 //! 包含 RMSNorm、Attention、MLP 和 TransformerBlock。
 
 use half::f16;
+use std::time::{Duration, Instant};
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
@@ -654,6 +655,16 @@ pub struct TransformerBlock {
     pub mlp: Mlp,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TransformerBlockProfile {
+    pub input_norm: Duration,
+    pub attention: Duration,
+    pub post_norm: Duration,
+    pub mlp: Duration,
+    pub residual: Duration,
+    pub total: Duration,
+}
+
 impl TransformerBlock {
     pub fn new(
         input_layernorm: RmsNorm,
@@ -679,21 +690,81 @@ impl TransformerBlock {
         layer_idx: usize,
         position_offset: usize,
     ) -> Result<Tensor> {
+        self.forward_inner(hidden_states, kv_cache, layer_idx, position_offset, None)
+    }
+
+    pub fn forward_profiled(
+        &self,
+        hidden_states: &Tensor,
+        kv_cache: &mut KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+        profile: &mut TransformerBlockProfile,
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            hidden_states,
+            kv_cache,
+            layer_idx,
+            position_offset,
+            Some(profile),
+        )
+    }
+
+    fn forward_inner(
+        &self,
+        hidden_states: &Tensor,
+        kv_cache: &mut KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+        mut profile: Option<&mut TransformerBlockProfile>,
+    ) -> Result<Tensor> {
+        let total_start = profile.as_ref().map(|_| Instant::now());
+
         // RMSNorm -> Attention
+        let start = profile.as_ref().map(|_| Instant::now());
         let normed = self.input_layernorm.forward(hidden_states)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.input_norm += start.elapsed();
+        }
+
+        let start = profile.as_ref().map(|_| Instant::now());
         let attn_output = self
             .attention
             .forward(&normed, kv_cache, layer_idx, position_offset)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.attention += start.elapsed();
+        }
 
         // Residual connection
+        let start = profile.as_ref().map(|_| Instant::now());
         let hidden_states = hidden_states.add(&attn_output)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.residual += start.elapsed();
+        }
 
         // RMSNorm -> MLP
+        let start = profile.as_ref().map(|_| Instant::now());
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.post_norm += start.elapsed();
+        }
+
+        let start = profile.as_ref().map(|_| Instant::now());
         let mlp_output = self.mlp.forward(&normed)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.mlp += start.elapsed();
+        }
 
         // Residual connection
-        hidden_states.add(&mlp_output)
+        let start = profile.as_ref().map(|_| Instant::now());
+        let output = hidden_states.add(&mlp_output)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.residual += start.elapsed();
+        }
+        if let (Some(profile), Some(start)) = (profile, total_start) {
+            profile.total += start.elapsed();
+        }
+        Ok(output)
     }
 
     pub fn try_enable_gpu_matvecs(&mut self, context: &GpuContext) -> (usize, Vec<String>) {

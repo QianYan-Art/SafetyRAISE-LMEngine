@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::engine::sampler::{default_sampler, Sampler};
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::model::Qwen3Model;
+use crate::model::{Qwen3Model, TransformerBlockProfile};
 use crate::runtime::RuntimeOptions;
 
 pub struct GenerationConfig {
@@ -40,6 +40,7 @@ pub struct GenerationProfile {
     pub decode_sample: Duration,
     pub text_decode: Duration,
     pub fast_path_tokens: usize,
+    pub layer_profiles: Vec<TransformerBlockProfile>,
 }
 
 impl GenerationProfile {
@@ -125,6 +126,15 @@ impl Generator {
         prompt: &str,
         mut on_text: F,
     ) -> Result<(String, GenerationProfile)> {
+        self.generate_stream_with_profile_options(prompt, false, |text| on_text(text))
+    }
+
+    pub fn generate_stream_with_profile_options<F: FnMut(&str)>(
+        &self,
+        prompt: &str,
+        profile_layers: bool,
+        mut on_text: F,
+    ) -> Result<(String, GenerationProfile)> {
         let input_ids = self.encode(prompt)?;
         let mut kv_cache = self.model.create_kv_cache();
         let mut profile = GenerationProfile {
@@ -133,7 +143,7 @@ impl Generator {
         };
 
         let (mut next, forward_time, sample_time, fast_path) =
-            self.next_token_profile(&input_ids, &mut kv_cache, 0)?;
+            self.next_token_profile(&input_ids, &mut kv_cache, 0, profile_layers, &mut profile)?;
         profile.prefill_forward += forward_time;
         profile.prefill_sample += sample_time;
         if fast_path {
@@ -160,8 +170,13 @@ impl Generator {
             }
 
             if step + 1 < self.config.max_tokens {
-                let (token, forward_time, sample_time, fast_path) =
-                    self.next_token_profile(&[next], &mut kv_cache, prompt_len + step)?;
+                let (token, forward_time, sample_time, fast_path) = self.next_token_profile(
+                    &[next],
+                    &mut kv_cache,
+                    prompt_len + step,
+                    profile_layers,
+                    &mut profile,
+                )?;
                 profile.decode_forward += forward_time;
                 profile.decode_sample += sample_time;
                 if fast_path {
@@ -186,20 +201,39 @@ impl Generator {
         input_ids: &[u32],
         kv_cache: &mut KVCache,
         position_offset: usize,
+        profile_layers: bool,
+        profile: &mut GenerationProfile,
     ) -> Result<(u32, Duration, Duration, bool)> {
         let forward_start = Instant::now();
         if self.sampler.is_greedy() && self.model.has_greedy_token_fast_path() {
             let snapshot = kv_cache.snapshot();
-            match self
-                .model
-                .forward_greedy_token(input_ids, kv_cache, position_offset)
-            {
+            let result = if profile_layers {
+                self.model.forward_greedy_token_profiled(
+                    input_ids,
+                    kv_cache,
+                    position_offset,
+                    &mut profile.layer_profiles,
+                )
+            } else {
+                self.model
+                    .forward_greedy_token(input_ids, kv_cache, position_offset)
+            };
+            match result {
                 Ok(token) => return Ok((token, forward_start.elapsed(), Duration::ZERO, true)),
                 Err(_) => kv_cache.restore(snapshot)?,
             }
         }
 
-        let logits = self.model.forward(input_ids, kv_cache, position_offset)?;
+        let logits = if profile_layers {
+            self.model.forward_profiled(
+                input_ids,
+                kv_cache,
+                position_offset,
+                &mut profile.layer_profiles,
+            )?
+        } else {
+            self.model.forward(input_ids, kv_cache, position_offset)?
+        };
         let forward_time = forward_start.elapsed();
         let sample_start = Instant::now();
         let logits_slice = logits.as_slice();

@@ -98,6 +98,10 @@ struct Args {
     #[arg(long)]
     profile_tokens: bool,
 
+    /// 打印 Transformer 层级耗时 profile；默认关闭，通常与 --profile-tokens 一起使用
+    #[arg(long)]
+    profile_layers: bool,
+
     /// 推理设备规划: cpu 保持现有 CPU 路径；auto/hybrid 探测 GPU 并生成混合放置计划
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
@@ -200,7 +204,13 @@ fn main() -> rsinfer::Result<()> {
             } else {
                 prompt
             };
-            generate_and_print(&generator, &final_prompt, args.verbose, args.profile_tokens)?;
+            generate_and_print(
+                &generator,
+                &final_prompt,
+                args.verbose,
+                args.profile_tokens,
+                args.profile_layers,
+            )?;
         }
         _ => run_interactive(
             &generator,
@@ -208,6 +218,7 @@ fn main() -> rsinfer::Result<()> {
             args.system.as_deref(),
             args.verbose,
             args.profile_tokens,
+            args.profile_layers,
         )?,
     }
     Ok(())
@@ -218,15 +229,17 @@ fn generate_and_print(
     prompt: &str,
     verbose: bool,
     profile_tokens: bool,
+    profile_layers: bool,
 ) -> rsinfer::Result<String> {
     if verbose {
         println!("=== 输入 prompt ===\n{prompt}\n=== 开始生成 ===");
     }
     let start = std::time::Instant::now();
-    let (full, profile) = generator.generate_stream_with_profile(prompt, |t| {
-        print!("{t}");
-        io::stdout().flush().ok();
-    })?;
+    let (full, profile) =
+        generator.generate_stream_with_profile_options(prompt, profile_layers, |t| {
+            print!("{t}");
+            io::stdout().flush().ok();
+        })?;
     println!();
     if verbose {
         println!(
@@ -249,6 +262,20 @@ fn generate_and_print(
             profile.avg_decode_forward_ms(),
         );
     }
+    if profile_layers {
+        for (idx, layer) in profile.layer_profiles.iter().enumerate() {
+            println!(
+                "profile.layer_ms layer={} total={:.3} input_norm={:.3} attention={:.3} post_norm={:.3} mlp={:.3} residual={:.3}",
+                idx,
+                layer.total.as_secs_f64() * 1000.0,
+                layer.input_norm.as_secs_f64() * 1000.0,
+                layer.attention.as_secs_f64() * 1000.0,
+                layer.post_norm.as_secs_f64() * 1000.0,
+                layer.mlp.as_secs_f64() * 1000.0,
+                layer.residual.as_secs_f64() * 1000.0,
+            );
+        }
+    }
     Ok(full)
 }
 
@@ -258,6 +285,7 @@ fn run_interactive(
     system: Option<&str>,
     verbose: bool,
     profile_tokens: bool,
+    profile_layers: bool,
 ) -> rsinfer::Result<()> {
     println!("\n=== rsinfer 交互式模式 ===");
     if use_chat {
@@ -305,7 +333,7 @@ fn run_interactive(
 
         print!("助手: ");
         stdout.flush().ok();
-        let full = generate_and_print(generator, &prompt, verbose, profile_tokens)?;
+        let full = generate_and_print(generator, &prompt, verbose, profile_tokens, profile_layers)?;
 
         if use_chat {
             history.push(Message {

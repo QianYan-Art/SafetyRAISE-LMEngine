@@ -8,7 +8,9 @@ use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
 use crate::gpu::GpuContext;
 use crate::model::config::Qwen3Config;
-use crate::model::layers::{build_transformer_block, Linear, RmsNorm, TransformerBlock};
+use crate::model::layers::{
+    build_transformer_block, Linear, RmsNorm, TransformerBlock, TransformerBlockProfile,
+};
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_weight, load_weights, WeightMap};
 use crate::runtime::{
@@ -220,6 +222,28 @@ impl Qwen3Model {
         self.lm_head.forward(&last)
     }
 
+    pub fn forward_profiled(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KVCache,
+        position_offset: usize,
+        layer_profiles: &mut Vec<TransformerBlockProfile>,
+    ) -> Result<Tensor> {
+        self.ensure_layer_profiles(layer_profiles);
+        let mut hidden = self.embedding(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_profiled(
+                &hidden,
+                kv_cache,
+                layer_idx,
+                position_offset,
+                &mut layer_profiles[layer_idx],
+            )?;
+        }
+        let last = self.norm.forward(&hidden.last_row()?)?;
+        self.lm_head.forward(&last)
+    }
+
     /// Greedy-only fast path: return the lm_head argmax token without reading full logits when
     /// the active lm_head backend can do that directly. Callers must fall back to `forward` on error.
     pub fn forward_greedy_token(
@@ -236,6 +260,36 @@ impl Qwen3Model {
         self.lm_head
             .try_forward_q8_gpu_argmax(&last)
             .map_err(RsinferError::DimensionError)
+    }
+
+    pub fn forward_greedy_token_profiled(
+        &self,
+        input_ids: &[u32],
+        kv_cache: &mut KVCache,
+        position_offset: usize,
+        layer_profiles: &mut Vec<TransformerBlockProfile>,
+    ) -> Result<u32> {
+        self.ensure_layer_profiles(layer_profiles);
+        let mut hidden = self.embedding(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_profiled(
+                &hidden,
+                kv_cache,
+                layer_idx,
+                position_offset,
+                &mut layer_profiles[layer_idx],
+            )?;
+        }
+        let last = self.norm.forward(&hidden.last_row()?)?;
+        self.lm_head
+            .try_forward_q8_gpu_argmax(&last)
+            .map_err(RsinferError::DimensionError)
+    }
+
+    fn ensure_layer_profiles(&self, layer_profiles: &mut Vec<TransformerBlockProfile>) {
+        if layer_profiles.len() < self.layers.len() {
+            layer_profiles.resize_with(self.layers.len(), TransformerBlockProfile::default);
+        }
     }
 
     fn embedding(&self, input_ids: &[u32]) -> Result<Tensor> {
