@@ -37,6 +37,7 @@ pub struct GenerationProfile {
     pub prefill_forward: Duration,
     pub prefill_sample: Duration,
     pub decode_forward: Duration,
+    pub decode_forward_token_ms: Vec<f64>,
     pub decode_sample: Duration,
     pub text_decode: Duration,
     pub fast_path_tokens: usize,
@@ -178,6 +179,9 @@ impl Generator {
                     &mut profile,
                 )?;
                 profile.decode_forward += forward_time;
+                profile
+                    .decode_forward_token_ms
+                    .push(forward_time.as_secs_f64() * 1000.0);
                 profile.decode_sample += sample_time;
                 if fast_path {
                     profile.fast_path_tokens += 1;

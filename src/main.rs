@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use rsinfer::engine::{CombinedSampler, Generator, GreedySampler, Sampler};
+use rsinfer::engine::{CombinedSampler, GenerationProfile, Generator, GreedySampler, Sampler};
 use rsinfer::runtime::{DevicePreference, QuantizationCacheMode, QuantizationMode, RuntimeOptions};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -101,6 +101,10 @@ struct Args {
     /// 打印 Transformer 层级耗时 profile；默认关闭，通常与 --profile-tokens 一起使用
     #[arg(long)]
     profile_layers: bool,
+
+    /// 打印 decode_forward 的 per-token 漂移摘要；默认关闭，通常与 --profile-tokens 一起使用
+    #[arg(long)]
+    profile_token_trace: bool,
 
     /// 推理设备规划: cpu 保持现有 CPU 路径；auto/hybrid 探测 GPU 并生成混合放置计划
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
@@ -210,6 +214,7 @@ fn main() -> rsinfer::Result<()> {
                 args.verbose,
                 args.profile_tokens,
                 args.profile_layers,
+                args.profile_token_trace,
             )?;
         }
         _ => run_interactive(
@@ -219,9 +224,55 @@ fn main() -> rsinfer::Result<()> {
             args.verbose,
             args.profile_tokens,
             args.profile_layers,
+            args.profile_token_trace,
         )?,
     }
     Ok(())
+}
+
+fn avg_ms(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn format_trace_window(values: &[f64], start: usize, end: usize) -> String {
+    values[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, value)| format!("t{}={value:.3}", start + offset + 1))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn print_decode_forward_trace_summary(profile: &GenerationProfile) {
+    let values = &profile.decode_forward_token_ms;
+    if values.is_empty() {
+        println!("profile.decode_forward_trace count=0");
+        return;
+    }
+
+    let first_end = values.len().min(4);
+    let middle_len = values.len().min(4);
+    let middle_start = (values.len().saturating_sub(middle_len)) / 2;
+    let middle_end = middle_start + middle_len;
+    let last_start = values.len().saturating_sub(4);
+
+    println!(
+        "profile.decode_forward_trace count={} first=[{}] middle=[{}] last=[{}]",
+        values.len(),
+        format_trace_window(values, 0, first_end),
+        format_trace_window(values, middle_start, middle_end),
+        format_trace_window(values, last_start, values.len()),
+    );
+    println!(
+        "profile.decode_forward_trace_avg first={:.3} middle={:.3} last={:.3}",
+        avg_ms(&values[..first_end]),
+        avg_ms(&values[middle_start..middle_end]),
+        avg_ms(&values[last_start..]),
+    );
 }
 
 fn generate_and_print(
@@ -230,6 +281,7 @@ fn generate_and_print(
     verbose: bool,
     profile_tokens: bool,
     profile_layers: bool,
+    profile_token_trace: bool,
 ) -> rsinfer::Result<String> {
     if verbose {
         println!("=== 输入 prompt ===\n{prompt}\n=== 开始生成 ===");
@@ -261,6 +313,9 @@ fn generate_and_print(
             profile.text_decode.as_secs_f64() * 1000.0,
             profile.avg_decode_forward_ms(),
         );
+    }
+    if profile_token_trace {
+        print_decode_forward_trace_summary(&profile);
     }
     if profile_layers {
         for (idx, layer) in profile.layer_profiles.iter().enumerate() {
@@ -295,6 +350,7 @@ fn run_interactive(
     verbose: bool,
     profile_tokens: bool,
     profile_layers: bool,
+    profile_token_trace: bool,
 ) -> rsinfer::Result<()> {
     println!("\n=== rsinfer 交互式模式 ===");
     if use_chat {
@@ -342,7 +398,14 @@ fn run_interactive(
 
         print!("助手: ");
         stdout.flush().ok();
-        let full = generate_and_print(generator, &prompt, verbose, profile_tokens, profile_layers)?;
+        let full = generate_and_print(
+            generator,
+            &prompt,
+            verbose,
+            profile_tokens,
+            profile_layers,
+            profile_token_trace,
+        )?;
 
         if use_chat {
             history.push(Message {
