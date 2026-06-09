@@ -31,6 +31,31 @@ pub struct Generator {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct FinalLayerTokenProfile {
+    pub total_ms: f64,
+    pub attention_ms: f64,
+    pub mlp_ms: f64,
+    pub mlp_gate_up_ms: f64,
+    pub mlp_down_proj_ms: f64,
+    pub mlp_q8_gate_up_dot_ms: f64,
+    pub mlp_q8_down_proj_dot_ms: f64,
+}
+
+impl FinalLayerTokenProfile {
+    fn from_layer_profile(profile: &TransformerBlockProfile) -> Self {
+        Self {
+            total_ms: profile.total.as_secs_f64() * 1000.0,
+            attention_ms: profile.attention.as_secs_f64() * 1000.0,
+            mlp_ms: profile.mlp.as_secs_f64() * 1000.0,
+            mlp_gate_up_ms: profile.mlp_gate_up.as_secs_f64() * 1000.0,
+            mlp_down_proj_ms: profile.mlp_down_proj.as_secs_f64() * 1000.0,
+            mlp_q8_gate_up_dot_ms: profile.mlp_q8_gate_up_dot.as_secs_f64() * 1000.0,
+            mlp_q8_down_proj_dot_ms: profile.mlp_q8_down_proj_dot.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct GenerationProfile {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
@@ -42,6 +67,8 @@ pub struct GenerationProfile {
     pub text_decode: Duration,
     pub fast_path_tokens: usize,
     pub layer_profiles: Vec<TransformerBlockProfile>,
+    pub final_layer_index: Option<usize>,
+    pub final_layer_decode_trace: Vec<FinalLayerTokenProfile>,
 }
 
 impl GenerationProfile {
@@ -52,6 +79,76 @@ impl GenerationProfile {
             self.decode_forward.as_secs_f64() * 1000.0 / (self.generated_tokens - 1) as f64
         }
     }
+
+    fn record_final_layer_decode_trace(
+        &mut self,
+        layer_index: usize,
+        layer_delta: &TransformerBlockProfile,
+    ) {
+        if let Some(existing) = self.final_layer_index {
+            debug_assert_eq!(existing, layer_index);
+        } else {
+            self.final_layer_index = Some(layer_index);
+        }
+        self.final_layer_decode_trace
+            .push(FinalLayerTokenProfile::from_layer_profile(layer_delta));
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NextTokenProfileResult {
+    token: u32,
+    forward_time: Duration,
+    sample_time: Duration,
+    fast_path: bool,
+    final_layer_delta: Option<TransformerBlockProfile>,
+}
+
+fn diff_transformer_block_profile(
+    before: &TransformerBlockProfile,
+    after: &TransformerBlockProfile,
+) -> TransformerBlockProfile {
+    TransformerBlockProfile {
+        input_norm: after.input_norm.saturating_sub(before.input_norm),
+        attention: after.attention.saturating_sub(before.attention),
+        post_norm: after.post_norm.saturating_sub(before.post_norm),
+        mlp: after.mlp.saturating_sub(before.mlp),
+        mlp_gate_up: after.mlp_gate_up.saturating_sub(before.mlp_gate_up),
+        mlp_silu_mul: after.mlp_silu_mul.saturating_sub(before.mlp_silu_mul),
+        mlp_down_proj: after.mlp_down_proj.saturating_sub(before.mlp_down_proj),
+        mlp_q8_gate_up_prep: after
+            .mlp_q8_gate_up_prep
+            .saturating_sub(before.mlp_q8_gate_up_prep),
+        mlp_q8_gate_up_dot: after
+            .mlp_q8_gate_up_dot
+            .saturating_sub(before.mlp_q8_gate_up_dot),
+        mlp_q8_gate_up_writeback: after
+            .mlp_q8_gate_up_writeback
+            .saturating_sub(before.mlp_q8_gate_up_writeback),
+        mlp_q8_down_proj_prep: after
+            .mlp_q8_down_proj_prep
+            .saturating_sub(before.mlp_q8_down_proj_prep),
+        mlp_q8_down_proj_dot: after
+            .mlp_q8_down_proj_dot
+            .saturating_sub(before.mlp_q8_down_proj_dot),
+        mlp_q8_down_proj_writeback: after
+            .mlp_q8_down_proj_writeback
+            .saturating_sub(before.mlp_q8_down_proj_writeback),
+        residual: after.residual.saturating_sub(before.residual),
+        total: after.total.saturating_sub(before.total),
+    }
+}
+
+fn final_layer_profile_delta(
+    before: Option<&TransformerBlockProfile>,
+    layer_profiles: &[TransformerBlockProfile],
+) -> Option<TransformerBlockProfile> {
+    let after = layer_profiles.last()?;
+    Some(if let Some(before_profile) = before {
+        diff_transformer_block_profile(before_profile, after)
+    } else {
+        after.clone()
+    })
 }
 
 impl Generator {
@@ -127,13 +224,14 @@ impl Generator {
         prompt: &str,
         mut on_text: F,
     ) -> Result<(String, GenerationProfile)> {
-        self.generate_stream_with_profile_options(prompt, false, |text| on_text(text))
+        self.generate_stream_with_profile_options(prompt, false, false, |text| on_text(text))
     }
 
     pub fn generate_stream_with_profile_options<F: FnMut(&str)>(
         &self,
         prompt: &str,
         profile_layers: bool,
+        profile_token_trace: bool,
         mut on_text: F,
     ) -> Result<(String, GenerationProfile)> {
         let input_ids = self.encode(prompt)?;
@@ -142,15 +240,23 @@ impl Generator {
             prompt_tokens: input_ids.len(),
             ..Default::default()
         };
+        let track_final_layer_trace = profile_layers && profile_token_trace;
 
-        let (mut next, forward_time, sample_time, fast_path) =
-            self.next_token_profile(&input_ids, &mut kv_cache, 0, profile_layers, &mut profile)?;
-        profile.prefill_forward += forward_time;
-        profile.prefill_sample += sample_time;
-        if fast_path {
+        let prefill = self.next_token_profile(
+            &input_ids,
+            &mut kv_cache,
+            0,
+            profile_layers,
+            track_final_layer_trace,
+            &mut profile,
+        )?;
+        profile.prefill_forward += prefill.forward_time;
+        profile.prefill_sample += prefill.sample_time;
+        if prefill.fast_path {
             profile.fast_path_tokens += 1;
         }
         let prompt_len = input_ids.len();
+        let mut next = prefill.token;
 
         // 逐 token 解码会截断多字节字符，故每步解码整段、只刷出已完整的新增后缀。
         let mut tokens: Vec<u32> = Vec::with_capacity(self.config.max_tokens);
@@ -171,22 +277,29 @@ impl Generator {
             }
 
             if step + 1 < self.config.max_tokens {
-                let (token, forward_time, sample_time, fast_path) = self.next_token_profile(
+                let next_token = self.next_token_profile(
                     &[next],
                     &mut kv_cache,
                     prompt_len + step,
                     profile_layers,
+                    track_final_layer_trace,
                     &mut profile,
                 )?;
-                profile.decode_forward += forward_time;
+                profile.decode_forward += next_token.forward_time;
                 profile
                     .decode_forward_token_ms
-                    .push(forward_time.as_secs_f64() * 1000.0);
-                profile.decode_sample += sample_time;
-                if fast_path {
+                    .push(next_token.forward_time.as_secs_f64() * 1000.0);
+                if let (Some(layer_index), Some(layer_delta)) = (
+                    profile.layer_profiles.len().checked_sub(1),
+                    next_token.final_layer_delta.as_ref(),
+                ) {
+                    profile.record_final_layer_decode_trace(layer_index, layer_delta);
+                }
+                profile.decode_sample += next_token.sample_time;
+                if next_token.fast_path {
                     profile.fast_path_tokens += 1;
                 }
-                next = token;
+                next = next_token.token;
             }
         }
 
@@ -206,9 +319,15 @@ impl Generator {
         kv_cache: &mut KVCache,
         position_offset: usize,
         profile_layers: bool,
+        track_final_layer_trace: bool,
         profile: &mut GenerationProfile,
-    ) -> Result<(u32, Duration, Duration, bool)> {
+    ) -> Result<NextTokenProfileResult> {
         let forward_start = Instant::now();
+        let final_layer_before = if track_final_layer_trace {
+            profile.layer_profiles.last().cloned()
+        } else {
+            None
+        };
         if self.sampler.is_greedy() && self.model.has_greedy_token_fast_path() {
             let snapshot = kv_cache.snapshot();
             let result = if profile_layers {
@@ -223,7 +342,18 @@ impl Generator {
                     .forward_greedy_token(input_ids, kv_cache, position_offset)
             };
             match result {
-                Ok(token) => return Ok((token, forward_start.elapsed(), Duration::ZERO, true)),
+                Ok(token) => {
+                    return Ok(NextTokenProfileResult {
+                        token,
+                        forward_time: forward_start.elapsed(),
+                        sample_time: Duration::ZERO,
+                        fast_path: true,
+                        final_layer_delta: final_layer_profile_delta(
+                            final_layer_before.as_ref(),
+                            &profile.layer_profiles,
+                        ),
+                    });
+                }
                 Err(_) => kv_cache.restore(snapshot)?,
             }
         }
@@ -247,6 +377,86 @@ impl Generator {
             ));
         }
         let token = self.sampler.sample(logits_slice);
-        Ok((token, forward_time, sample_start.elapsed(), false))
+        Ok(NextTokenProfileResult {
+            token,
+            forward_time,
+            sample_time: sample_start.elapsed(),
+            fast_path: false,
+            final_layer_delta: final_layer_profile_delta(
+                final_layer_before.as_ref(),
+                &profile.layer_profiles,
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn transformer_block_profile_delta_is_fieldwise() {
+        let before = TransformerBlockProfile {
+            attention: ms(11),
+            mlp: ms(13),
+            mlp_gate_up: ms(17),
+            mlp_down_proj: ms(19),
+            mlp_q8_gate_up_dot: ms(23),
+            mlp_q8_down_proj_dot: ms(29),
+            total: ms(31),
+            ..Default::default()
+        };
+        let after = TransformerBlockProfile {
+            attention: ms(41),
+            mlp: ms(53),
+            mlp_gate_up: ms(67),
+            mlp_down_proj: ms(79),
+            mlp_q8_gate_up_dot: ms(83),
+            mlp_q8_down_proj_dot: ms(97),
+            total: ms(101),
+            ..Default::default()
+        };
+
+        let delta = diff_transformer_block_profile(&before, &after);
+
+        assert_eq!(delta.attention, ms(30));
+        assert_eq!(delta.mlp, ms(40));
+        assert_eq!(delta.mlp_gate_up, ms(50));
+        assert_eq!(delta.mlp_down_proj, ms(60));
+        assert_eq!(delta.mlp_q8_gate_up_dot, ms(60));
+        assert_eq!(delta.mlp_q8_down_proj_dot, ms(68));
+        assert_eq!(delta.total, ms(70));
+    }
+
+    #[test]
+    fn generation_profile_records_final_layer_trace_in_ms() {
+        let mut profile = GenerationProfile::default();
+        let delta = TransformerBlockProfile {
+            attention: Duration::from_micros(500),
+            mlp: Duration::from_micros(1_500),
+            mlp_gate_up: Duration::from_micros(250),
+            mlp_down_proj: Duration::from_micros(750),
+            mlp_q8_gate_up_dot: Duration::from_micros(1_000),
+            mlp_q8_down_proj_dot: Duration::from_micros(1_250),
+            total: Duration::from_micros(2_500),
+            ..Default::default()
+        };
+
+        profile.record_final_layer_decode_trace(35, &delta);
+
+        assert_eq!(profile.final_layer_index, Some(35));
+        assert_eq!(profile.final_layer_decode_trace.len(), 1);
+        let trace = &profile.final_layer_decode_trace[0];
+        assert!((trace.total_ms - 2.5).abs() < 1e-9);
+        assert!((trace.attention_ms - 0.5).abs() < 1e-9);
+        assert!((trace.mlp_ms - 1.5).abs() < 1e-9);
+        assert!((trace.mlp_gate_up_ms - 0.25).abs() < 1e-9);
+        assert!((trace.mlp_down_proj_ms - 0.75).abs() < 1e-9);
+        assert!((trace.mlp_q8_gate_up_dot_ms - 1.0).abs() < 1e-9);
+        assert!((trace.mlp_q8_down_proj_dot_ms - 1.25).abs() < 1e-9);
     }
 }

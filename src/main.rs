@@ -247,6 +247,15 @@ fn format_trace_window(values: &[f64], start: usize, end: usize) -> String {
         .join(",")
 }
 
+fn trace_window_bounds(len: usize) -> (usize, usize, usize, usize) {
+    let first_end = len.min(4);
+    let middle_len = len.min(4);
+    let middle_start = (len.saturating_sub(middle_len)) / 2;
+    let middle_end = middle_start + middle_len;
+    let last_start = len.saturating_sub(4);
+    (first_end, middle_start, middle_end, last_start)
+}
+
 fn print_decode_forward_trace_summary(profile: &GenerationProfile) {
     let values = &profile.decode_forward_token_ms;
     if values.is_empty() {
@@ -254,11 +263,7 @@ fn print_decode_forward_trace_summary(profile: &GenerationProfile) {
         return;
     }
 
-    let first_end = values.len().min(4);
-    let middle_len = values.len().min(4);
-    let middle_start = (values.len().saturating_sub(middle_len)) / 2;
-    let middle_end = middle_start + middle_len;
-    let last_start = values.len().saturating_sub(4);
+    let (first_end, middle_start, middle_end, last_start) = trace_window_bounds(values.len());
 
     println!(
         "profile.decode_forward_trace count={} first=[{}] middle=[{}] last=[{}]",
@@ -275,6 +280,106 @@ fn print_decode_forward_trace_summary(profile: &GenerationProfile) {
     );
 }
 
+fn print_final_layer_trace_avg(
+    layer_index: usize,
+    field: &str,
+    values: &[f64],
+    first_end: usize,
+    middle_start: usize,
+    middle_end: usize,
+    last_start: usize,
+) {
+    println!(
+        "profile.layer_trace_avg layer={} field={} first={:.3} middle={:.3} last={:.3}",
+        layer_index,
+        field,
+        avg_ms(&values[..first_end]),
+        avg_ms(&values[middle_start..middle_end]),
+        avg_ms(&values[last_start..]),
+    );
+}
+
+fn print_final_layer_decode_trace_summary(profile: &GenerationProfile) {
+    let Some(layer_index) = profile.final_layer_index else {
+        return;
+    };
+    let traces = &profile.final_layer_decode_trace;
+    if traces.is_empty() {
+        return;
+    }
+
+    let (first_end, middle_start, middle_end, last_start) = trace_window_bounds(traces.len());
+    let total_values: Vec<f64> = traces.iter().map(|trace| trace.total_ms).collect();
+    println!(
+        "profile.layer_trace layer={} count={} total_first=[{}] middle=[{}] last=[{}]",
+        layer_index,
+        traces.len(),
+        format_trace_window(&total_values, 0, first_end),
+        format_trace_window(&total_values, middle_start, middle_end),
+        format_trace_window(&total_values, last_start, total_values.len()),
+    );
+
+    let fields = [
+        (
+            "total",
+            traces
+                .iter()
+                .map(|trace| trace.total_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "attention",
+            traces
+                .iter()
+                .map(|trace| trace.attention_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mlp",
+            traces.iter().map(|trace| trace.mlp_ms).collect::<Vec<_>>(),
+        ),
+        (
+            "mlp_gate_up",
+            traces
+                .iter()
+                .map(|trace| trace.mlp_gate_up_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mlp_down_proj",
+            traces
+                .iter()
+                .map(|trace| trace.mlp_down_proj_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mlp_q8_gate_up_dot",
+            traces
+                .iter()
+                .map(|trace| trace.mlp_q8_gate_up_dot_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mlp_q8_down_proj_dot",
+            traces
+                .iter()
+                .map(|trace| trace.mlp_q8_down_proj_dot_ms)
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    for (field, values) in fields {
+        print_final_layer_trace_avg(
+            layer_index,
+            field,
+            &values,
+            first_end,
+            middle_start,
+            middle_end,
+            last_start,
+        );
+    }
+}
+
 fn generate_and_print(
     generator: &Generator,
     prompt: &str,
@@ -287,11 +392,15 @@ fn generate_and_print(
         println!("=== 输入 prompt ===\n{prompt}\n=== 开始生成 ===");
     }
     let start = std::time::Instant::now();
-    let (full, profile) =
-        generator.generate_stream_with_profile_options(prompt, profile_layers, |t| {
+    let (full, profile) = generator.generate_stream_with_profile_options(
+        prompt,
+        profile_layers,
+        profile_token_trace,
+        |t| {
             print!("{t}");
             io::stdout().flush().ok();
-        })?;
+        },
+    )?;
     println!();
     if verbose {
         println!(
@@ -316,6 +425,7 @@ fn generate_and_print(
     }
     if profile_token_trace {
         print_decode_forward_trace_summary(&profile);
+        print_final_layer_decode_trace_summary(&profile);
     }
     if profile_layers {
         for (idx, layer) in profile.layer_profiles.iter().enumerate() {

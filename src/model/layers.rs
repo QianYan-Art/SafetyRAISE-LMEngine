@@ -644,7 +644,7 @@ impl Mlp {
         } else {
             self.down_proj.forward(&hidden)?
         };
-        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+        if let (Some(profile), Some(start)) = (profile, start) {
             profile.mlp_down_proj += start.elapsed();
         }
         Ok(output)
