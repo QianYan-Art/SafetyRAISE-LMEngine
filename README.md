@@ -62,14 +62,14 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 | `-v, --verbose` | 打印 prompt 与耗时 | 关 |
 | `--profile-tokens` | 打印 token 级 prefill/decode/sample/text decode 耗时 | 关 |
 | `--device` | 运行时设备规划：`cpu` / `auto` / `hybrid` | `cpu` |
-| `--gpu-layers` | 计划放到 GPU 的 Transformer 层数；省略时按模式保守选择，Q8 hybrid 本机默认 32 | 自动估计 |
+| `--gpu-layers` | 计划放到 GPU 的 Transformer 层数；省略时按模式保守选择，Q8 hybrid 本机默认 35 | 自动估计 |
 | `--quantization` | 权重量化路径：`none` / `q8` | `none` |
 | `--q8-cache` | Q8 sidecar 缓存：`auto` / `off` | `auto` |
 | `--q8-cache-dir` | Q8 sidecar 目录；默认在模型目录同级创建 `<model>.rsinfer-q8` | — |
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
-`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。对 `--quantization q8`，未显式传 `--gpu-layers` 时默认 offload 32 个 Transformer decode 层，这是基于本机 token profile 对 GPU+CPU 混合 decode 路径的选择；显式传 `--gpu-layers 0` 可回到只保留 `lm_head` GPU 路径。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。对 `--quantization q8`，未显式传 `--gpu-layers` 时默认 offload 35 个 Transformer decode 层，这是基于本机 token profile 对 GPU+CPU 混合 decode 路径的选择；显式传 `--gpu-layers 0` 可回到只保留 `lm_head` GPU 路径。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
 
 `--quantization q8` 会在 safetensors 权重加载后，为 bias-free 线性层构建行级 Q8 权重；它不会修改原始模型文件。默认 `--q8-cache auto` 会在模型目录同级创建 sidecar 目录（例如 `TS-Qwen3.rsinfer-q8`），后续运行若模型 fingerprint 匹配就直接读取 Q8 sidecar，减少重复量化加载成本。`--q8-cache off` 会关闭 sidecar 并每次在内存中派生 Q8 权重。若同一个线性层已接入 Q8 GPU matvec 或 f16 GPU matvec，GPU 路径仍优先，Q8 CPU linear 是 fallback。
 
