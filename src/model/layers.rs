@@ -3,6 +3,7 @@
 //! 包含 RMSNorm、Attention、MLP 和 TransformerBlock。
 
 use half::f16;
+use rayon::join;
 use std::time::{Duration, Instant};
 
 use crate::engine::KVCache;
@@ -140,6 +141,13 @@ impl Linear {
 
     pub fn q8_gpu_matvec(&self) -> Option<&GpuQ8MatVec> {
         self.q8_gpu_matvec.as_ref()
+    }
+
+    fn has_cpu_q8_only(&self) -> bool {
+        self.bias.is_none()
+            && self.q8_weight.is_some()
+            && self.q8_gpu_matvec.is_none()
+            && self.gpu_matvec.is_none()
     }
 
     pub fn has_q8_gpu_argmax(&self) -> bool {
@@ -555,6 +563,10 @@ impl Mlp {
                         _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
                     }
                 }
+                _ if self.gate_proj.has_cpu_q8_only() && self.up_proj.has_cpu_q8_only() => {
+                    let (gate, up) = join(|| self.gate_proj.forward(x), || self.up_proj.forward(x));
+                    (gate?, up?)
+                }
                 _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
             }
         } else {
@@ -865,6 +877,51 @@ mod tests {
                 (expected - actual).abs() <= 0.02,
                 "q8 Linear output {actual} too far from f16 {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn mlp_q8_single_token_parallel_gate_up_matches_multi_row_first_row() {
+        let gate_weight = vec![
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let up_weight = vec![
+            f16::from_f32(-0.25),
+            f16::from_f32(0.75),
+            f16::from_f32(0.4),
+            f16::from_f32(-1.25),
+            f16::from_f32(1.0),
+            f16::from_f32(0.5),
+        ];
+        let down_weight = vec![
+            f16::from_f32(0.3),
+            f16::from_f32(-0.8),
+            f16::from_f32(0.6),
+            f16::from_f32(-0.4),
+            f16::from_f32(0.2),
+            f16::from_f32(1.2),
+        ];
+        let mut mlp = Mlp::new(
+            Linear::from_f16_weight(&[3, 2], gate_weight, None).unwrap(),
+            Linear::from_f16_weight(&[3, 2], up_weight, None).unwrap(),
+            Linear::from_f16_weight(&[2, 3], down_weight, None).unwrap(),
+        );
+        mlp.try_enable_q8_weights(None).unwrap();
+        let single = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let multi = Tensor::from_f32_slice(&[2, 2], &[0.6, -1.4, 1.0, 0.25]).unwrap();
+
+        let single_out = mlp.forward(&single).unwrap();
+        let multi_out = mlp.forward(&multi).unwrap();
+
+        assert_eq!(single_out.shape(), &[1, 2]);
+        assert_eq!(multi_out.shape(), &[2, 2]);
+        for (single, multi) in single_out.as_slice().iter().zip(&multi_out.as_slice()[..2]) {
+            assert!((single - multi).abs() <= 1e-6);
         }
     }
 
