@@ -526,6 +526,22 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x, None)
+    }
+
+    pub fn forward_profiled(
+        &self,
+        x: &Tensor,
+        profile: &mut TransformerBlockProfile,
+    ) -> Result<Tensor> {
+        self.forward_inner(x, Some(profile))
+    }
+
+    fn forward_inner(
+        &self,
+        x: &Tensor,
+        mut profile: Option<&mut TransformerBlockProfile>,
+    ) -> Result<Tensor> {
         if x.shape()[0] == 1 {
             if let (Some(gate_proj), Some(up_proj), Some(down_proj)) = (
                 self.gate_proj.q8_gpu_matvec(),
@@ -551,6 +567,7 @@ impl Mlp {
             }
         }
 
+        let start = profile.as_ref().map(|_| Instant::now());
         let (gate, up) = if x.shape()[0] == 1 {
             match (self.gate_proj.gpu_matvec(), self.up_proj.gpu_matvec()) {
                 (Some(gate_proj), Some(up_proj)) => {
@@ -572,9 +589,23 @@ impl Mlp {
         } else {
             (self.gate_proj.forward(x)?, self.up_proj.forward(x)?)
         };
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.mlp_gate_up += start.elapsed();
+        }
+
+        let start = profile.as_ref().map(|_| Instant::now());
         let gate = silu(&gate);
         let hidden = gate.mul(&up)?;
-        self.down_proj.forward(&hidden)
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.mlp_silu_mul += start.elapsed();
+        }
+
+        let start = profile.as_ref().map(|_| Instant::now());
+        let output = self.down_proj.forward(&hidden)?;
+        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
+            profile.mlp_down_proj += start.elapsed();
+        }
+        Ok(output)
     }
 
     pub fn try_enable_q8_weights(
@@ -673,6 +704,9 @@ pub struct TransformerBlockProfile {
     pub attention: Duration,
     pub post_norm: Duration,
     pub mlp: Duration,
+    pub mlp_gate_up: Duration,
+    pub mlp_silu_mul: Duration,
+    pub mlp_down_proj: Duration,
     pub residual: Duration,
     pub total: Duration,
 }
@@ -762,9 +796,13 @@ impl TransformerBlock {
         }
 
         let start = profile.as_ref().map(|_| Instant::now());
-        let mlp_output = self.mlp.forward(&normed)?;
-        if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
-            profile.mlp += start.elapsed();
+        let mlp_output = if let Some(profile_ref) = profile.as_deref_mut() {
+            self.mlp.forward_profiled(&normed, profile_ref)?
+        } else {
+            self.mlp.forward(&normed)?
+        };
+        if let (Some(profile_ref), Some(start)) = (profile.as_deref_mut(), start) {
+            profile_ref.mlp += start.elapsed();
         }
 
         // Residual connection
