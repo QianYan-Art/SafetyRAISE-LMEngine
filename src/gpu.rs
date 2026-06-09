@@ -96,10 +96,29 @@ fn main(
     var sum = 0.0;
     let base = out_idx * params.words_per_row;
     let lane = local_id.x;
-    for (var i = lane; i < params.in_features; i = i + 64u) {
-        let word = qweight[base + (i / 4u)];
-        let q = unpack_i8(word, i & 3u);
-        sum = sum + input[i] * f32(q);
+    let full_words = params.in_features / 4u;
+    for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
+        let word = qweight[base + word_idx];
+        let input_base = word_idx * 4u;
+        sum = sum + input[input_base] * f32(unpack_i8(word, 0u));
+        sum = sum + input[input_base + 1u] * f32(unpack_i8(word, 1u));
+        sum = sum + input[input_base + 2u] * f32(unpack_i8(word, 2u));
+        sum = sum + input[input_base + 3u] * f32(unpack_i8(word, 3u));
+    }
+
+    let tail = params.in_features & 3u;
+    if (tail != 0u && lane == 0u) {
+        let word = qweight[base + full_words];
+        let input_base = full_words * 4u;
+        if (tail >= 1u) {
+            sum = sum + input[input_base] * f32(unpack_i8(word, 0u));
+        }
+        if (tail >= 2u) {
+            sum = sum + input[input_base + 1u] * f32(unpack_i8(word, 1u));
+        }
+        if (tail >= 3u) {
+            sum = sum + input[input_base + 2u] * f32(unpack_i8(word, 2u));
+        }
     }
     partial_sum[lane] = sum;
     workgroupBarrier();
