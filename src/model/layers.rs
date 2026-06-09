@@ -15,8 +15,9 @@ use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
-    linear_forward_f16, linear_forward_q8, rms_norm, rope_with_inv_freq,
-    scaled_dot_product_attention_gqa_cached, silu, CachedAttention, Q8LinearWeight, Tensor,
+    linear_forward_f16, linear_forward_q8, linear_forward_q8_profiled, rms_norm,
+    rope_with_inv_freq, scaled_dot_product_attention_gqa_cached, silu, CachedAttention,
+    Q8LinearProfile, Q8LinearWeight, Tensor,
 };
 
 /// RMS 归一化层
@@ -581,8 +582,34 @@ impl Mlp {
                     }
                 }
                 _ if self.gate_proj.has_cpu_q8_only() && self.up_proj.has_cpu_q8_only() => {
-                    let (gate, up) = join(|| self.gate_proj.forward(x), || self.up_proj.forward(x));
-                    (gate?, up?)
+                    if let (Some(profile_ref), Some(gate_weight), Some(up_weight)) = (
+                        profile.as_deref_mut(),
+                        self.gate_proj.q8_weight.as_ref(),
+                        self.up_proj.q8_weight.as_ref(),
+                    ) {
+                        let ((gate, gate_profile), (up, up_profile)) = join(
+                            || {
+                                let mut gate_profile = Q8LinearProfile::default();
+                                let gate =
+                                    linear_forward_q8_profiled(x, gate_weight, &mut gate_profile);
+                                (gate, gate_profile)
+                            },
+                            || {
+                                let mut up_profile = Q8LinearProfile::default();
+                                let up = linear_forward_q8_profiled(x, up_weight, &mut up_profile);
+                                (up, up_profile)
+                            },
+                        );
+                        profile_ref.mlp_q8_gate_up_prep += gate_profile.prep + up_profile.prep;
+                        profile_ref.mlp_q8_gate_up_dot += gate_profile.dot + up_profile.dot;
+                        profile_ref.mlp_q8_gate_up_writeback +=
+                            gate_profile.writeback + up_profile.writeback;
+                        (gate?, up?)
+                    } else {
+                        let (gate, up) =
+                            join(|| self.gate_proj.forward(x), || self.up_proj.forward(x));
+                        (gate?, up?)
+                    }
                 }
                 _ => (self.gate_proj.forward(x)?, self.up_proj.forward(x)?),
             }
@@ -601,7 +628,22 @@ impl Mlp {
         }
 
         let start = profile.as_ref().map(|_| Instant::now());
-        let output = self.down_proj.forward(&hidden)?;
+        let output = if let (Some(profile_ref), Some(down_weight)) =
+            (profile.as_deref_mut(), self.down_proj.q8_weight.as_ref())
+        {
+            if self.down_proj.has_cpu_q8_only() {
+                let mut down_profile = Q8LinearProfile::default();
+                let output = linear_forward_q8_profiled(&hidden, down_weight, &mut down_profile)?;
+                profile_ref.mlp_q8_down_proj_prep += down_profile.prep;
+                profile_ref.mlp_q8_down_proj_dot += down_profile.dot;
+                profile_ref.mlp_q8_down_proj_writeback += down_profile.writeback;
+                output
+            } else {
+                self.down_proj.forward(&hidden)?
+            }
+        } else {
+            self.down_proj.forward(&hidden)?
+        };
         if let (Some(profile), Some(start)) = (profile.as_deref_mut(), start) {
             profile.mlp_down_proj += start.elapsed();
         }
@@ -707,6 +749,12 @@ pub struct TransformerBlockProfile {
     pub mlp_gate_up: Duration,
     pub mlp_silu_mul: Duration,
     pub mlp_down_proj: Duration,
+    pub mlp_q8_gate_up_prep: Duration,
+    pub mlp_q8_gate_up_dot: Duration,
+    pub mlp_q8_gate_up_writeback: Duration,
+    pub mlp_q8_down_proj_prep: Duration,
+    pub mlp_q8_down_proj_dot: Duration,
+    pub mlp_q8_down_proj_writeback: Duration,
     pub residual: Duration,
     pub total: Duration,
 }

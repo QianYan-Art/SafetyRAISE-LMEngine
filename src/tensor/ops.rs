@@ -6,6 +6,7 @@ use half::f16;
 use half::slice::HalfFloatSliceExt;
 use ndarray::{ArrayD, Axis, IxDyn};
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 use super::Tensor;
 use crate::error::{Result, RsinferError};
@@ -19,6 +20,13 @@ pub struct Q8LinearWeight {
     pub scales: Vec<f32>,
     pub out_features: usize,
     pub in_features: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Q8LinearProfile {
+    pub prep: Duration,
+    pub dot: Duration,
+    pub writeback: Duration,
 }
 
 impl Q8LinearWeight {
@@ -191,6 +199,90 @@ pub fn linear_forward_q8(x: &Tensor, weight: &Q8LinearWeight) -> Result<Tensor> 
         }
     }
     Tensor::from_f32_slice(&[m, n], &out)
+}
+
+/// 线性层矩阵乘法：与 `linear_forward_q8` 等价，但额外记录诊断计时。
+pub fn linear_forward_q8_profiled(
+    x: &Tensor,
+    weight: &Q8LinearWeight,
+    profile: &mut Q8LinearProfile,
+) -> Result<Tensor> {
+    let start = Instant::now();
+    if x.ndim() != 2 {
+        return Err(RsinferError::DimensionError(format!(
+            "linear_forward_q8 需要 2D 输入, got {}D",
+            x.ndim()
+        )));
+    }
+    let (m, k) = (x.shape()[0], x.shape()[1]);
+    if k != weight.in_features {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![m, weight.in_features],
+            actual: vec![m, k],
+        });
+    }
+
+    let x_std = x.data.as_standard_layout();
+    let xs = x_std
+        .as_slice()
+        .ok_or_else(|| RsinferError::DimensionError("x 非连续内存".into()))?;
+    profile.prep += start.elapsed();
+
+    let n = weight.out_features;
+    if m == 1 {
+        let input = &xs[..k];
+        let mut out = vec![0f32; n];
+        const JCHUNK: usize = 16;
+        let start = Instant::now();
+        out.par_chunks_mut(JCHUNK)
+            .enumerate()
+            .for_each(|(c, block)| {
+                let jbase = c * JCHUNK;
+                for (jj, dst) in block.iter_mut().enumerate() {
+                    let j = jbase + jj;
+                    let w_row = &weight.qweight[j * k..(j + 1) * k];
+                    *dst = dot_q8(input, w_row, weight.scales[j]);
+                }
+            });
+        profile.dot += start.elapsed();
+
+        let start = Instant::now();
+        let tensor = Tensor::from_f32_vec(&[1, n], out)?;
+        profile.writeback += start.elapsed();
+        return Ok(tensor);
+    }
+
+    let mut out_t = vec![0f32; n * m];
+    const JCHUNK: usize = 16;
+    let start = Instant::now();
+    out_t
+        .par_chunks_mut(m * JCHUNK)
+        .enumerate()
+        .for_each(|(c, block)| {
+            let jbase = c * JCHUNK;
+            let feats = block.len() / m;
+            for jj in 0..feats {
+                let j = jbase + jj;
+                let w_row = &weight.qweight[j * k..(j + 1) * k];
+                let scale = weight.scales[j];
+                let dst = &mut block[jj * m..(jj + 1) * m];
+                for i in 0..m {
+                    dst[i] = dot_q8(&xs[i * k..(i + 1) * k], w_row, scale);
+                }
+            }
+        });
+    profile.dot += start.elapsed();
+
+    let start = Instant::now();
+    let mut out = vec![0f32; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            out[i * n + j] = out_t[j * m + i];
+        }
+    }
+    let tensor = Tensor::from_f32_slice(&[m, n], &out)?;
+    profile.writeback += start.elapsed();
+    Ok(tensor)
 }
 
 /// 两个等长切片的点积。
@@ -1061,5 +1153,27 @@ mod tests {
         assert_eq!(single_out.shape(), &[1, 3]);
         assert_eq!(multi_out.shape(), &[2, 3]);
         assert_eq!(single_out.as_slice(), &multi_out.as_slice()[..3]);
+    }
+
+    #[test]
+    fn test_linear_forward_q8_profiled_matches_regular_path() {
+        let weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let q8 = Q8LinearWeight::from_f16(&weight, 3, 2).unwrap();
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+
+        let expected = linear_forward_q8(&x, &q8).unwrap();
+        let mut profile = Q8LinearProfile::default();
+        let actual = linear_forward_q8_profiled(&x, &q8, &mut profile).unwrap();
+
+        assert_eq!(expected.shape(), actual.shape());
+        assert_eq!(expected.as_slice(), actual.as_slice());
+        assert!(profile.dot > Duration::ZERO);
     }
 }
