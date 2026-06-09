@@ -223,7 +223,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             if options.gpu_layers.is_none() {
                 if options.quantization == QuantizationMode::Q8 {
                     notes.push(
-                        "Q8 hybrid defaults transformer decode GPU layers to 0 because partial transformer offload remains workload-sensitive for this backend; pass --gpu-layers to enable explicit GPU+CPU decode testing."
+                        "Q8 hybrid defaults transformer decode GPU layers to 1 on this local profile; pass --gpu-layers to override for explicit GPU+CPU decode testing."
                             .to_string(),
                     );
                 } else {
@@ -361,7 +361,7 @@ fn estimate_gpu_layers(
     quantization: QuantizationMode,
 ) -> usize {
     if quantization == QuantizationMode::Q8 {
-        return 0;
+        return MAX_AUTO_TRANSFORMER_GPU_LAYERS.min(config.num_hidden_layers);
     }
 
     let Some(memory_mib) = gpu.memory_total_mib else {
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn q8_auto_estimate_keeps_transformer_layers_on_cpu() {
+    fn q8_auto_estimate_uses_one_transformer_gpu_layer() {
         let config = test_config();
         let gpu = GpuInfo {
             name: "Test GPU".to_string(),
@@ -521,6 +521,6 @@ mod tests {
             driver_version: Some("1.0".to_string()),
         };
 
-        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 0);
+        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 1);
     }
 }
