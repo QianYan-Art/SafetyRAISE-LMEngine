@@ -3,13 +3,13 @@
 [![CI](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/QianYan-Art/SafetyRAISE-LMEngine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-用 Rust 从零写的极简大模型推理引擎（crate 名 `rsinfer`），默认 CPU 执行，专门适配微调的 **Qwen3-4B-Thinking** 模型，服务于 SafetyRAISE 系统。
+用 Rust 从零写的极简大模型推理引擎（crate 名 `rsinfer`），默认 CPU 执行，专门适配微调的 **Qwen3-4B-Thinking** 模型，服务于 SafetyRAISE 系统。当前本地优化与验证的主目标模型是 [suyuan37/SafetyRAISE-TS-Qwen3](https://huggingface.co/suyuan37/SafetyRAISE-TS-Qwen3)，它也是 [SafetyRAISE-OS](https://github.com/QianYan-Art/SafetyRAISE-OS.git) 使用的 expert small model。
 
 定位是学习/练手项目：把 Transformer 推理的每一环（权重加载、张量算子、注意力、KV cache、采样、生成循环）都用可读的 Rust 实现一遍。要追求生产级速度请用 llama.cpp。
 
 ## 支持的模型
 
-HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。已验证：微调版 Qwen3-4B-Thinking-2507。
+HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。当前已验证并持续作为本地优化目标的模型是 [SafetyRAISE-TS-Qwen3](https://huggingface.co/suyuan37/SafetyRAISE-TS-Qwen3)，它在产品侧对应 [SafetyRAISE-OS](https://github.com/QianYan-Art/SafetyRAISE-OS.git) 的 expert small model 角色。
 
 关键架构特性均已实现：GQA、Qwen3 的 QK-Norm、RoPE、SwiGLU、RMSNorm、权重绑定（tie embeddings）、f16 权重存储。
 
