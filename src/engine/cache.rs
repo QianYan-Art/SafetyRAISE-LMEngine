@@ -5,6 +5,9 @@
 use crate::error::{Result, RsinferError};
 use crate::tensor::Tensor;
 use ndarray::{ArrayD, IxDyn};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_KV_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct KVCacheLayer {
@@ -82,6 +85,12 @@ pub struct KVCache {
 
     /// 最大支持的序列长度
     max_len: usize,
+
+    /// 用于区分不同 KVCache 实例。
+    cache_id: u64,
+
+    /// 仅在 reset 等“前缀整体失效”事件后递增，供 GPU 驻留态判定是否必须重传 CPU 前缀。
+    revision: u64,
 }
 
 impl KVCache {
@@ -95,6 +104,8 @@ impl KVCache {
             layers: vec![None; num_layers],
             current_len: 0,
             max_len,
+            cache_id: NEXT_KV_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
         }
     }
 
@@ -304,6 +315,29 @@ impl KVCache {
         self.current_len
     }
 
+    pub fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    pub fn cache_id(&self) -> u64 {
+        self.cache_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn set_current_len(&mut self, len: usize) -> Result<()> {
+        if len > self.max_len {
+            return Err(RsinferError::DimensionError(format!(
+                "KV cache current_len {len} exceeds max_len {}",
+                self.max_len
+            )));
+        }
+        self.current_len = len;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> KVCacheSnapshot {
         KVCacheSnapshot {
             layer_lengths: self
@@ -353,6 +387,7 @@ impl KVCache {
             layer.current_len = 0;
         }
         self.current_len = 0;
+        self.revision = self.revision.saturating_add(1);
     }
 }
 

@@ -72,7 +72,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive --device
 | `--top-p` / `--top-k` | 核采样 / top-k | 0.95 / 20 |
 | `-i, --interactive` | 交互模式 | 关 |
 | `-v, --verbose` | 打印 prompt 与耗时 | 关 |
-| `--profile-tokens` | 打印 token 级 prefill/decode/sample/text decode 耗时 | 关 |
+| `--profile-tokens` | 打印 token 级 prefill/decode/sample/text decode 耗时，以及 GPU submit/poll/readback 同步计数 | 关 |
 | `--device` | 运行时设备规划：`cpu` / `auto` / `hybrid` | `cpu` |
 | `--gpu-layers` | 计划放到 GPU 的 Transformer 层数；省略时按模式保守选择，Q8 hybrid 本机默认 35 | 自动估计 |
 | `--quantization` | 权重量化路径：`none` / `q8` | `none` |
@@ -85,7 +85,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive --device
 
 `--quantization q8` 会在 safetensors 权重加载后，为 bias-free 线性层构建行级 Q8 权重；它不会修改原始模型文件。默认 `--q8-cache auto` 会在模型目录同级创建 sidecar 目录（例如 `TS-Qwen3.rsinfer-q8`），后续运行若模型 fingerprint 匹配就直接读取 Q8 sidecar，减少重复量化加载成本。当前 warm sidecar 路径还会尽量跳过 Transformer / `lm_head` 线性权重的大块原始 safetensors 读取，只保留 embedding 与各类 norm 的必要加载。`--q8-cache off` 会关闭 sidecar 并每次在内存中派生 Q8 权重。若同一个线性层已接入 Q8 GPU matvec 或 f16 GPU matvec，GPU 路径仍优先，Q8 CPU linear 是 fallback。
 
-`--profile-tokens` 只在显式开启时输出 `profile.tokens` / `profile.time_ms` 行，用于分析较长生成里的 prefill、decode forward、采样和文本解码耗时；默认输出保持不变。
+`--profile-tokens` 只在显式开启时输出 `profile.tokens` / `profile.time_ms` 行，用于分析较长生成里的 prefill、decode forward、采样、文本解码耗时，以及 GPU submit / `poll(wait)` / readback 次数；默认输出保持不变。
 
 ## 本机基准
 

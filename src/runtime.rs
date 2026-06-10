@@ -81,6 +81,7 @@ pub struct RuntimeOptions {
     pub quantization: QuantizationMode,
     pub quantization_cache: QuantizationCacheMode,
     pub q8_cache_dir: Option<PathBuf>,
+    pub internal_resident_decode_prototype: bool,
 }
 
 impl Default for RuntimeOptions {
@@ -91,6 +92,7 @@ impl Default for RuntimeOptions {
             quantization: QuantizationMode::None,
             quantization_cache: QuantizationCacheMode::Auto,
             q8_cache_dir: None,
+            internal_resident_decode_prototype: false,
         }
     }
 }

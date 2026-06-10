@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::engine::sampler::{default_sampler, Sampler};
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
+use crate::gpu::{reset_sync_stats, sync_stats, GpuSyncStats};
 use crate::model::{Qwen3Model, TransformerBlockProfile};
 use crate::runtime::RuntimeOptions;
 
@@ -61,8 +62,11 @@ pub struct GenerationProfile {
     pub generated_tokens: usize,
     pub prefill_forward: Duration,
     pub prefill_sample: Duration,
+    pub prefill_gpu_sync: GpuSyncStats,
     pub decode_forward: Duration,
     pub decode_forward_token_ms: Vec<f64>,
+    pub decode_gpu_sync: GpuSyncStats,
+    pub decode_gpu_sync_trace: Vec<GpuSyncStats>,
     pub decode_sample: Duration,
     pub text_decode: Duration,
     pub fast_path_tokens: usize,
@@ -93,6 +97,46 @@ impl GenerationProfile {
         self.final_layer_decode_trace
             .push(FinalLayerTokenProfile::from_layer_profile(layer_delta));
     }
+
+    pub fn avg_decode_gpu_submits(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_gpu_sync.submits as f64 / (self.generated_tokens - 1) as f64
+        }
+    }
+
+    pub fn avg_decode_gpu_poll_waits(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_gpu_sync.poll_waits as f64 / (self.generated_tokens - 1) as f64
+        }
+    }
+
+    pub fn avg_decode_gpu_map_reads(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_gpu_sync.map_reads as f64 / (self.generated_tokens - 1) as f64
+        }
+    }
+
+    pub fn avg_decode_gpu_host_write_buffers(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_gpu_sync.host_write_buffers as f64 / (self.generated_tokens - 1) as f64
+        }
+    }
+
+    pub fn avg_decode_gpu_position_write_buffers(&self) -> f64 {
+        if self.generated_tokens <= 1 {
+            0.0
+        } else {
+            self.decode_gpu_sync.position_write_buffers as f64 / (self.generated_tokens - 1) as f64
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +144,7 @@ struct NextTokenProfileResult {
     token: u32,
     forward_time: Duration,
     sample_time: Duration,
+    gpu_sync: GpuSyncStats,
     fast_path: bool,
     final_layer_delta: Option<TransformerBlockProfile>,
 }
@@ -252,6 +297,7 @@ impl Generator {
         )?;
         profile.prefill_forward += prefill.forward_time;
         profile.prefill_sample += prefill.sample_time;
+        profile.prefill_gpu_sync.record(prefill.gpu_sync);
         if prefill.fast_path {
             profile.fast_path_tokens += 1;
         }
@@ -289,6 +335,8 @@ impl Generator {
                 profile
                     .decode_forward_token_ms
                     .push(next_token.forward_time.as_secs_f64() * 1000.0);
+                profile.decode_gpu_sync.record(next_token.gpu_sync);
+                profile.decode_gpu_sync_trace.push(next_token.gpu_sync);
                 if let (Some(layer_index), Some(layer_delta)) = (
                     profile.layer_profiles.len().checked_sub(1),
                     next_token.final_layer_delta.as_ref(),
@@ -322,6 +370,7 @@ impl Generator {
         track_final_layer_trace: bool,
         profile: &mut GenerationProfile,
     ) -> Result<NextTokenProfileResult> {
+        reset_sync_stats();
         let forward_start = Instant::now();
         let final_layer_before = if track_final_layer_trace {
             profile.layer_profiles.last().cloned()
@@ -347,6 +396,7 @@ impl Generator {
                         token,
                         forward_time: forward_start.elapsed(),
                         sample_time: Duration::ZERO,
+                        gpu_sync: sync_stats(),
                         fast_path: true,
                         final_layer_delta: final_layer_profile_delta(
                             final_layer_before.as_ref(),
@@ -381,6 +431,7 @@ impl Generator {
             token,
             forward_time,
             sample_time: sample_start.elapsed(),
+            gpu_sync: sync_stats(),
             fast_path: false,
             final_layer_delta: final_layer_profile_delta(
                 final_layer_before.as_ref(),

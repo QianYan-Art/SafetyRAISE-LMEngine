@@ -4,12 +4,15 @@
 
 use half::f16;
 use rayon::join;
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use crate::engine::KVCache;
+use crate::engine::{CachedKV, KVCache};
 use crate::error::{Result, RsinferError};
 use crate::gpu::{
-    GpuContext, GpuMatVec, GpuQ8MatVec, GpuQ8SameInputBatch, GpuQ8SwiGluDown, GpuSwiGluDown,
+    GpuContext, GpuDecodeGqaAttention, GpuDecodeGqaAttentionConfig, GpuKvAppend, GpuMatVec,
+    GpuPositionUniform, GpuQ8MatVec, GpuQ8SameInputBatch, GpuQ8SwiGluDown, GpuQkRmsNormRope,
+    GpuQkRmsNormRopeConfig, GpuResidentBuffer, GpuSwiGluDown,
 };
 use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
@@ -21,7 +24,6 @@ use crate::tensor::{
     scaled_dot_product_attention_gqa_cached_decode_one_raw, silu, CachedAttention, Q8LinearProfile,
     Q8LinearWeight, Tensor,
 };
-
 /// RMS 归一化层
 pub struct RmsNorm {
     pub weight: Tensor,
@@ -359,9 +361,298 @@ pub struct Attention {
     pub rope_theta: f32,
     rope_inv_freq: Vec<f32>,
     q8_qkv_batch: Option<GpuQ8SameInputBatch>,
+    resident_runtime_state: RefCell<Option<ResidentAttentionRuntimeState>>,
+}
+
+struct ResidentAttentionRuntimeState {
+    kv_gpu: GpuKvAppend,
+    resident_key_cache: GpuResidentBuffer,
+    resident_value_cache: GpuResidentBuffer,
+    resident_q_pre: GpuResidentBuffer,
+    resident_k_pre: GpuResidentBuffer,
+    resident_q: GpuResidentBuffer,
+    resident_k: GpuResidentBuffer,
+    resident_v: GpuResidentBuffer,
+    resident_attention: GpuResidentBuffer,
+    qk_gpu: GpuQkRmsNormRope,
+    attn_gpu: GpuDecodeGqaAttention,
+    o_proj_gpu_cache: Option<crate::gpu::GpuQ8MatVecResidentCache>,
+    qkv_batch_cache: Option<crate::gpu::GpuQ8SameInputBatchResidentCache>,
+    qk_gpu_cache: crate::gpu::GpuQkRmsNormRopeResidentCache,
+    kv_gpu_cache: crate::gpu::GpuKvAppendResidentCache,
+    attn_gpu_cache: crate::gpu::GpuDecodeGqaAttentionResidentCache,
+    synced_cache_id: u64,
+    synced_cache_revision: u64,
+    max_len: usize,
+}
+
+impl ResidentAttentionRuntimeState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        context: &GpuContext,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_len: usize,
+        q_weight: &Tensor,
+        k_weight: &Tensor,
+        rope_inv_freq: &[f32],
+        q_eps: f32,
+        k_eps: f32,
+    ) -> std::result::Result<Self, String> {
+        let kv_gpu =
+            GpuKvAppend::with_context_resident_only(context, num_kv_heads, head_dim, max_len)?;
+        let resident_key_cache =
+            GpuResidentBuffer::with_context(context, &[num_kv_heads, max_len, head_dim])?;
+        let resident_value_cache =
+            GpuResidentBuffer::with_context(context, &[num_kv_heads, max_len, head_dim])?;
+        let resident_q_pre = GpuResidentBuffer::with_context(context, &[1, num_heads, head_dim])?;
+        let resident_k_pre =
+            GpuResidentBuffer::with_context(context, &[1, num_kv_heads, head_dim])?;
+        let resident_q = GpuResidentBuffer::with_context(context, &[1, num_heads, head_dim])?;
+        let resident_k = GpuResidentBuffer::with_context(context, &[1, num_kv_heads, head_dim])?;
+        let resident_v = GpuResidentBuffer::with_context(context, &[1, num_kv_heads, head_dim])?;
+        let resident_attention =
+            GpuResidentBuffer::with_context(context, &[1, num_heads, head_dim])?;
+        let qk_gpu = GpuQkRmsNormRope::with_context(
+            context,
+            GpuQkRmsNormRopeConfig {
+                q_weight,
+                k_weight,
+                q_shape: &[1, num_heads, head_dim],
+                k_shape: &[1, num_kv_heads, head_dim],
+                pos: 0,
+                inv_freq: rope_inv_freq,
+                q_eps,
+                k_eps,
+            },
+        )?;
+        let attn_gpu = GpuDecodeGqaAttention::with_context(
+            context,
+            GpuDecodeGqaAttentionConfig {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_len,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+            },
+        )?;
+        let shared_position = GpuPositionUniform::with_context(context, 0)?;
+        let qk_gpu_cache = qk_gpu.prepare_resident_cache_with_position_buffer(
+            &resident_q_pre,
+            &resident_k_pre,
+            &resident_q,
+            &resident_k,
+            shared_position.buffer(),
+        )?;
+        let kv_gpu_cache = kv_gpu.prepare_resident_cache_with_position_buffer(
+            &resident_k,
+            &resident_v,
+            &resident_key_cache,
+            &resident_value_cache,
+            shared_position.buffer(),
+        )?;
+        let attn_gpu_cache = attn_gpu.prepare_resident_cache_with_position_buffer(
+            &resident_q,
+            &resident_key_cache,
+            &resident_value_cache,
+            &resident_attention,
+            shared_position.buffer(),
+        )?;
+        Ok(Self {
+            kv_gpu,
+            resident_key_cache,
+            resident_value_cache,
+            resident_q_pre,
+            resident_k_pre,
+            resident_q,
+            resident_k,
+            resident_v,
+            resident_attention,
+            qk_gpu,
+            attn_gpu,
+            o_proj_gpu_cache: None,
+            qkv_batch_cache: None,
+            qk_gpu_cache,
+            kv_gpu_cache,
+            attn_gpu_cache,
+            synced_cache_id: 0,
+            synced_cache_revision: 0,
+            max_len,
+        })
+    }
+}
+
+impl ResidentTransformerBlockRuntimeState {
+    fn new(context: &GpuContext, block: &TransformerBlock, hidden_size: usize) -> Result<Self> {
+        let gpu_input_norm = crate::gpu::GpuRmsNorm::with_context(
+            context,
+            &block.input_layernorm.weight,
+            &[1, hidden_size],
+            block.input_layernorm.eps,
+        )
+        .map_err(TransformerBlock::gpu_error)?;
+        let gpu_post_norm = crate::gpu::GpuRmsNorm::with_context(
+            context,
+            &block.post_attention_layernorm.weight,
+            &[1, hidden_size],
+            block.post_attention_layernorm.eps,
+        )
+        .map_err(TransformerBlock::gpu_error)?;
+        let gpu_add = crate::gpu::GpuResidualAdd::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_input = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_norm1 = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_attn = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_hidden = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_norm2 = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_mlp_output = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_mlp_hidden =
+            GpuResidentBuffer::with_context(context, &[1, block.mlp.gate_proj.out_features])
+                .map_err(TransformerBlock::gpu_error)?;
+        let resident_output = GpuResidentBuffer::with_context(context, &[1, hidden_size])
+            .map_err(TransformerBlock::gpu_error)?;
+        let resident_mlp_q8_cache = match (
+            block.mlp.q8_gpu_swiglu_down.as_ref(),
+            block.mlp.gate_proj.q8_gpu_matvec(),
+            block.mlp.up_proj.q8_gpu_matvec(),
+            block.mlp.down_proj.q8_gpu_matvec(),
+        ) {
+            (Some(fused), Some(gate), Some(up), Some(down)) => Some(
+                fused
+                    .prepare_resident_cache(
+                        gate,
+                        up,
+                        down,
+                        &resident_norm2,
+                        &resident_mlp_hidden,
+                        &resident_mlp_output,
+                    )
+                    .map_err(TransformerBlock::gpu_error)?,
+            ),
+            _ => None,
+        };
+        let gpu_input_norm_cache = gpu_input_norm
+            .prepare_resident_cache(&resident_input, &resident_norm1)
+            .map_err(TransformerBlock::gpu_error)?;
+        let gpu_post_norm_cache = gpu_post_norm
+            .prepare_resident_cache(&resident_hidden, &resident_norm2)
+            .map_err(TransformerBlock::gpu_error)?;
+        let gpu_input_residual_cache = gpu_add
+            .prepare_resident_cache(&resident_input, &resident_attn, &resident_hidden)
+            .map_err(TransformerBlock::gpu_error)?;
+        let gpu_output_residual_cache = gpu_add
+            .prepare_resident_cache(&resident_hidden, &resident_mlp_output, &resident_output)
+            .map_err(TransformerBlock::gpu_error)?;
+        Ok(Self {
+            resident_input,
+            resident_norm1,
+            resident_attn,
+            resident_hidden,
+            resident_norm2,
+            resident_mlp_output,
+            resident_mlp_hidden,
+            resident_output,
+            resident_mlp_q8_cache,
+            gpu_input_norm,
+            gpu_post_norm,
+            gpu_add,
+            gpu_input_norm_cache,
+            gpu_post_norm_cache,
+            gpu_input_residual_cache,
+            gpu_output_residual_cache,
+            slot_caches: None,
+        })
+    }
+
+    fn ensure_slot_caches(
+        &mut self,
+        slot0: &GpuResidentBuffer,
+        slot1: &GpuResidentBuffer,
+    ) -> Result<()> {
+        if self.slot_caches.is_some() {
+            return Ok(());
+        }
+        let even = ResidentTransformerBlockIoCaches {
+            input_norm_cache: self
+                .gpu_input_norm
+                .prepare_resident_cache(slot0, &self.resident_norm1)
+                .map_err(TransformerBlock::gpu_error)?,
+            input_residual_cache: self
+                .gpu_add
+                .prepare_resident_cache(slot0, &self.resident_attn, &self.resident_hidden)
+                .map_err(TransformerBlock::gpu_error)?,
+            output_residual_cache: self
+                .gpu_add
+                .prepare_resident_cache(&self.resident_hidden, &self.resident_mlp_output, slot1)
+                .map_err(TransformerBlock::gpu_error)?,
+        };
+        let odd = ResidentTransformerBlockIoCaches {
+            input_norm_cache: self
+                .gpu_input_norm
+                .prepare_resident_cache(slot1, &self.resident_norm1)
+                .map_err(TransformerBlock::gpu_error)?,
+            input_residual_cache: self
+                .gpu_add
+                .prepare_resident_cache(slot1, &self.resident_attn, &self.resident_hidden)
+                .map_err(TransformerBlock::gpu_error)?,
+            output_residual_cache: self
+                .gpu_add
+                .prepare_resident_cache(&self.resident_hidden, &self.resident_mlp_output, slot0)
+                .map_err(TransformerBlock::gpu_error)?,
+        };
+        self.slot_caches = Some(ResidentTransformerBlockSlotCaches { even, odd });
+        Ok(())
+    }
+}
+
+struct ResidentTransformerBlockRuntimeState {
+    #[allow(dead_code)]
+    resident_input: GpuResidentBuffer,
+    resident_norm1: GpuResidentBuffer,
+    resident_attn: GpuResidentBuffer,
+    resident_hidden: GpuResidentBuffer,
+    resident_norm2: GpuResidentBuffer,
+    resident_mlp_output: GpuResidentBuffer,
+    resident_mlp_hidden: GpuResidentBuffer,
+    #[allow(dead_code)]
+    resident_output: GpuResidentBuffer,
+    resident_mlp_q8_cache: Option<crate::gpu::GpuQ8SwiGluDownResidentCache>,
+    gpu_input_norm: crate::gpu::GpuRmsNorm,
+    gpu_post_norm: crate::gpu::GpuRmsNorm,
+    gpu_add: crate::gpu::GpuResidualAdd,
+    #[allow(dead_code)]
+    gpu_input_norm_cache: crate::gpu::GpuRmsNormResidentCache,
+    gpu_post_norm_cache: crate::gpu::GpuRmsNormResidentCache,
+    #[allow(dead_code)]
+    gpu_input_residual_cache: crate::gpu::GpuResidualAddResidentCache,
+    #[allow(dead_code)]
+    gpu_output_residual_cache: crate::gpu::GpuResidualAddResidentCache,
+    slot_caches: Option<ResidentTransformerBlockSlotCaches>,
+}
+
+struct ResidentTransformerBlockIoCaches {
+    input_norm_cache: crate::gpu::GpuRmsNormResidentCache,
+    input_residual_cache: crate::gpu::GpuResidualAddResidentCache,
+    output_residual_cache: crate::gpu::GpuResidualAddResidentCache,
+}
+
+struct ResidentTransformerBlockSlotCaches {
+    even: ResidentTransformerBlockIoCaches,
+    odd: ResidentTransformerBlockIoCaches,
 }
 
 impl Attention {
+    fn gpu_error(err: String) -> RsinferError {
+        RsinferError::DimensionError(format!("GPU resident attention prototype failed: {err}"))
+    }
+
     pub fn try_enable_q8_weights(
         &mut self,
         mut sidecar: Option<&mut Q8SidecarCache>,
@@ -607,6 +898,528 @@ impl Attention {
         )?;
         let attn = Tensor::from_f32_vec(&[1, self.num_heads * self.head_dim], attn)?;
         self.o_proj.forward(&attn)
+    }
+
+    #[cfg(test)]
+    fn forward_decode_one_resident_prototype(
+        &self,
+        hidden_states: &Tensor,
+        cached_prefix: Option<CachedKV<'_>>,
+        position_offset: usize,
+    ) -> Result<Tensor> {
+        if hidden_states.ndim() != 2 || hidden_states.shape() != [1, self.num_heads * self.head_dim]
+        {
+            return Err(RsinferError::DimensionError(format!(
+                "resident decode-one attention prototype expects [1, {}], got {:?}",
+                self.num_heads * self.head_dim,
+                hidden_states.shape()
+            )));
+        }
+
+        let q_proj = self
+            .q_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing q_proj Q8 GPU matvec".to_string()))?;
+        let context = q_proj.shared_context();
+
+        if !hidden_states.shape()[1].is_multiple_of(self.head_dim) {
+            return Err(RsinferError::DimensionError(
+                "resident decode-one attention prototype got non-integral head width".into(),
+            ));
+        }
+
+        let prefix_len = cached_prefix
+            .as_ref()
+            .map(|cached| cached.seq_len)
+            .unwrap_or(0);
+        if prefix_len != position_offset {
+            return Err(RsinferError::DimensionError(format!(
+                "resident decode-one attention prototype expects cached prefix len {} to equal position_offset {}",
+                prefix_len, position_offset
+            )));
+        }
+
+        if let Some(cached) = cached_prefix.as_ref() {
+            if cached.num_heads != self.num_kv_heads || cached.head_dim != self.head_dim {
+                return Err(RsinferError::DimensionError(format!(
+                    "resident decode-one attention prototype cached prefix shape mismatch: got heads={}, head_dim={}, expected heads={}, head_dim={}",
+                    cached.num_heads, cached.head_dim, self.num_kv_heads, self.head_dim
+                )));
+            }
+        }
+
+        let resident_output =
+            GpuResidentBuffer::with_context(&context, &[1, self.num_heads * self.head_dim])
+                .map_err(Self::gpu_error)?;
+        let resident_hidden =
+            GpuResidentBuffer::from_tensor(&context, hidden_states).map_err(Self::gpu_error)?;
+
+        let mut encoder =
+            context.create_command_encoder("rsinfer-resident-attention-prototype-encoder");
+        self.encode_decode_one_resident_prototype(
+            &mut encoder,
+            &resident_hidden,
+            &resident_output,
+            cached_prefix,
+            position_offset,
+            None,
+            None,
+        )?;
+        context.submit(encoder);
+
+        resident_output.read_back().map_err(Self::gpu_error)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decode_one_resident_prototype(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_hidden: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        cached_prefix: Option<CachedKV<'_>>,
+        position_offset: usize,
+        resident_k_capture: Option<&GpuResidentBuffer>,
+        resident_v_capture: Option<&GpuResidentBuffer>,
+    ) -> Result<()> {
+        let q_proj = self
+            .q_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing q_proj Q8 GPU matvec".to_string()))?;
+        let k_proj = self
+            .k_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing k_proj Q8 GPU matvec".to_string()))?;
+        let v_proj = self
+            .v_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing v_proj Q8 GPU matvec".to_string()))?;
+        let o_proj = self
+            .o_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing o_proj Q8 GPU matvec".to_string()))?;
+        let context = q_proj.shared_context();
+        let prefix_len = cached_prefix
+            .as_ref()
+            .map(|cached| cached.seq_len)
+            .unwrap_or(0);
+        let max_len = cached_prefix
+            .as_ref()
+            .map(|cached| cached.capacity_len)
+            .unwrap_or(position_offset + 1)
+            .max(position_offset + 1);
+        let cache_shape = [self.num_kv_heads, max_len, self.head_dim];
+        let cache_values_len = self.num_kv_heads * max_len * self.head_dim;
+        let mut key_cache = vec![0.0f32; cache_values_len];
+        let mut value_cache = vec![0.0f32; cache_values_len];
+        if let Some(cached) = cached_prefix.as_ref() {
+            let compact_head_len = cached.seq_len * cached.head_dim;
+            let cache_head_len = max_len * cached.head_dim;
+            let src_head_len = cached.capacity_len * cached.head_dim;
+            for h in 0..cached.num_heads {
+                let src_start = h * src_head_len;
+                let dst_start = h * cache_head_len;
+                key_cache[dst_start..dst_start + compact_head_len]
+                    .copy_from_slice(&cached.key[src_start..src_start + compact_head_len]);
+                value_cache[dst_start..dst_start + compact_head_len]
+                    .copy_from_slice(&cached.value[src_start..src_start + compact_head_len]);
+            }
+        }
+        let resident_q_pre =
+            GpuResidentBuffer::with_context(&context, &[1, self.num_heads, self.head_dim])
+                .map_err(Self::gpu_error)?;
+        let resident_k_pre =
+            GpuResidentBuffer::with_context(&context, &[1, self.num_kv_heads, self.head_dim])
+                .map_err(Self::gpu_error)?;
+        let resident_q =
+            GpuResidentBuffer::with_context(&context, &[1, self.num_heads, self.head_dim])
+                .map_err(Self::gpu_error)?;
+        let owned_k = if resident_k_capture.is_none() {
+            Some(
+                GpuResidentBuffer::with_context(&context, &[1, self.num_kv_heads, self.head_dim])
+                    .map_err(Self::gpu_error)?,
+            )
+        } else {
+            None
+        };
+        let resident_k = resident_k_capture.unwrap_or_else(|| owned_k.as_ref().unwrap());
+        let owned_v = if resident_v_capture.is_none() {
+            Some(
+                GpuResidentBuffer::with_context(&context, &[1, self.num_kv_heads, self.head_dim])
+                    .map_err(Self::gpu_error)?,
+            )
+        } else {
+            None
+        };
+        let resident_v = resident_v_capture.unwrap_or_else(|| owned_v.as_ref().unwrap());
+        let resident_key_cache = GpuResidentBuffer::from_tensor(
+            &context,
+            &Tensor::from_f32_vec(&cache_shape, key_cache)?,
+        )
+        .map_err(Self::gpu_error)?;
+        let resident_value_cache = GpuResidentBuffer::from_tensor(
+            &context,
+            &Tensor::from_f32_vec(&cache_shape, value_cache)?,
+        )
+        .map_err(Self::gpu_error)?;
+        let resident_attention =
+            GpuResidentBuffer::with_context(&context, &[1, self.num_heads, self.head_dim])
+                .map_err(Self::gpu_error)?;
+        let qk_gpu = GpuQkRmsNormRope::with_context(
+            &context,
+            GpuQkRmsNormRopeConfig {
+                q_weight: &self.q_norm.weight,
+                k_weight: &self.k_norm.weight,
+                q_shape: &[1, self.num_heads, self.head_dim],
+                k_shape: &[1, self.num_kv_heads, self.head_dim],
+                pos: position_offset,
+                inv_freq: &self.rope_inv_freq,
+                q_eps: self.q_norm.eps,
+                k_eps: self.k_norm.eps,
+            },
+        )
+        .map_err(Self::gpu_error)?;
+        let mut kv_gpu =
+            GpuKvAppend::with_context(&context, self.num_kv_heads, self.head_dim, max_len)
+                .map_err(Self::gpu_error)?;
+        kv_gpu
+            .restore_len(position_offset)
+            .map_err(Self::gpu_error)?;
+        let attn_gpu = GpuDecodeGqaAttention::with_context(
+            &context,
+            GpuDecodeGqaAttentionConfig {
+                num_heads: self.num_heads,
+                num_kv_heads: self.num_kv_heads,
+                head_dim: self.head_dim,
+                max_len,
+                scale: 1.0 / (self.head_dim as f32).sqrt(),
+            },
+        )
+        .map_err(Self::gpu_error)?;
+
+        if let Some(batch) = &self.q8_qkv_batch {
+            batch
+                .encode_resident(
+                    &[q_proj, k_proj, v_proj],
+                    encoder,
+                    resident_hidden,
+                    &[&resident_q_pre, &resident_k_pre, resident_v],
+                )
+                .map_err(Self::gpu_error)?;
+        } else {
+            q_proj
+                .encode_resident(encoder, resident_hidden, &resident_q_pre)
+                .map_err(Self::gpu_error)?;
+            k_proj
+                .encode_resident(encoder, resident_hidden, &resident_k_pre)
+                .map_err(Self::gpu_error)?;
+            v_proj
+                .encode_resident(encoder, resident_hidden, resident_v)
+                .map_err(Self::gpu_error)?;
+        }
+        qk_gpu
+            .encode_resident(
+                encoder,
+                &resident_q_pre,
+                &resident_k_pre,
+                &resident_q,
+                resident_k,
+            )
+            .map_err(Self::gpu_error)?;
+        kv_gpu
+            .encode_resident(
+                encoder,
+                prefix_len.max(position_offset),
+                resident_k,
+                resident_v,
+                &resident_key_cache,
+                &resident_value_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        attn_gpu
+            .encode_resident(
+                encoder,
+                &resident_q,
+                &resident_key_cache,
+                &resident_value_cache,
+                &resident_attention,
+                position_offset,
+            )
+            .map_err(Self::gpu_error)?;
+        o_proj
+            .encode_resident(encoder, &resident_attention, resident_output)
+            .map_err(Self::gpu_error)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decode_one_resident_runtime(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_hidden: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        position_offset: usize,
+    ) -> Result<()> {
+        let q_proj = self
+            .q_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing q_proj Q8 GPU matvec".to_string()))?;
+        let k_proj = self
+            .k_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing k_proj Q8 GPU matvec".to_string()))?;
+        let v_proj = self
+            .v_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing v_proj Q8 GPU matvec".to_string()))?;
+        let o_proj = self
+            .o_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing o_proj Q8 GPU matvec".to_string()))?;
+        let mut state_slot = self.resident_runtime_state.borrow_mut();
+        let state = state_slot.as_mut().ok_or_else(|| {
+            Self::gpu_error("resident runtime state should be initialized".to_string())
+        })?;
+
+        if let Some(batch) = &self.q8_qkv_batch {
+            if state.qkv_batch_cache.is_none() {
+                state.qkv_batch_cache = Some(
+                    batch
+                        .prepare_resident_cache(
+                            &[q_proj, k_proj, v_proj],
+                            resident_hidden,
+                            &[
+                                &state.resident_q_pre,
+                                &state.resident_k_pre,
+                                &state.resident_v,
+                            ],
+                        )
+                        .map_err(Self::gpu_error)?,
+                );
+            }
+            batch
+                .encode_resident_input_copy(encoder, resident_hidden)
+                .map_err(Self::gpu_error)?;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-resident-attention-full-chain-pass"),
+                timestamp_writes: None,
+            });
+            batch
+                .encode_resident_with_cache_in_pass(
+                    &[q_proj, k_proj, v_proj],
+                    resident_hidden,
+                    &[
+                        &state.resident_q_pre,
+                        &state.resident_k_pre,
+                        &state.resident_v,
+                    ],
+                    state
+                        .qkv_batch_cache
+                        .as_ref()
+                        .expect("resident qkv batch cache initialized"),
+                    &mut pass,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .qk_gpu
+                .encode_resident_at_pos_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_q_pre,
+                    &state.resident_k_pre,
+                    &state.resident_q,
+                    &state.resident_k,
+                    position_offset,
+                    &state.qk_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .kv_gpu
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    position_offset,
+                    &state.resident_k,
+                    &state.resident_v,
+                    &state.resident_key_cache,
+                    &state.resident_value_cache,
+                    &state.kv_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .attn_gpu
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_q,
+                    &state.resident_key_cache,
+                    &state.resident_value_cache,
+                    &state.resident_attention,
+                    position_offset,
+                    &state.attn_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+        } else {
+            q_proj
+                .encode_resident(encoder, resident_hidden, &state.resident_q_pre)
+                .map_err(Self::gpu_error)?;
+            k_proj
+                .encode_resident(encoder, resident_hidden, &state.resident_k_pre)
+                .map_err(Self::gpu_error)?;
+            v_proj
+                .encode_resident(encoder, resident_hidden, &state.resident_v)
+                .map_err(Self::gpu_error)?;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-resident-attention-chain-pass"),
+                timestamp_writes: None,
+            });
+            state
+                .qk_gpu
+                .encode_resident_at_pos_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_q_pre,
+                    &state.resident_k_pre,
+                    &state.resident_q,
+                    &state.resident_k,
+                    position_offset,
+                    &state.qk_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .kv_gpu
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    position_offset,
+                    &state.resident_k,
+                    &state.resident_v,
+                    &state.resident_key_cache,
+                    &state.resident_value_cache,
+                    &state.kv_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .attn_gpu
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_q,
+                    &state.resident_key_cache,
+                    &state.resident_value_cache,
+                    &state.resident_attention,
+                    position_offset,
+                    &state.attn_gpu_cache,
+                )
+                .map_err(Self::gpu_error)?;
+        }
+        if state.o_proj_gpu_cache.is_none() {
+            state.o_proj_gpu_cache = Some(
+                o_proj
+                    .prepare_resident_cache(&state.resident_attention, resident_output)
+                    .map_err(Self::gpu_error)?,
+            );
+        }
+        o_proj
+            .encode_resident_with_cache(
+                encoder,
+                &state.resident_attention,
+                resident_output,
+                state
+                    .o_proj_gpu_cache
+                    .as_ref()
+                    .expect("resident o_proj cache initialized"),
+            )
+            .map_err(Self::gpu_error)?;
+        Ok(())
+    }
+
+    fn build_resident_cache_tensors(
+        &self,
+        cached_prefix: Option<CachedKV<'_>>,
+        max_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let cache_shape = [self.num_kv_heads, max_len, self.head_dim];
+        let cache_values_len = self.num_kv_heads * max_len * self.head_dim;
+        let mut key_cache = vec![0.0f32; cache_values_len];
+        let mut value_cache = vec![0.0f32; cache_values_len];
+        if let Some(cached) = cached_prefix {
+            if cached.num_heads != self.num_kv_heads || cached.head_dim != self.head_dim {
+                return Err(RsinferError::DimensionError(format!(
+                    "resident attention cached prefix shape mismatch: got heads={}, head_dim={}, expected heads={}, head_dim={}",
+                    cached.num_heads, cached.head_dim, self.num_kv_heads, self.head_dim
+                )));
+            }
+            let compact_head_len = cached.seq_len * cached.head_dim;
+            let cache_head_len = max_len * cached.head_dim;
+            let src_head_len = cached.capacity_len * cached.head_dim;
+            for h in 0..cached.num_heads {
+                let src_start = h * src_head_len;
+                let dst_start = h * cache_head_len;
+                key_cache[dst_start..dst_start + compact_head_len]
+                    .copy_from_slice(&cached.key[src_start..src_start + compact_head_len]);
+                value_cache[dst_start..dst_start + compact_head_len]
+                    .copy_from_slice(&cached.value[src_start..src_start + compact_head_len]);
+            }
+        }
+        Ok((
+            Tensor::from_f32_vec(&cache_shape, key_cache)?,
+            Tensor::from_f32_vec(&cache_shape, value_cache)?,
+        ))
+    }
+
+    fn ensure_resident_runtime_state(
+        &self,
+        context: &GpuContext,
+        kv_cache: &KVCache,
+        cached_prefix: Option<CachedKV<'_>>,
+        position_offset: usize,
+    ) -> Result<()> {
+        let desired_max_len = cached_prefix
+            .as_ref()
+            .map(|cached| cached.capacity_len.max(position_offset + 1))
+            .unwrap_or_else(|| (position_offset + 1).max(64))
+            .min(kv_cache.max_len());
+        let mut state_slot = self.resident_runtime_state.borrow_mut();
+        let needs_rebuild = state_slot
+            .as_ref()
+            .map(|state| state.max_len < desired_max_len)
+            .unwrap_or(true);
+        if needs_rebuild {
+            *state_slot = Some(
+                ResidentAttentionRuntimeState::new(
+                    context,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    desired_max_len,
+                    &self.q_norm.weight,
+                    &self.k_norm.weight,
+                    &self.rope_inv_freq,
+                    self.q_norm.eps,
+                    self.k_norm.eps,
+                )
+                .map_err(Self::gpu_error)?,
+            );
+        }
+        let state = state_slot
+            .as_mut()
+            .expect("resident runtime state should exist");
+        let sync_from_cpu = state.synced_cache_id != kv_cache.cache_id()
+            || state.synced_cache_revision != kv_cache.revision();
+        if sync_from_cpu {
+            let (key_cache, value_cache) =
+                self.build_resident_cache_tensors(cached_prefix, state.max_len)?;
+            state
+                .resident_key_cache
+                .upload(&key_cache)
+                .map_err(Self::gpu_error)?;
+            state
+                .resident_value_cache
+                .upload(&value_cache)
+                .map_err(Self::gpu_error)?;
+        }
+        state
+            .kv_gpu
+            .restore_len(position_offset)
+            .map_err(Self::gpu_error)?;
+        state.synced_cache_id = kv_cache.cache_id();
+        state.synced_cache_revision = kv_cache.revision();
+        Ok(())
     }
 
     fn forward_qkv_decode_fallback(
@@ -921,6 +1734,141 @@ impl Mlp {
         };
         (attached, errors)
     }
+
+    fn gpu_error(err: String) -> RsinferError {
+        RsinferError::DimensionError(format!("GPU resident MLP prototype failed: {err}"))
+    }
+
+    #[cfg(test)]
+    fn encode_resident_prototype(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_input: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+    ) -> Result<()> {
+        let gate = self
+            .gate_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing gate_proj Q8 GPU matvec".to_string()))?;
+        let hidden = GpuResidentBuffer::with_context(
+            &gate.shared_context(),
+            &[1, self.gate_proj.out_features],
+        )
+        .map_err(Self::gpu_error)?;
+        self.encode_resident_prototype_with_hidden(
+            encoder,
+            resident_input,
+            &hidden,
+            resident_output,
+        )
+    }
+
+    #[cfg(test)]
+    fn encode_resident_prototype_with_hidden(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_input: &GpuResidentBuffer,
+        resident_hidden: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+    ) -> Result<()> {
+        self.encode_resident_prototype_with_hidden_cache(
+            encoder,
+            resident_input,
+            resident_hidden,
+            resident_output,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn encode_resident_prototype_with_hidden_cache(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_input: &GpuResidentBuffer,
+        resident_hidden: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        resident_cache: Option<&crate::gpu::GpuQ8SwiGluDownResidentCache>,
+    ) -> Result<()> {
+        let gate = self
+            .gate_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing gate_proj Q8 GPU matvec".to_string()))?;
+        let up = self
+            .up_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing up_proj Q8 GPU matvec".to_string()))?;
+        let down = self
+            .down_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing down_proj Q8 GPU matvec".to_string()))?;
+        let fused = self
+            .q8_gpu_swiglu_down
+            .as_ref()
+            .ok_or_else(|| Self::gpu_error("missing fused Q8 SwiGLU helper".to_string()))?;
+        match resident_cache {
+            Some(cache) => fused
+                .encode_resident_with_hidden_cache(
+                    gate,
+                    up,
+                    down,
+                    encoder,
+                    resident_input,
+                    resident_output,
+                    cache,
+                )
+                .map_err(Self::gpu_error),
+            None => fused
+                .encode_resident_with_hidden(
+                    gate,
+                    up,
+                    down,
+                    encoder,
+                    resident_input,
+                    resident_hidden,
+                    resident_output,
+                )
+                .map_err(Self::gpu_error),
+        }
+    }
+
+    fn encode_resident_prototype_with_hidden_cache_in_pass(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        resident_input: &GpuResidentBuffer,
+        _resident_hidden: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        resident_cache: Option<&crate::gpu::GpuQ8SwiGluDownResidentCache>,
+    ) -> Result<()> {
+        let gate = self
+            .gate_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing gate_proj Q8 GPU matvec".to_string()))?;
+        let up = self
+            .up_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing up_proj Q8 GPU matvec".to_string()))?;
+        let down = self
+            .down_proj
+            .q8_gpu_matvec()
+            .ok_or_else(|| Self::gpu_error("missing down_proj Q8 GPU matvec".to_string()))?;
+        let fused = self
+            .q8_gpu_swiglu_down
+            .as_ref()
+            .ok_or_else(|| Self::gpu_error("missing fused Q8 SwiGLU helper".to_string()))?;
+        let cache = resident_cache
+            .ok_or_else(|| Self::gpu_error("missing resident fused Q8 SwiGLU cache".to_string()))?;
+        fused
+            .encode_resident_with_hidden_cache_in_pass(
+                gate,
+                up,
+                down,
+                pass,
+                resident_input,
+                resident_output,
+                cache,
+            )
+            .map_err(Self::gpu_error)
+    }
 }
 
 /// Transformer Block
@@ -931,6 +1879,7 @@ pub struct TransformerBlock {
     pub attention: Attention,
     pub post_attention_layernorm: RmsNorm,
     pub mlp: Mlp,
+    resident_runtime_state: RefCell<Option<ResidentTransformerBlockRuntimeState>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -964,6 +1913,7 @@ impl TransformerBlock {
             attention,
             post_attention_layernorm,
             mlp,
+            resident_runtime_state: RefCell::new(None),
         }
     }
 
@@ -1086,6 +2036,384 @@ impl TransformerBlock {
         };
         Ok(attention + mlp)
     }
+
+    fn gpu_error(err: String) -> RsinferError {
+        RsinferError::DimensionError(format!(
+            "GPU resident transformer block prototype failed: {err}"
+        ))
+    }
+
+    fn ensure_resident_runtime_state(
+        &self,
+        context: &GpuContext,
+        hidden_size: usize,
+    ) -> Result<()> {
+        let mut state_slot = self.resident_runtime_state.borrow_mut();
+        if state_slot.is_none() {
+            *state_slot = Some(ResidentTransformerBlockRuntimeState::new(
+                context,
+                self,
+                hidden_size,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn ensure_resident_runtime_state_with_slots(
+        &self,
+        context: &GpuContext,
+        hidden_size: usize,
+        slot0: &GpuResidentBuffer,
+        slot1: &GpuResidentBuffer,
+    ) -> Result<()> {
+        self.ensure_resident_runtime_state(context, hidden_size)?;
+        let mut state_slot = self.resident_runtime_state.borrow_mut();
+        let state = state_slot
+            .as_mut()
+            .expect("resident block runtime state should be initialized");
+        state.ensure_slot_caches(slot0, slot1)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn forward_decode_one_resident_prototype(
+        &self,
+        hidden_states: &Tensor,
+        cached_prefix: Option<CachedKV<'_>>,
+        position_offset: usize,
+    ) -> Result<Tensor> {
+        if hidden_states.ndim() != 2 || hidden_states.shape()[0] != 1 {
+            return Err(Self::gpu_error(format!(
+                "resident transformer block prototype expects [1, hidden], got {:?}",
+                hidden_states.shape()
+            )));
+        }
+        let hidden_size = hidden_states.shape()[1];
+        let q_proj =
+            self.attention.q_proj.q8_gpu_matvec().ok_or_else(|| {
+                Self::gpu_error("missing attention q_proj Q8 GPU matvec".to_string())
+            })?;
+        let context = q_proj.shared_context();
+
+        let resident_input =
+            GpuResidentBuffer::from_tensor(&context, hidden_states).map_err(Self::gpu_error)?;
+        let resident_norm1 = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+        let resident_attn = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+        let resident_hidden = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+        let resident_norm2 = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+        let resident_mlp = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+        let resident_output = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+
+        let gpu_input_norm = crate::gpu::GpuRmsNorm::with_context(
+            &context,
+            &self.input_layernorm.weight,
+            &[1, hidden_size],
+            self.input_layernorm.eps,
+        )
+        .map_err(Self::gpu_error)?;
+        let gpu_post_norm = crate::gpu::GpuRmsNorm::with_context(
+            &context,
+            &self.post_attention_layernorm.weight,
+            &[1, hidden_size],
+            self.post_attention_layernorm.eps,
+        )
+        .map_err(Self::gpu_error)?;
+        let gpu_add = crate::gpu::GpuResidualAdd::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+
+        let mut encoder =
+            context.create_command_encoder("rsinfer-resident-transformer-block-prototype-encoder");
+        gpu_input_norm
+            .encode_resident(&mut encoder, &resident_input, &resident_norm1)
+            .map_err(Self::gpu_error)?;
+        self.attention.encode_decode_one_resident_prototype(
+            &mut encoder,
+            &resident_norm1,
+            &resident_attn,
+            cached_prefix,
+            position_offset,
+            None,
+            None,
+        )?;
+        gpu_add
+            .encode_resident(
+                &mut encoder,
+                &resident_input,
+                &resident_attn,
+                &resident_hidden,
+            )
+            .map_err(Self::gpu_error)?;
+        gpu_post_norm
+            .encode_resident(&mut encoder, &resident_hidden, &resident_norm2)
+            .map_err(Self::gpu_error)?;
+        self.mlp
+            .encode_resident_prototype(&mut encoder, &resident_norm2, &resident_mlp)?;
+        gpu_add
+            .encode_resident(
+                &mut encoder,
+                &resident_hidden,
+                &resident_mlp,
+                &resident_output,
+            )
+            .map_err(Self::gpu_error)?;
+        context.submit(encoder);
+
+        resident_output.read_back().map_err(Self::gpu_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_decode_one_resident_runtime(
+        &self,
+        hidden_states: &Tensor,
+        kv_cache: &mut KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+    ) -> Result<Tensor> {
+        if hidden_states.ndim() != 2 || hidden_states.shape()[0] != 1 {
+            return Err(Self::gpu_error(format!(
+                "resident transformer block runtime expects [1, hidden], got {:?}",
+                hidden_states.shape()
+            )));
+        }
+        let q_proj =
+            self.attention.q_proj.q8_gpu_matvec().ok_or_else(|| {
+                Self::gpu_error("missing attention q_proj Q8 GPU matvec".to_string())
+            })?;
+        let context = q_proj.shared_context();
+
+        let resident_input =
+            GpuResidentBuffer::from_tensor(&context, hidden_states).map_err(Self::gpu_error)?;
+        let hidden_size = hidden_states.shape()[1];
+        let resident_output = GpuResidentBuffer::with_context(&context, &[1, hidden_size])
+            .map_err(Self::gpu_error)?;
+
+        let mut encoder =
+            context.create_command_encoder("rsinfer-resident-transformer-block-runtime-encoder");
+        self.encode_decode_one_resident_runtime(
+            &mut encoder,
+            &resident_input,
+            &resident_output,
+            kv_cache,
+            layer_idx,
+            position_offset,
+        )?;
+        context.submit(encoder);
+
+        if layer_idx == 0 {
+            kv_cache.set_current_len(position_offset + 1)?;
+        }
+        resident_output.read_back().map_err(Self::gpu_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_decode_one_resident_runtime(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_input: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        kv_cache: &KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+    ) -> Result<()> {
+        let hidden_size = resident_input.len();
+        let q_proj =
+            self.attention.q_proj.q8_gpu_matvec().ok_or_else(|| {
+                Self::gpu_error("missing attention q_proj Q8 GPU matvec".to_string())
+            })?;
+        let context = q_proj.shared_context();
+        let cached_prefix = if position_offset == 0 {
+            None
+        } else {
+            Some(kv_cache.get_cached(layer_idx)?)
+        };
+        self.ensure_resident_runtime_state(&context, hidden_size)?;
+        self.attention.ensure_resident_runtime_state(
+            &context,
+            kv_cache,
+            cached_prefix,
+            position_offset,
+        )?;
+        let state_slot = self.resident_runtime_state.borrow();
+        let state = state_slot
+            .as_ref()
+            .expect("resident block runtime state should be initialized");
+
+        resident_input
+            .encode_copy_to(encoder, &state.resident_input)
+            .map_err(Self::gpu_error)?;
+        state
+            .gpu_input_norm
+            .encode_resident_with_cache(
+                encoder,
+                &state.resident_input,
+                &state.resident_norm1,
+                &state.gpu_input_norm_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        self.attention.encode_decode_one_resident_runtime(
+            encoder,
+            &state.resident_norm1,
+            &state.resident_attn,
+            position_offset,
+        )?;
+        state
+            .gpu_add
+            .encode_resident_with_cache(
+                encoder,
+                &state.resident_input,
+                &state.resident_attn,
+                &state.resident_hidden,
+                &state.gpu_input_residual_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        state
+            .gpu_post_norm
+            .encode_resident_with_cache(
+                encoder,
+                &state.resident_hidden,
+                &state.resident_norm2,
+                &state.gpu_post_norm_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        self.mlp.encode_resident_prototype_with_hidden_cache(
+            encoder,
+            &state.resident_norm2,
+            &state.resident_mlp_hidden,
+            &state.resident_mlp_output,
+            state.resident_mlp_q8_cache.as_ref(),
+        )?;
+        state
+            .gpu_add
+            .encode_resident_with_cache(
+                encoder,
+                &state.resident_hidden,
+                &state.resident_mlp_output,
+                &state.resident_output,
+                &state.gpu_output_residual_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        state
+            .resident_output
+            .encode_copy_to(encoder, resident_output)
+            .map_err(Self::gpu_error)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_decode_one_resident_runtime_with_slot_cache(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resident_input: &GpuResidentBuffer,
+        resident_output: &GpuResidentBuffer,
+        resident_slot0: &GpuResidentBuffer,
+        resident_slot1: &GpuResidentBuffer,
+        kv_cache: &KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+    ) -> Result<()> {
+        let hidden_size = resident_input.len();
+        let q_proj =
+            self.attention.q_proj.q8_gpu_matvec().ok_or_else(|| {
+                Self::gpu_error("missing attention q_proj Q8 GPU matvec".to_string())
+            })?;
+        let context = q_proj.shared_context();
+        let cached_prefix = if position_offset == 0 {
+            None
+        } else {
+            Some(kv_cache.get_cached(layer_idx)?)
+        };
+        self.ensure_resident_runtime_state_with_slots(
+            &context,
+            hidden_size,
+            resident_slot0,
+            resident_slot1,
+        )?;
+        self.attention.ensure_resident_runtime_state(
+            &context,
+            kv_cache,
+            cached_prefix,
+            position_offset,
+        )?;
+        let state_slot = self.resident_runtime_state.borrow();
+        let state = state_slot
+            .as_ref()
+            .expect("resident block runtime state should be initialized");
+        let slot_caches = state
+            .slot_caches
+            .as_ref()
+            .expect("resident block slot caches should be initialized");
+        let io_caches = if layer_idx.is_multiple_of(2) {
+            &slot_caches.even
+        } else {
+            &slot_caches.odd
+        };
+
+        state
+            .gpu_input_norm
+            .encode_resident_with_cache(
+                encoder,
+                resident_input,
+                &state.resident_norm1,
+                &io_caches.input_norm_cache,
+            )
+            .map_err(Self::gpu_error)?;
+        self.attention.encode_decode_one_resident_runtime(
+            encoder,
+            &state.resident_norm1,
+            &state.resident_attn,
+            position_offset,
+        )?;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-resident-post-attention-chain-pass"),
+                timestamp_writes: None,
+            });
+            state
+                .gpu_add
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    resident_input,
+                    &state.resident_attn,
+                    &state.resident_hidden,
+                    &io_caches.input_residual_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            state
+                .gpu_post_norm
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_hidden,
+                    &state.resident_norm2,
+                    &state.gpu_post_norm_cache,
+                )
+                .map_err(Self::gpu_error)?;
+            self.mlp
+                .encode_resident_prototype_with_hidden_cache_in_pass(
+                    &mut pass,
+                    &state.resident_norm2,
+                    &state.resident_mlp_hidden,
+                    &state.resident_mlp_output,
+                    state.resident_mlp_q8_cache.as_ref(),
+                )?;
+            state
+                .gpu_add
+                .encode_resident_with_cache_in_pass(
+                    &mut pass,
+                    &state.resident_hidden,
+                    &state.resident_mlp_output,
+                    resident_output,
+                    &io_caches.output_residual_cache,
+                )
+                .map_err(Self::gpu_error)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn build_transformer_block(
@@ -1140,6 +2468,7 @@ pub fn build_transformer_block_with_q8_sidecar(
                 rope_theta: config.rope_theta,
                 rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
                 q8_qkv_batch: None,
+                resident_runtime_state: RefCell::new(None),
             },
             Mlp::new(
                 Linear::from_weight_map_or_q8_sidecar(
@@ -1180,6 +2509,7 @@ pub fn build_transformer_block_with_q8_sidecar(
                 rope_theta: config.rope_theta,
                 rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
                 q8_qkv_batch: None,
+                resident_runtime_state: RefCell::new(None),
             },
             Mlp::new(
                 linear("mlp.gate_proj.weight")?,
@@ -1200,6 +2530,213 @@ pub fn build_transformer_block_with_q8_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{gpu_test_guard, reset_sync_stats, sync_stats};
+
+    fn build_test_attention() -> Attention {
+        let q_proj = Linear::from_f16_weight(
+            &[4, 4],
+            vec![
+                f16::from_f32(0.5),
+                f16::from_f32(-1.0),
+                f16::from_f32(0.75),
+                f16::from_f32(0.25),
+                f16::from_f32(-0.5),
+                f16::from_f32(0.4),
+                f16::from_f32(1.1),
+                f16::from_f32(-0.3),
+                f16::from_f32(0.2),
+                f16::from_f32(0.8),
+                f16::from_f32(-0.6),
+                f16::from_f32(1.0),
+                f16::from_f32(-0.7),
+                f16::from_f32(0.1),
+                f16::from_f32(0.3),
+                f16::from_f32(0.9),
+            ],
+            None,
+        )
+        .unwrap();
+        let k_proj = Linear::from_f16_weight(
+            &[2, 4],
+            vec![
+                f16::from_f32(0.6),
+                f16::from_f32(-0.2),
+                f16::from_f32(0.4),
+                f16::from_f32(0.9),
+                f16::from_f32(-0.8),
+                f16::from_f32(0.5),
+                f16::from_f32(0.7),
+                f16::from_f32(-0.1),
+            ],
+            None,
+        )
+        .unwrap();
+        let v_proj = Linear::from_f16_weight(
+            &[2, 4],
+            vec![
+                f16::from_f32(0.3),
+                f16::from_f32(0.7),
+                f16::from_f32(-0.5),
+                f16::from_f32(0.2),
+                f16::from_f32(-0.4),
+                f16::from_f32(1.0),
+                f16::from_f32(0.6),
+                f16::from_f32(-0.9),
+            ],
+            None,
+        )
+        .unwrap();
+        let o_proj = Linear::from_f16_weight(
+            &[4, 4],
+            vec![
+                f16::from_f32(0.25),
+                f16::from_f32(-0.6),
+                f16::from_f32(1.2),
+                f16::from_f32(0.1),
+                f16::from_f32(-0.3),
+                f16::from_f32(0.5),
+                f16::from_f32(0.8),
+                f16::from_f32(-0.7),
+                f16::from_f32(0.9),
+                f16::from_f32(0.4),
+                f16::from_f32(-0.2),
+                f16::from_f32(0.6),
+                f16::from_f32(-1.0),
+                f16::from_f32(0.3),
+                f16::from_f32(0.2),
+                f16::from_f32(0.75),
+            ],
+            None,
+        )
+        .unwrap();
+        Attention {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm: RmsNorm::new(Tensor::from_f32_slice(&[2], &[1.0, 0.75]).unwrap(), 1e-5),
+            k_norm: RmsNorm::new(Tensor::from_f32_slice(&[2], &[0.8, -1.1]).unwrap(), 1e-5),
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            rope_theta: 10000.0,
+            rope_inv_freq: super::rope_inv_freq(2, 10000.0),
+            q8_qkv_batch: None,
+            resident_runtime_state: RefCell::new(None),
+        }
+    }
+
+    fn build_test_mlp() -> Mlp {
+        let gate_proj = Linear::from_f16_weight(
+            &[6, 4],
+            vec![
+                f16::from_f32(0.5),
+                f16::from_f32(-1.0),
+                f16::from_f32(0.75),
+                f16::from_f32(0.25),
+                f16::from_f32(-0.5),
+                f16::from_f32(0.4),
+                f16::from_f32(1.1),
+                f16::from_f32(-0.3),
+                f16::from_f32(0.2),
+                f16::from_f32(0.8),
+                f16::from_f32(-0.6),
+                f16::from_f32(1.0),
+                f16::from_f32(-0.7),
+                f16::from_f32(0.1),
+                f16::from_f32(0.3),
+                f16::from_f32(0.9),
+                f16::from_f32(-0.4),
+                f16::from_f32(0.6),
+                f16::from_f32(-0.2),
+                f16::from_f32(0.7),
+                f16::from_f32(0.9),
+                f16::from_f32(-0.5),
+                f16::from_f32(0.4),
+                f16::from_f32(0.2),
+            ],
+            None,
+        )
+        .unwrap();
+        let up_proj = Linear::from_f16_weight(
+            &[6, 4],
+            vec![
+                f16::from_f32(-0.25),
+                f16::from_f32(0.75),
+                f16::from_f32(0.4),
+                f16::from_f32(-1.25),
+                f16::from_f32(1.0),
+                f16::from_f32(0.5),
+                f16::from_f32(-0.4),
+                f16::from_f32(0.2),
+                f16::from_f32(0.6),
+                f16::from_f32(-0.7),
+                f16::from_f32(0.3),
+                f16::from_f32(1.1),
+                f16::from_f32(-0.8),
+                f16::from_f32(0.9),
+                f16::from_f32(0.2),
+                f16::from_f32(0.1),
+                f16::from_f32(0.45),
+                f16::from_f32(-0.35),
+                f16::from_f32(0.85),
+                f16::from_f32(0.55),
+                f16::from_f32(-0.15),
+                f16::from_f32(0.95),
+                f16::from_f32(-0.65),
+                f16::from_f32(0.25),
+            ],
+            None,
+        )
+        .unwrap();
+        let down_proj = Linear::from_f16_weight(
+            &[4, 6],
+            vec![
+                f16::from_f32(0.3),
+                f16::from_f32(-0.8),
+                f16::from_f32(0.6),
+                f16::from_f32(-0.4),
+                f16::from_f32(0.2),
+                f16::from_f32(1.2),
+                f16::from_f32(-0.6),
+                f16::from_f32(0.5),
+                f16::from_f32(0.4),
+                f16::from_f32(0.7),
+                f16::from_f32(-0.9),
+                f16::from_f32(0.1),
+                f16::from_f32(0.8),
+                f16::from_f32(-0.2),
+                f16::from_f32(1.0),
+                f16::from_f32(0.3),
+                f16::from_f32(-0.5),
+                f16::from_f32(0.6),
+                f16::from_f32(-1.1),
+                f16::from_f32(0.4),
+                f16::from_f32(0.2),
+                f16::from_f32(0.9),
+                f16::from_f32(0.5),
+                f16::from_f32(-0.3),
+            ],
+            None,
+        )
+        .unwrap();
+        Mlp::new(gate_proj, up_proj, down_proj)
+    }
+
+    fn build_test_transformer_block() -> TransformerBlock {
+        TransformerBlock::new(
+            RmsNorm::new(
+                Tensor::from_f32_slice(&[4], &[1.0, 0.8, -0.6, 1.2]).unwrap(),
+                1e-5,
+            ),
+            build_test_attention(),
+            RmsNorm::new(
+                Tensor::from_f32_slice(&[4], &[0.7, -1.1, 0.9, 0.5]).unwrap(),
+                1e-5,
+            ),
+            build_test_mlp(),
+        )
+    }
 
     #[test]
     fn linear_q8_optional_weight_matches_f16_path() {
@@ -1316,6 +2853,254 @@ mod tests {
 
         assert_eq!(transposed.shape(), &[1, 3, 2]);
         assert_eq!(transposed.as_slice(), x.as_slice());
+    }
+
+    #[test]
+    fn resident_decode_one_attention_prototype_matches_current_path_when_available() {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("resident attention prototype test skipped: no usable wgpu adapter");
+            return;
+        };
+
+        let mut attention = build_test_attention();
+        attention.try_enable_q8_weights(None).unwrap();
+        let (attached, errors) = attention.try_enable_q8_gpu_matvecs(&context);
+        assert_eq!(attached, 4, "expected all four attention Q8 GPU matvecs");
+        assert!(
+            errors.is_empty(),
+            "unexpected Q8 GPU matvec attach errors: {errors:?}"
+        );
+
+        let prefix_hidden = Tensor::from_f32_slice(&[1, 4], &[0.3, -0.7, 1.1, 0.5]).unwrap();
+        let current_hidden = Tensor::from_f32_slice(&[1, 4], &[-0.2, 0.9, 0.4, -1.3]).unwrap();
+
+        let mut prefix_cache = KVCache::new(1, 8);
+        attention
+            .forward(&prefix_hidden, &mut prefix_cache, 0, 0)
+            .unwrap();
+        let cached_prefix = prefix_cache.get_cached(0).unwrap();
+
+        let mut expected_cache = prefix_cache.clone();
+        let expected = attention
+            .forward(&current_hidden, &mut expected_cache, 0, 1)
+            .unwrap();
+
+        reset_sync_stats();
+        let got = attention
+            .forward_decode_one_resident_prototype(&current_hidden, Some(cached_prefix), 1)
+            .unwrap();
+        let stats = sync_stats();
+
+        assert_eq!(
+            stats.submits, 2,
+            "expected one compute submit + one final readback submit"
+        );
+        assert_eq!(stats.poll_waits, 1, "expected only final readback poll");
+        assert_eq!(stats.map_reads, 1, "expected only final readback map");
+
+        let max_abs = expected
+            .as_slice()
+            .iter()
+            .zip(got.as_slice())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs <= 0.03,
+            "resident attention prototype max abs diff {max_abs} exceeded tolerance"
+        );
+    }
+
+    #[test]
+    fn resident_decode_one_transformer_block_prototype_matches_current_path_when_available() {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("resident transformer block prototype test skipped: no usable wgpu adapter");
+            return;
+        };
+
+        let mut block = build_test_transformer_block();
+        block.try_enable_q8_weights(None).unwrap();
+        let (attached, errors) = block.try_enable_q8_gpu_matvecs(&context);
+        assert_eq!(attached, 7, "expected all attention+mlp Q8 GPU matvecs");
+        assert!(
+            errors.is_empty(),
+            "unexpected transformer block Q8 GPU attach errors: {errors:?}"
+        );
+
+        let prefix_hidden = Tensor::from_f32_slice(&[1, 4], &[0.3, -0.7, 1.1, 0.5]).unwrap();
+        let current_hidden = Tensor::from_f32_slice(&[1, 4], &[-0.2, 0.9, 0.4, -1.3]).unwrap();
+
+        let mut prefix_cache = KVCache::new(1, 8);
+        block
+            .forward(&prefix_hidden, &mut prefix_cache, 0, 0)
+            .unwrap();
+        let cached_prefix = prefix_cache.get_cached(0).unwrap();
+
+        let mut expected_cache = prefix_cache.clone();
+        let expected = block
+            .forward(&current_hidden, &mut expected_cache, 0, 1)
+            .unwrap();
+
+        reset_sync_stats();
+        let got = block
+            .forward_decode_one_resident_prototype(&current_hidden, Some(cached_prefix), 1)
+            .unwrap();
+        let stats = sync_stats();
+
+        assert_eq!(
+            stats.submits, 2,
+            "expected one compute submit + one final readback submit"
+        );
+        assert_eq!(stats.poll_waits, 1, "expected only final readback poll");
+        assert_eq!(stats.map_reads, 1, "expected only final readback map");
+
+        let max_abs = expected
+            .as_slice()
+            .iter()
+            .zip(got.as_slice())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs <= 0.05,
+            "resident transformer block prototype max abs diff {max_abs} exceeded tolerance"
+        );
+    }
+
+    #[test]
+    fn resident_decode_one_transformer_block_runtime_keeps_gpu_kv_across_tokens_and_restore_when_available(
+    ) {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("resident transformer block runtime test skipped: no usable wgpu adapter");
+            return;
+        };
+
+        let mut block = build_test_transformer_block();
+        block.try_enable_q8_weights(None).unwrap();
+        let (attached, errors) = block.try_enable_q8_gpu_matvecs(&context);
+        assert_eq!(attached, 7, "expected all attention+mlp Q8 GPU matvecs");
+        assert!(
+            errors.is_empty(),
+            "unexpected transformer block Q8 GPU attach errors: {errors:?}"
+        );
+
+        let prefix_hidden = Tensor::from_f32_slice(&[1, 4], &[0.3, -0.7, 1.1, 0.5]).unwrap();
+        let token1_hidden = Tensor::from_f32_slice(&[1, 4], &[-0.2, 0.9, 0.4, -1.3]).unwrap();
+        let token2_hidden = Tensor::from_f32_slice(&[1, 4], &[0.8, -0.1, -0.6, 1.4]).unwrap();
+
+        let mut expected_cache = KVCache::new(1, 8);
+        block
+            .forward(&prefix_hidden, &mut expected_cache, 0, 0)
+            .unwrap();
+        let expected_token1 = block
+            .forward(&token1_hidden, &mut expected_cache, 0, 1)
+            .unwrap();
+        let expected_snapshot = expected_cache.snapshot();
+        let expected_token2 = block
+            .forward(&token2_hidden, &mut expected_cache, 0, 2)
+            .unwrap();
+
+        let mut runtime_cache = KVCache::new(1, 8);
+        block
+            .forward(&prefix_hidden, &mut runtime_cache, 0, 0)
+            .unwrap();
+
+        reset_sync_stats();
+        let got_token1 = block
+            .forward_decode_one_resident_runtime(&token1_hidden, &mut runtime_cache, 0, 1)
+            .unwrap();
+        let stats1 = sync_stats();
+        assert_eq!(
+            stats1.submits, 2,
+            "resident runtime token1 should keep exactly one compute submit and one final readback submit"
+        );
+        assert_eq!(
+            stats1.poll_waits, 1,
+            "resident runtime token1 should only poll for final output"
+        );
+        assert_eq!(
+            stats1.map_reads, 1,
+            "resident runtime token1 should only map final output"
+        );
+        assert_eq!(runtime_cache.current_len(), 2);
+
+        let max_abs_token1 = expected_token1
+            .as_slice()
+            .iter()
+            .zip(got_token1.as_slice())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_token1 <= 0.05,
+            "resident runtime token1 max abs diff {max_abs_token1} exceeded tolerance"
+        );
+
+        let runtime_snapshot = runtime_cache.snapshot();
+        reset_sync_stats();
+        let got_token2 = block
+            .forward_decode_one_resident_runtime(&token2_hidden, &mut runtime_cache, 0, 2)
+            .unwrap();
+        let stats2 = sync_stats();
+        assert_eq!(
+            stats2.submits, 2,
+            "resident runtime token2 should keep exactly one compute submit and one final readback submit"
+        );
+        assert_eq!(
+            stats2.poll_waits, 1,
+            "resident runtime token2 should only poll for final output"
+        );
+        assert_eq!(
+            stats2.map_reads, 1,
+            "resident runtime token2 should only map final output"
+        );
+        assert_eq!(runtime_cache.current_len(), 3);
+
+        let max_abs_token2 = expected_token2
+            .as_slice()
+            .iter()
+            .zip(got_token2.as_slice())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_token2 <= 0.05,
+            "resident runtime token2 max abs diff {max_abs_token2} exceeded tolerance"
+        );
+
+        runtime_cache.restore(runtime_snapshot).unwrap();
+        expected_cache.restore(expected_snapshot).unwrap();
+
+        reset_sync_stats();
+        let replay_token2 = block
+            .forward_decode_one_resident_runtime(&token2_hidden, &mut runtime_cache, 0, 2)
+            .unwrap();
+        let replay_stats = sync_stats();
+        assert_eq!(
+            replay_stats.submits, 2,
+            "resident runtime replay should still keep exactly one compute submit and one final readback submit"
+        );
+        assert_eq!(
+            replay_stats.poll_waits, 1,
+            "resident runtime replay should only poll for final output"
+        );
+        assert_eq!(
+            replay_stats.map_reads, 1,
+            "resident runtime replay should only map final output"
+        );
+
+        let replay_expected = block
+            .forward(&token2_hidden, &mut expected_cache, 0, 2)
+            .unwrap();
+        let replay_max_abs = replay_expected
+            .as_slice()
+            .iter()
+            .zip(replay_token2.as_slice())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            replay_max_abs <= 0.05,
+            "resident runtime replay max abs diff {replay_max_abs} exceeded tolerance"
+        );
     }
 
     #[test]

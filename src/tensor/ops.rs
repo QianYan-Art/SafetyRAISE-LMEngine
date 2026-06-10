@@ -358,19 +358,47 @@ fn dot_q8_scalar(x: &[f32], q: &[i8]) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q8_avx2_fma(x: &[f32], q: &[i8]) -> f32 {
     let len = x.len();
-    let simd_end = len / 8 * 8;
-    let mut acc = _mm256_setzero_ps();
+    let simd_end = len / 32 * 32;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let mut idx = 0usize;
     while idx < simd_end {
-        // SAFETY: idx advances in chunks of 8 and simd_end is rounded down to a valid bound.
+        // SAFETY: idx advances in chunks of 32 and simd_end is rounded down to a valid bound.
+        let x0 = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx)) };
+        let x1 = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx + 8)) };
+        let x2 = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx + 16)) };
+        let x3 = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx + 24)) };
+        // SAFETY: each load reads 8 signed bytes from a valid slice range.
+        let q0 = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx) as *const __m128i) };
+        let q1 = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx + 8) as *const __m128i) };
+        let q2 = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx + 16) as *const __m128i) };
+        let q3 = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx + 24) as *const __m128i) };
+        let q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0));
+        let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1));
+        let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q2));
+        let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q3));
+        acc0 = _mm256_fmadd_ps(x0, q0, acc0);
+        acc1 = _mm256_fmadd_ps(x1, q1, acc1);
+        acc2 = _mm256_fmadd_ps(x2, q2, acc2);
+        acc3 = _mm256_fmadd_ps(x3, q3, acc3);
+        idx += 32;
+    }
+
+    let simd_end_8 = len / 8 * 8;
+    while idx < simd_end_8 {
+        // SAFETY: idx advances in chunks of 8 and simd_end_8 is rounded down to a valid bound.
         let x_vec = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx)) };
         // SAFETY: reading 8 signed bytes from a valid slice range.
         let q_vec = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx) as *const __m128i) };
         let q_i32 = _mm256_cvtepi8_epi32(q_vec);
         let q_f32 = _mm256_cvtepi32_ps(q_i32);
-        acc = _mm256_fmadd_ps(x_vec, q_f32, acc);
+        acc0 = _mm256_fmadd_ps(x_vec, q_f32, acc0);
         idx += 8;
     }
+
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
 
     let mut lanes = [0f32; 8];
     // SAFETY: `lanes` is a properly sized writable buffer for eight f32 values.
@@ -999,7 +1027,6 @@ pub fn scaled_dot_product_attention_gqa_cached_decode_one_raw(
                 max_score = score;
             }
         }
-
         let inv_sum = 1.0 / sum_exp;
         for value in out_row.iter_mut() {
             *value *= inv_sum;

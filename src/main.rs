@@ -163,6 +163,13 @@ fn unescape(s: &str) -> String {
         .replace("\\\\", "\\")
 }
 
+fn internal_resident_decode_enabled() -> bool {
+    matches!(
+        std::env::var("RSINFER_INTERNAL_RESIDENT_DECODE_PROTOTYPE"),
+        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON")
+    )
+}
+
 fn main() -> rsinfer::Result<()> {
     let args = Args::parse();
 
@@ -174,6 +181,7 @@ fn main() -> rsinfer::Result<()> {
         quantization: args.quantization.into(),
         quantization_cache: args.q8_cache.into(),
         q8_cache_dir: args.q8_cache_dir.clone(),
+        internal_resident_decode_prototype: internal_resident_decode_enabled(),
     };
     let generator = Generator::from_pretrained_with_options(&args.model_path, &runtime_options)?;
     println!("模型加载完成，耗时: {:.2}s", start.elapsed().as_secs_f32());
@@ -410,8 +418,25 @@ fn generate_and_print(
     }
     if profile_tokens {
         println!(
-            "profile.tokens prompt={} generated={} fast_path={}",
-            profile.prompt_tokens, profile.generated_tokens, profile.fast_path_tokens
+            "profile.tokens prompt={} generated={} fast_path={} prefill_gpu_submits={} prefill_gpu_polls={} prefill_gpu_map_reads={} prefill_gpu_host_write_buffers={} prefill_gpu_position_write_buffers={} decode_gpu_submits={} decode_gpu_polls={} decode_gpu_map_reads={} decode_gpu_host_write_buffers={} decode_gpu_position_write_buffers={} avg_decode_gpu_submits_per_token={:.3} avg_decode_gpu_polls_per_token={:.3} avg_decode_gpu_map_reads_per_token={:.3} avg_decode_gpu_host_write_buffers_per_token={:.3} avg_decode_gpu_position_write_buffers_per_token={:.3}",
+            profile.prompt_tokens,
+            profile.generated_tokens,
+            profile.fast_path_tokens,
+            profile.prefill_gpu_sync.submits,
+            profile.prefill_gpu_sync.poll_waits,
+            profile.prefill_gpu_sync.map_reads,
+            profile.prefill_gpu_sync.host_write_buffers,
+            profile.prefill_gpu_sync.position_write_buffers,
+            profile.decode_gpu_sync.submits,
+            profile.decode_gpu_sync.poll_waits,
+            profile.decode_gpu_sync.map_reads,
+            profile.decode_gpu_sync.host_write_buffers,
+            profile.decode_gpu_sync.position_write_buffers,
+            profile.avg_decode_gpu_submits(),
+            profile.avg_decode_gpu_poll_waits(),
+            profile.avg_decode_gpu_map_reads(),
+            profile.avg_decode_gpu_host_write_buffers(),
+            profile.avg_decode_gpu_position_write_buffers(),
         );
         println!(
             "profile.time_ms prefill_forward={:.3} prefill_sample={:.3} decode_forward={:.3} decode_sample={:.3} text_decode={:.3} avg_decode_forward_per_token={:.3}",
