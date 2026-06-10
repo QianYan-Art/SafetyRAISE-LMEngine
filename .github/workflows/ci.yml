@@ -7,6 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repository default uses target-cpu=native for this workstation's
+  # release binary. CI must stay portable across GitHub-hosted runners.
+  CARGO_BUILD_RUSTFLAGS: "-C target-cpu=x86-64"
 
 jobs:
   check:
