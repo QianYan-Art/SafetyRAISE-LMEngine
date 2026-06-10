@@ -11,8 +11,8 @@ use crate::engine::{CachedKV, KVCache};
 use crate::error::{Result, RsinferError};
 use crate::gpu::{
     GpuContext, GpuDecodeGqaAttention, GpuDecodeGqaAttentionConfig, GpuKvAppend, GpuMatVec,
-    GpuPositionUniform, GpuQ8MatVec, GpuQ8SameInputBatch, GpuQ8SwiGluDown, GpuQkRmsNormRope,
-    GpuQkRmsNormRopeConfig, GpuResidentBuffer, GpuSwiGluDown,
+    GpuQ8MatVec, GpuQ8SameInputBatch, GpuQ8SwiGluDown, GpuQkRmsNormRope, GpuQkRmsNormRopeConfig,
+    GpuResidentBuffer, GpuSwiGluDown,
 };
 use crate::model::config::Qwen3Config;
 use crate::model::q8_sidecar::Q8SidecarCache;
@@ -394,6 +394,7 @@ impl ResidentAttentionRuntimeState {
         num_kv_heads: usize,
         head_dim: usize,
         max_len: usize,
+        position_buffer: &wgpu::Buffer,
         q_weight: &Tensor,
         k_weight: &Tensor,
         rope_inv_freq: &[f32],
@@ -437,27 +438,26 @@ impl ResidentAttentionRuntimeState {
                 scale: 1.0 / (head_dim as f32).sqrt(),
             },
         )?;
-        let shared_position = GpuPositionUniform::with_context(context, 0)?;
         let qk_gpu_cache = qk_gpu.prepare_resident_cache_with_position_buffer(
             &resident_q_pre,
             &resident_k_pre,
             &resident_q,
             &resident_k,
-            shared_position.buffer(),
+            position_buffer,
         )?;
         let kv_gpu_cache = kv_gpu.prepare_resident_cache_with_position_buffer(
             &resident_k,
             &resident_v,
             &resident_key_cache,
             &resident_value_cache,
-            shared_position.buffer(),
+            position_buffer,
         )?;
         let attn_gpu_cache = attn_gpu.prepare_resident_cache_with_position_buffer(
             &resident_q,
             &resident_key_cache,
             &resident_value_cache,
             &resident_attention,
-            shared_position.buffer(),
+            position_buffer,
         )?;
         Ok(Self {
             kv_gpu,
@@ -518,6 +518,8 @@ impl ResidentTransformerBlockRuntimeState {
                 .map_err(TransformerBlock::gpu_error)?;
         let resident_output = GpuResidentBuffer::with_context(context, &[1, hidden_size])
             .map_err(TransformerBlock::gpu_error)?;
+        let resident_position = crate::gpu::GpuPositionUniform::with_context(context, 0)
+            .map_err(TransformerBlock::gpu_error)?;
         let resident_mlp_q8_cache = match (
             block.mlp.q8_gpu_swiglu_down.as_ref(),
             block.mlp.gate_proj.q8_gpu_matvec(),
@@ -559,6 +561,7 @@ impl ResidentTransformerBlockRuntimeState {
             resident_mlp_output,
             resident_mlp_hidden,
             resident_output,
+            resident_position,
             resident_mlp_q8_cache,
             gpu_input_norm,
             gpu_post_norm,
@@ -623,6 +626,8 @@ struct ResidentTransformerBlockRuntimeState {
     resident_mlp_hidden: GpuResidentBuffer,
     #[allow(dead_code)]
     resident_output: GpuResidentBuffer,
+    #[allow(dead_code)]
+    resident_position: crate::gpu::GpuPositionUniform,
     resident_mlp_q8_cache: Option<crate::gpu::GpuQ8SwiGluDownResidentCache>,
     gpu_input_norm: crate::gpu::GpuRmsNorm,
     gpu_post_norm: crate::gpu::GpuRmsNorm,
@@ -1222,19 +1227,18 @@ impl Attention {
                 .map_err(Self::gpu_error)?;
             state
                 .qk_gpu
-                .encode_resident_at_pos_with_cache_in_pass(
+                .encode_resident_in_pass_cached(
                     &mut pass,
                     &state.resident_q_pre,
                     &state.resident_k_pre,
                     &state.resident_q,
                     &state.resident_k,
-                    position_offset,
                     &state.qk_gpu_cache,
                 )
                 .map_err(Self::gpu_error)?;
             state
                 .kv_gpu
-                .encode_resident_with_cache_in_pass(
+                .encode_resident_in_pass_current_position(
                     &mut pass,
                     position_offset,
                     &state.resident_k,
@@ -1246,7 +1250,7 @@ impl Attention {
                 .map_err(Self::gpu_error)?;
             state
                 .attn_gpu
-                .encode_resident_with_cache_in_pass(
+                .encode_resident_in_pass_current_position(
                     &mut pass,
                     &state.resident_q,
                     &state.resident_key_cache,
@@ -1272,19 +1276,18 @@ impl Attention {
             });
             state
                 .qk_gpu
-                .encode_resident_at_pos_with_cache_in_pass(
+                .encode_resident_in_pass_cached(
                     &mut pass,
                     &state.resident_q_pre,
                     &state.resident_k_pre,
                     &state.resident_q,
                     &state.resident_k,
-                    position_offset,
                     &state.qk_gpu_cache,
                 )
                 .map_err(Self::gpu_error)?;
             state
                 .kv_gpu
-                .encode_resident_with_cache_in_pass(
+                .encode_resident_in_pass_current_position(
                     &mut pass,
                     position_offset,
                     &state.resident_k,
@@ -1296,7 +1299,7 @@ impl Attention {
                 .map_err(Self::gpu_error)?;
             state
                 .attn_gpu
-                .encode_resident_with_cache_in_pass(
+                .encode_resident_in_pass_current_position(
                     &mut pass,
                     &state.resident_q,
                     &state.resident_key_cache,
@@ -1368,6 +1371,7 @@ impl Attention {
         kv_cache: &KVCache,
         cached_prefix: Option<CachedKV<'_>>,
         position_offset: usize,
+        position_buffer: &wgpu::Buffer,
     ) -> Result<()> {
         let desired_max_len = cached_prefix
             .as_ref()
@@ -1387,6 +1391,7 @@ impl Attention {
                     self.num_kv_heads,
                     self.head_dim,
                     desired_max_len,
+                    position_buffer,
                     &self.q_norm.weight,
                     &self.k_norm.weight,
                     &self.rope_inv_freq,
@@ -2233,16 +2238,18 @@ impl TransformerBlock {
             Some(kv_cache.get_cached(layer_idx)?)
         };
         self.ensure_resident_runtime_state(&context, hidden_size)?;
+        let state_slot = self.resident_runtime_state.borrow();
+        let state = state_slot
+            .as_ref()
+            .expect("resident block runtime state should be initialized");
+        state.resident_position.write_position(position_offset);
         self.attention.ensure_resident_runtime_state(
             &context,
             kv_cache,
             cached_prefix,
             position_offset,
+            state.resident_position.buffer(),
         )?;
-        let state_slot = self.resident_runtime_state.borrow();
-        let state = state_slot
-            .as_ref()
-            .expect("resident block runtime state should be initialized");
 
         resident_input
             .encode_copy_to(encoder, &state.resident_input)
@@ -2316,6 +2323,7 @@ impl TransformerBlock {
         kv_cache: &KVCache,
         layer_idx: usize,
         position_offset: usize,
+        position_buffer: &wgpu::Buffer,
     ) -> Result<()> {
         let hidden_size = resident_input.len();
         let q_proj =
@@ -2339,6 +2347,7 @@ impl TransformerBlock {
             kv_cache,
             cached_prefix,
             position_offset,
+            position_buffer,
         )?;
         let state_slot = self.resident_runtime_state.borrow();
         let state = state_slot

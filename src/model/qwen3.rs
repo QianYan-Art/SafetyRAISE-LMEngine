@@ -6,7 +6,7 @@ use ndarray::{s, Array2};
 
 use crate::engine::KVCache;
 use crate::error::{Result, RsinferError};
-use crate::gpu::{GpuContext, GpuResidentBuffer};
+use crate::gpu::{GpuContext, GpuPositionUniform, GpuResidentBuffer};
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{
     build_transformer_block, build_transformer_block_with_q8_sidecar, Linear, RmsNorm,
@@ -33,6 +33,7 @@ pub struct Qwen3Model {
 struct ResidentQwen3RuntimeState {
     resident_hidden_a: GpuResidentBuffer,
     resident_hidden_b: GpuResidentBuffer,
+    resident_position: GpuPositionUniform,
     hidden_size: usize,
 }
 
@@ -329,6 +330,8 @@ impl Qwen3Model {
                     .map_err(RsinferError::DimensionError)?,
                 resident_hidden_b: GpuResidentBuffer::with_context(context, &[1, hidden_size])
                     .map_err(RsinferError::DimensionError)?,
+                resident_position: GpuPositionUniform::with_context(context, 0)
+                    .map_err(RsinferError::DimensionError)?,
                 hidden_size,
             });
         }
@@ -371,6 +374,7 @@ impl Qwen3Model {
             .resident_hidden_a
             .upload(&hidden)
             .map_err(RsinferError::DimensionError)?;
+        state.resident_position.write_position(position_offset);
         let mut encoder =
             context.create_command_encoder("rsinfer-resident-qwen3-gpu-prefix-encoder");
         for (layer_idx, layer) in self.layers.iter().take(gpu_prefix_len).enumerate() {
@@ -388,6 +392,7 @@ impl Qwen3Model {
                 kv_cache,
                 layer_idx,
                 position_offset,
+                state.resident_position.buffer(),
             )?;
         }
         context.submit(encoder);
@@ -450,6 +455,7 @@ impl Qwen3Model {
             .resident_hidden_a
             .upload(&hidden)
             .map_err(RsinferError::DimensionError)?;
+        state.resident_position.write_position(position_offset);
         let prefix_start = std::time::Instant::now();
         let mut encoder =
             context.create_command_encoder("rsinfer-resident-qwen3-gpu-prefix-profiled-encoder");
@@ -468,6 +474,7 @@ impl Qwen3Model {
                 kv_cache,
                 layer_idx,
                 position_offset,
+                state.resident_position.buffer(),
             )?;
         }
         context.submit(encoder);

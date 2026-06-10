@@ -824,6 +824,7 @@ pub struct GpuResidentBuffer {
 }
 
 pub struct GpuPositionUniform {
+    context: GpuContext,
     buffer: wgpu::Buffer,
 }
 
@@ -3774,7 +3775,15 @@ impl GpuPositionUniform {
                 contents: bytemuck::cast_slice(&params),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-        Ok(Self { buffer })
+        Ok(Self {
+            context: context.clone(),
+            buffer,
+        })
+    }
+
+    pub fn write_position(&self, position: usize) {
+        let params = [position as u32, 0_u32, 0_u32, 0_u32];
+        write_position_buffer(&self.context.inner.queue, &self.buffer, 0, &params);
     }
 
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
