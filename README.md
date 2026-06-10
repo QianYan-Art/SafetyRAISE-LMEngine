@@ -13,6 +13,12 @@ HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。当前已验
 
 关键架构特性均已实现：GQA、Qwen3 的 QK-Norm、RoPE、SwiGLU、RMSNorm、权重绑定（tie embeddings）、f16 权重存储。
 
+## 当前发布状态
+
+当前主线状态是 **downgraded resident V1**：`hybrid + q8` 默认开启 resident decode，目标是给本机交互对话提供更快的默认路径。最终本机 A/B 中，普通 hybrid q8 中位数为 `47.886 ms/token`，resident q8 中位数为 `37.893 ms/token`（约 `26.39 tok/s`），性能提升约 `20.868%`。
+
+这个版本不是完整原始 V1：原计划 `<=33 ms/token` 尚未达成，且 64-token resident 与 `--no-resident` 贪心输出精确等价仍有已记录差异。需要严格回归普通 hybrid 行为时，请显式传 `--no-resident`。
+
 ## 构建
 
 ```powershell
