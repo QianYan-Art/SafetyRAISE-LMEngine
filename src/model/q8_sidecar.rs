@@ -99,6 +99,20 @@ impl Q8SidecarCache {
         Ok(weight)
     }
 
+    pub fn load_existing(&mut self, name: &str) -> Result<Option<Q8LinearWeight>> {
+        let Some(entry) = self.manifest.entries.get(name) else {
+            return Ok(None);
+        };
+        let out_features = entry.out_features;
+        let in_features = entry.in_features;
+        if let Some(weight) = self.try_load(name, out_features, in_features) {
+            self.hits += 1;
+            Ok(Some(weight))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn record_fallback(&mut self, name: &str, err: impl Into<String>) {
         self.fallbacks.push(format!("{name}: {}", err.into()));
     }
@@ -266,10 +280,8 @@ fn read_q8_weight(path: &Path, out_features: usize, in_features: usize) -> Resul
     let expected = out_features * in_features;
     let mut qbytes = vec![0u8; expected];
     file.read_exact(&mut qbytes)?;
-    let qweight = qbytes.into_iter().map(|value| value as i8).collect();
-
     Ok(Q8LinearWeight {
-        qweight,
+        qweight: qbytes.into_iter().map(|value| value as i8).collect(),
         scales,
         out_features,
         in_features,

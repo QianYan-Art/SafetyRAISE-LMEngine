@@ -9,10 +9,11 @@ use crate::error::{Result, RsinferError};
 use crate::gpu::GpuContext;
 use crate::model::config::Qwen3Config;
 use crate::model::layers::{
-    build_transformer_block, Linear, RmsNorm, TransformerBlock, TransformerBlockProfile,
+    build_transformer_block, build_transformer_block_with_q8_sidecar, Linear, RmsNorm,
+    TransformerBlock, TransformerBlockProfile,
 };
 use crate::model::q8_sidecar::Q8SidecarCache;
-use crate::model::weights::{get_weight, load_weights, WeightMap};
+use crate::model::weights::{get_weight, load_weights, load_weights_filtered, WeightMap};
 use crate::runtime::{
     build_runtime_plan, QuantizationCacheMode, QuantizationMode, RuntimeOptions, RuntimePlan,
 };
@@ -38,16 +39,47 @@ impl Qwen3Model {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let config = Qwen3Config::from_file(model_dir.join("config.json"))?;
-        let weights = load_weights(model_dir)?;
-        let (q8_sidecar, q8_sidecar_error) = if runtime_options.quantization == QuantizationMode::Q8
-            && runtime_options.quantization_cache == QuantizationCacheMode::Auto
-        {
+        let mut q8_sidecar_error = None;
+        let use_q8_sidecar = runtime_options.quantization == QuantizationMode::Q8
+            && runtime_options.quantization_cache == QuantizationCacheMode::Auto;
+        if use_q8_sidecar {
             match Q8SidecarCache::open(model_dir, runtime_options.q8_cache_dir.as_deref()) {
-                Ok(cache) => (Some(cache), None),
-                Err(err) => (None, Some(err.to_string())),
+                Ok(cache) => {
+                    if let Ok(weights) = load_weights_filtered(model_dir, |name| {
+                        !should_skip_warm_q8_linear_weight(name)
+                    }) {
+                        if let Ok(mut model) = Self::from_weights_with_options_and_sidecar(
+                            &config,
+                            &weights,
+                            runtime_options,
+                            Some(cache),
+                            None,
+                        ) {
+                            model.runtime_plan.notes.push(
+                                "Warm Q8 sidecar fast-load skipped raw safetensors reads for transformer/lm_head linear weights."
+                                    .to_string(),
+                            );
+                            return Ok(model);
+                        }
+                    }
+                }
+                Err(err) => q8_sidecar_error = Some(err.to_string()),
+            }
+        }
+
+        let weights = load_weights(model_dir)?;
+        let q8_sidecar = if use_q8_sidecar {
+            match Q8SidecarCache::open(model_dir, runtime_options.q8_cache_dir.as_deref()) {
+                Ok(cache) => Some(cache),
+                Err(err) => {
+                    if q8_sidecar_error.is_none() {
+                        q8_sidecar_error = Some(err.to_string());
+                    }
+                    None
+                }
             }
         } else {
-            (None, None)
+            None
         };
         Self::from_weights_with_options_and_sidecar(
             &config,
@@ -91,10 +123,24 @@ impl Qwen3Model {
             None
         };
         let embed_tokens = get_weight(weights, "model.embed_tokens.weight")?;
+        let use_q8 = runtime_options.quantization == QuantizationMode::Q8;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
-            layers.push(build_transformer_block(weights, config, layer_idx)?);
+            if use_q8 {
+                let layer = match q8_sidecar.as_mut() {
+                    Some(cache) => build_transformer_block_with_q8_sidecar(
+                        weights,
+                        config,
+                        layer_idx,
+                        Some(cache),
+                    )?,
+                    None => build_transformer_block(weights, config, layer_idx)?,
+                };
+                layers.push(layer);
+            } else {
+                layers.push(build_transformer_block(weights, config, layer_idx)?);
+            }
         }
 
         let norm = RmsNorm::new(
@@ -103,19 +149,53 @@ impl Qwen3Model {
         );
 
         // tie_word_embeddings 时 lm_head 复用 embedding 权重
-        let mut lm_head = match Linear::from_weight_map(weights, "lm_head.weight", None) {
-            Ok(linear) => linear,
-            Err(_) if config.tie_word_embeddings => {
-                Linear::from_weight_map(weights, "model.embed_tokens.weight", None)?
+        let mut lm_head = if use_q8 {
+            match q8_sidecar.as_mut() {
+                Some(cache) => match Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    "lm_head.weight",
+                    None,
+                    Some(cache),
+                ) {
+                    Ok(linear) => linear,
+                    Err(_) if config.tie_word_embeddings => Linear::from_weight_map_or_q8_sidecar(
+                        weights,
+                        "model.embed_tokens.weight",
+                        None,
+                        Some(cache),
+                    )?,
+                    Err(_) => {
+                        return Err(RsinferError::WeightError(
+                            "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
+                        ))
+                    }
+                },
+                None => match Linear::from_weight_map(weights, "lm_head.weight", None) {
+                    Ok(linear) => linear,
+                    Err(_) if config.tie_word_embeddings => {
+                        Linear::from_weight_map(weights, "model.embed_tokens.weight", None)?
+                    }
+                    Err(_) => {
+                        return Err(RsinferError::WeightError(
+                            "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
+                        ))
+                    }
+                },
             }
-            Err(_) => {
-                return Err(RsinferError::WeightError(
-                    "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
-                ))
+        } else {
+            match Linear::from_weight_map(weights, "lm_head.weight", None) {
+                Ok(linear) => linear,
+                Err(_) if config.tie_word_embeddings => {
+                    Linear::from_weight_map(weights, "model.embed_tokens.weight", None)?
+                }
+                Err(_) => {
+                    return Err(RsinferError::WeightError(
+                        "缺少 lm_head.weight 且 tie_word_embeddings 为 false".into(),
+                    ))
+                }
             }
         };
 
-        let use_q8 = runtime_options.quantization == QuantizationMode::Q8;
         if use_q8 {
             match runtime_options.quantization_cache {
                 QuantizationCacheMode::Auto => {
@@ -179,7 +259,7 @@ impl Qwen3Model {
             }
 
             if use_q8 {
-                match lm_head.try_enable_q8_gpu_matvec_with_context(context) {
+                match lm_head.try_enable_q8_gpu_matvec_with_context_and_argmax(context, true) {
                     Ok(()) => runtime_plan.mark_lm_head_q8_gpu(),
                     Err(err) => runtime_plan.mark_lm_head_gpu_fallback(err),
                 }
@@ -318,4 +398,15 @@ impl Qwen3Model {
             self.config.max_position_embeddings,
         )
     }
+}
+
+fn should_skip_warm_q8_linear_weight(name: &str) -> bool {
+    name == "lm_head.weight"
+        || name.ends_with("self_attn.q_proj.weight")
+        || name.ends_with("self_attn.k_proj.weight")
+        || name.ends_with("self_attn.v_proj.weight")
+        || name.ends_with("self_attn.o_proj.weight")
+        || name.ends_with("mlp.gate_proj.weight")
+        || name.ends_with("mlp.up_proj.weight")
+        || name.ends_with("mlp.down_proj.weight")
 }

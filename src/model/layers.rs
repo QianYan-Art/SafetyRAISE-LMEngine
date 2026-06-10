@@ -16,8 +16,10 @@ use crate::model::q8_sidecar::Q8SidecarCache;
 use crate::model::weights::{get_linear_weight_f16, get_weight, WeightMap};
 use crate::tensor::{
     linear_forward_f16, linear_forward_q8, linear_forward_q8_profiled, rms_norm,
-    rope_with_inv_freq, scaled_dot_product_attention_gqa_cached, silu, CachedAttention,
-    Q8LinearProfile, Q8LinearWeight, Tensor,
+    rms_norm_per_head_inplace, rope_single_token_inplace, rope_with_inv_freq,
+    scaled_dot_product_attention_gqa_cached,
+    scaled_dot_product_attention_gqa_cached_decode_one_raw, silu, CachedAttention, Q8LinearProfile,
+    Q8LinearWeight, Tensor,
 };
 
 /// RMS 归一化层
@@ -38,9 +40,9 @@ impl RmsNorm {
 
 /// 线性层 (矩阵乘法 + 可选偏置)
 ///
-/// 权重以 f16 存储（权重本就是 f16，无精度损失），计算时即时转 f32。
+/// 权重以 f16 存储；在 warm Q8 sidecar fast path 下，已接入的 Q8-only 线性层可不再保留原始 f16 副本。
 pub struct Linear {
-    /// f16 权重，行主序 [out_features, in_features]
+    /// f16 权重，行主序 [out_features, in_features]；Q8-only fast path 下允许为空。
     pub weight: Vec<f16>,
     pub out_features: usize,
     pub in_features: usize,
@@ -104,6 +106,19 @@ impl Linear {
         })
     }
 
+    pub fn from_q8_weight(name: &str, q8_weight: Q8LinearWeight, bias: Option<Tensor>) -> Self {
+        Self {
+            weight: Vec::new(),
+            out_features: q8_weight.out_features,
+            in_features: q8_weight.in_features,
+            bias,
+            gpu_matvec: None,
+            q8_gpu_matvec: None,
+            q8_weight: Some(q8_weight),
+            source_name: Some(name.to_string()),
+        }
+    }
+
     pub fn from_weight_map(weights: &WeightMap, name: &str, bias: Option<Tensor>) -> Result<Self> {
         let (shape, weight) = get_linear_weight_f16(weights, name)?;
         let mut linear = Self::from_f16_weight(&shape, weight, bias)?;
@@ -111,7 +126,31 @@ impl Linear {
         Ok(linear)
     }
 
+    pub fn from_weight_map_or_q8_sidecar(
+        weights: &WeightMap,
+        name: &str,
+        bias: Option<Tensor>,
+        sidecar: Option<&mut Q8SidecarCache>,
+    ) -> Result<Self> {
+        if let Some(cache) = sidecar {
+            if let Some(q8_weight) = cache.load_existing(name)? {
+                return Ok(Self::from_q8_weight(name, q8_weight, bias));
+            }
+        }
+        Self::from_weight_map(weights, name, bias)
+    }
+
+    fn has_f16_weight(&self) -> bool {
+        self.weight.len() == self.out_features * self.in_features
+    }
+
     pub fn try_enable_gpu_matvec(&mut self) -> std::result::Result<(), String> {
+        if !self.has_f16_weight() {
+            return Err(format!(
+                "Linear '{}' has no f16 weight for GPU matvec fallback",
+                self.source_name.as_deref().unwrap_or("<unnamed>")
+            ));
+        }
         let accelerator =
             GpuMatVec::from_f16_weight(&self.weight, self.out_features, self.in_features)?;
         self.gpu_matvec = Some(accelerator);
@@ -122,6 +161,12 @@ impl Linear {
         &mut self,
         context: &GpuContext,
     ) -> std::result::Result<(), String> {
+        if !self.has_f16_weight() {
+            return Err(format!(
+                "Linear '{}' has no f16 weight for GPU matvec fallback",
+                self.source_name.as_deref().unwrap_or("<unnamed>")
+            ));
+        }
         let accelerator = GpuMatVec::from_f16_weight_with_context(
             context,
             &self.weight,
@@ -144,6 +189,10 @@ impl Linear {
         self.q8_gpu_matvec.as_ref()
     }
 
+    pub fn q8_gpu_matvec_mut(&mut self) -> Option<&mut GpuQ8MatVec> {
+        self.q8_gpu_matvec.as_mut()
+    }
+
     fn has_cpu_q8_only(&self) -> bool {
         self.bias.is_none()
             && self.q8_weight.is_some()
@@ -152,12 +201,25 @@ impl Linear {
     }
 
     pub fn has_q8_gpu_argmax(&self) -> bool {
-        self.bias.is_none() && self.q8_gpu_matvec.is_some()
+        self.bias.is_none()
+            && self
+                .q8_gpu_matvec
+                .as_ref()
+                .map(GpuQ8MatVec::supports_argmax)
+                .unwrap_or(false)
     }
 
     pub fn try_enable_q8_gpu_matvec_with_context(
         &mut self,
         context: &GpuContext,
+    ) -> std::result::Result<(), String> {
+        self.try_enable_q8_gpu_matvec_with_context_and_argmax(context, true)
+    }
+
+    pub fn try_enable_q8_gpu_matvec_with_context_and_argmax(
+        &mut self,
+        context: &GpuContext,
+        enable_argmax: bool,
     ) -> std::result::Result<(), String> {
         if self.q8_weight.is_none() {
             self.try_enable_q8_weight().map_err(|err| err.to_string())?;
@@ -166,12 +228,28 @@ impl Linear {
             .q8_weight
             .as_ref()
             .ok_or_else(|| "Q8 weight was not attached".to_string())?;
-        let accelerator = GpuQ8MatVec::from_q8_weight_with_context(context, q8_weight)?;
+        let accelerator =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(context, q8_weight, enable_argmax)?;
         self.q8_gpu_matvec = Some(accelerator);
         Ok(())
     }
 
+    pub fn release_q8_gpu_standalone_forward_resources(&mut self, keep_readback: bool) {
+        if let Some(matvec) = self.q8_gpu_matvec.as_mut() {
+            matvec.release_standalone_forward_resources(keep_readback);
+        }
+    }
+
     pub fn try_enable_q8_weight(&mut self) -> Result<()> {
+        if self.q8_weight.is_some() {
+            return Ok(());
+        }
+        if !self.has_f16_weight() {
+            return Err(RsinferError::WeightError(format!(
+                "Linear '{}' has no f16 weight to derive missing Q8 fallback",
+                self.source_name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
         let q8 = Q8LinearWeight::from_f16(&self.weight, self.out_features, self.in_features)?;
         self.q8_weight = Some(q8);
         Ok(())
@@ -181,8 +259,16 @@ impl Linear {
         &mut self,
         sidecar: Option<&mut Q8SidecarCache>,
     ) -> Result<()> {
+        if self.q8_weight.is_some() {
+            return Ok(());
+        }
         if let (Some(cache), Some(name)) = (sidecar, self.source_name.as_deref()) {
             match cache.load_or_create(name, self.out_features, self.in_features, || {
+                if !self.has_f16_weight() {
+                    return Err(RsinferError::WeightError(format!(
+                        "Linear '{name}' has no f16 weight to rebuild missing Q8 sidecar entry"
+                    )));
+                }
                 Q8LinearWeight::from_f16(&self.weight, self.out_features, self.in_features)
             }) {
                 Ok(q8) => {
@@ -217,6 +303,12 @@ impl Linear {
             }
         }
 
+        if !self.has_f16_weight() {
+            return Err(RsinferError::WeightError(format!(
+                "Linear '{}' has no f16 fallback weight attached",
+                self.source_name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
         let result = linear_forward_f16(x, &self.weight, self.out_features, self.in_features)?;
 
         if let Some(bias) = &self.bias {
@@ -235,6 +327,17 @@ impl Linear {
             .as_ref()
             .ok_or_else(|| "Q8 GPU matvec is not attached".to_string())?;
         q8_gpu_matvec.forward_argmax(x)
+    }
+
+    pub fn try_forward_q8_gpu_raw(&self, input: &[f32]) -> std::result::Result<Vec<f32>, String> {
+        if self.bias.is_some() {
+            return Err("Q8 GPU raw path does not support bias".to_string());
+        }
+        let q8_gpu_matvec = self
+            .q8_gpu_matvec
+            .as_ref()
+            .ok_or_else(|| "Q8 GPU matvec is not attached".to_string())?;
+        q8_gpu_matvec.forward_raw(input)
     }
 }
 
@@ -305,7 +408,8 @@ impl Attention {
             ("v_proj", &mut self.v_proj),
             ("o_proj", &mut self.o_proj),
         ] {
-            match linear.try_enable_q8_gpu_matvec_with_context(context) {
+            let enable_argmax = false;
+            match linear.try_enable_q8_gpu_matvec_with_context_and_argmax(context, enable_argmax) {
                 Ok(()) => attached += 1,
                 Err(err) => errors.push(format!("attention.{name}.q8_gpu: {err}")),
             }
@@ -317,7 +421,15 @@ impl Attention {
         ) {
             (Some(q_proj), Some(k_proj), Some(v_proj)) => {
                 match GpuQ8SameInputBatch::new(&[q_proj, k_proj, v_proj]) {
-                    Ok(batch) => Some(batch),
+                    Ok(batch) => {
+                        self.q_proj
+                            .release_q8_gpu_standalone_forward_resources(true);
+                        self.k_proj
+                            .release_q8_gpu_standalone_forward_resources(true);
+                        self.v_proj
+                            .release_q8_gpu_standalone_forward_resources(true);
+                        Some(batch)
+                    }
                     Err(err) => {
                         errors.push(format!("attention.qkv.q8_shared_input: {err}"));
                         None
@@ -384,6 +496,10 @@ impl Attention {
             )
         };
 
+        if seq_len == 1 {
+            return self.forward_decode_one_fast(q, k, v, kv_cache, layer_idx, position_offset);
+        }
+
         let q = q.reshape(&[seq_len, self.num_heads, self.head_dim])?;
         let k = k.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
         let v = v.reshape(&[seq_len, self.num_kv_heads, self.head_dim])?;
@@ -420,6 +536,76 @@ impl Attention {
 
         let attn = transpose_back(&attn, seq_len, self.num_heads)?
             .reshape(&[seq_len, self.num_heads * self.head_dim])?;
+        self.o_proj.forward(&attn)
+    }
+
+    fn forward_decode_one_fast(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        kv_cache: &mut KVCache,
+        layer_idx: usize,
+        position_offset: usize,
+    ) -> Result<Tensor> {
+        let mut q_data = q.as_slice().to_vec();
+        let mut k_data = k.as_slice().to_vec();
+        let v_data = v.as_slice();
+        rms_norm_per_head_inplace(
+            &mut q_data,
+            self.num_heads,
+            self.head_dim,
+            self.q_norm.weight.as_slice(),
+            self.q_norm.eps,
+        )?;
+        rms_norm_per_head_inplace(
+            &mut k_data,
+            self.num_kv_heads,
+            self.head_dim,
+            self.k_norm.weight.as_slice(),
+            self.k_norm.eps,
+        )?;
+        rope_single_token_inplace(
+            &mut q_data,
+            self.num_heads,
+            self.head_dim,
+            position_offset,
+            &self.rope_inv_freq,
+        )?;
+        rope_single_token_inplace(
+            &mut k_data,
+            self.num_kv_heads,
+            self.head_dim,
+            position_offset,
+            &self.rope_inv_freq,
+        )?;
+
+        kv_cache.append_decode_one_raw(
+            layer_idx,
+            self.num_kv_heads,
+            self.head_dim,
+            &k_data,
+            v_data,
+        )?;
+        let cached = kv_cache.get_cached(layer_idx)?;
+        let kv_group_size = self.num_heads / self.num_kv_heads;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let attn = scaled_dot_product_attention_gqa_cached_decode_one_raw(
+            &q_data,
+            CachedAttention {
+                key: cached.key,
+                value: cached.value,
+                num_kv_heads: cached.num_heads,
+                seq_len_k: cached.seq_len,
+                head_dim: cached.head_dim,
+                max_len: cached.capacity_len,
+            },
+            self.num_heads,
+            kv_group_size,
+            self.head_dim,
+            scale,
+        )?;
+        let attn = Tensor::from_f32_vec(&[1, self.num_heads * self.head_dim], attn)?;
         self.o_proj.forward(&attn)
     }
 
@@ -705,7 +891,8 @@ impl Mlp {
             ("up_proj", &mut self.up_proj),
             ("down_proj", &mut self.down_proj),
         ] {
-            match linear.try_enable_q8_gpu_matvec_with_context(context) {
+            let enable_argmax = false;
+            match linear.try_enable_q8_gpu_matvec_with_context_and_argmax(context, enable_argmax) {
                 Ok(()) => attached += 1,
                 Err(err) => errors.push(format!("mlp.{name}.q8_gpu: {err}")),
             }
@@ -717,7 +904,13 @@ impl Mlp {
         ) {
             (Some(gate_proj), Some(up_proj), Some(down_proj)) => {
                 match GpuQ8SwiGluDown::new(gate_proj, up_proj, down_proj) {
-                    Ok(fused) => Some(fused),
+                    Ok(fused) => {
+                        self.gate_proj
+                            .release_q8_gpu_standalone_forward_resources(false);
+                        self.up_proj
+                            .release_q8_gpu_standalone_forward_resources(false);
+                        Some(fused)
+                    }
                     Err(err) => {
                         errors.push(format!("mlp.q8_swiglu_down: {err}"));
                         None
@@ -900,33 +1093,101 @@ pub fn build_transformer_block(
     config: &Qwen3Config,
     layer_idx: usize,
 ) -> Result<TransformerBlock> {
+    build_transformer_block_with_q8_sidecar(weights, config, layer_idx, None)
+}
+
+pub fn build_transformer_block_with_q8_sidecar(
+    weights: &WeightMap,
+    config: &Qwen3Config,
+    layer_idx: usize,
+    sidecar: Option<&mut Q8SidecarCache>,
+) -> Result<TransformerBlock> {
     let prefix = format!("model.layers.{layer_idx}");
     let get = |suffix: &str| get_weight(weights, &format!("{prefix}.{suffix}"));
     let eps = config.rms_norm_eps;
-    let linear = |suffix: &str| -> Result<Linear> {
-        Linear::from_weight_map(weights, &format!("{prefix}.{suffix}"), None)
+    let (attention, mlp) = if let Some(cache) = sidecar {
+        (
+            Attention {
+                q_proj: Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                k_proj: Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                v_proj: Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                o_proj: Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.self_attn.o_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                q_norm: RmsNorm::new(get("self_attn.q_norm.weight")?, eps),
+                k_norm: RmsNorm::new(get("self_attn.k_norm.weight")?, eps),
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim(),
+                rope_theta: config.rope_theta,
+                rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
+                q8_qkv_batch: None,
+            },
+            Mlp::new(
+                Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+                Linear::from_weight_map_or_q8_sidecar(
+                    weights,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    None,
+                    Some(&mut *cache),
+                )?,
+            ),
+        )
+    } else {
+        let linear = |suffix: &str| -> Result<Linear> {
+            Linear::from_weight_map(weights, &format!("{prefix}.{suffix}"), None)
+        };
+        (
+            Attention {
+                q_proj: linear("self_attn.q_proj.weight")?,
+                k_proj: linear("self_attn.k_proj.weight")?,
+                v_proj: linear("self_attn.v_proj.weight")?,
+                o_proj: linear("self_attn.o_proj.weight")?,
+                q_norm: RmsNorm::new(get("self_attn.q_norm.weight")?, eps),
+                k_norm: RmsNorm::new(get("self_attn.k_norm.weight")?, eps),
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim(),
+                rope_theta: config.rope_theta,
+                rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
+                q8_qkv_batch: None,
+            },
+            Mlp::new(
+                linear("mlp.gate_proj.weight")?,
+                linear("mlp.up_proj.weight")?,
+                linear("mlp.down_proj.weight")?,
+            ),
+        )
     };
-
-    let attention = Attention {
-        q_proj: linear("self_attn.q_proj.weight")?,
-        k_proj: linear("self_attn.k_proj.weight")?,
-        v_proj: linear("self_attn.v_proj.weight")?,
-        o_proj: linear("self_attn.o_proj.weight")?,
-        q_norm: RmsNorm::new(get("self_attn.q_norm.weight")?, eps),
-        k_norm: RmsNorm::new(get("self_attn.k_norm.weight")?, eps),
-        num_heads: config.num_attention_heads,
-        num_kv_heads: config.num_key_value_heads,
-        head_dim: config.head_dim(),
-        rope_theta: config.rope_theta,
-        rope_inv_freq: rope_inv_freq(config.head_dim(), config.rope_theta),
-        q8_qkv_batch: None,
-    };
-
-    let mlp = Mlp::new(
-        linear("mlp.gate_proj.weight")?,
-        linear("mlp.up_proj.weight")?,
-        linear("mlp.down_proj.weight")?,
-    );
 
     Ok(TransformerBlock::new(
         RmsNorm::new(get("input_layernorm.weight")?, eps),
@@ -962,6 +1223,32 @@ mod tests {
             assert!(
                 (expected - actual).abs() <= 0.02,
                 "q8 Linear output {actual} too far from f16 {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_from_q8_weight_matches_f16_path_without_f16_fallback_copy() {
+        let weight = vec![
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let f16_linear = Linear::from_f16_weight(&[3, 2], weight.clone(), None).unwrap();
+        let q8_weight = Q8LinearWeight::from_f16(&weight, 3, 2).unwrap();
+        let q8_only_linear = Linear::from_q8_weight("test.weight", q8_weight, None);
+
+        let expected = f16_linear.forward(&x).unwrap();
+        let actual = q8_only_linear.forward(&x).unwrap();
+
+        for (expected, actual) in expected.as_slice().iter().zip(actual.as_slice()) {
+            assert!(
+                (expected - actual).abs() <= 0.02,
+                "q8-only Linear output {actual} too far from f16 {expected}"
             );
         }
     }

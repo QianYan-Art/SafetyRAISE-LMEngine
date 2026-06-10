@@ -2,8 +2,9 @@
 //!
 //! 支持加载单文件和分片的 SafeTensors 模型权重。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use half::f16;
@@ -47,6 +48,13 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SafetensorsHeaderEntry {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [u64; 2],
+}
+
 /// 从模型目录加载所有权重
 ///
 /// 自动检测是单文件还是分片格式：
@@ -63,6 +71,27 @@ pub fn load_weights<P: AsRef<Path>>(model_dir: P) -> Result<WeightMap> {
     } else if single_path.exists() {
         // 单文件格式
         load_single_weights(&single_path)
+    } else {
+        Err(RsinferError::WeightError(format!(
+            "No safetensors file found in {:?}",
+            model_dir
+        )))
+    }
+}
+
+pub fn load_weights_filtered<P, F>(model_dir: P, keep: F) -> Result<WeightMap>
+where
+    P: AsRef<Path>,
+    F: Fn(&str) -> bool,
+{
+    let model_dir = model_dir.as_ref();
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let single_path = model_dir.join("model.safetensors");
+
+    if index_path.exists() {
+        load_sharded_weights_filtered(model_dir, &index_path, &keep)
+    } else if single_path.exists() {
+        load_single_weights_filtered(&single_path, &keep)
     } else {
         Err(RsinferError::WeightError(format!(
             "No safetensors file found in {:?}",
@@ -88,6 +117,26 @@ fn load_single_weights<P: AsRef<Path>>(path: P) -> Result<WeightMap> {
         weights.insert(name.to_string(), tensor);
     }
 
+    Ok(weights)
+}
+
+fn load_single_weights_filtered<P, F>(path: P, keep: &F) -> Result<WeightMap>
+where
+    P: AsRef<Path>,
+    F: Fn(&str) -> bool,
+{
+    let mut file = fs::File::open(path.as_ref())?;
+    let (data_start, header) = read_safetensors_header(&mut file, path.as_ref())?;
+    let selected_names: Vec<String> = header.keys().filter(|name| keep(name)).cloned().collect();
+    let mut weights = HashMap::new();
+    load_selected_tensors(
+        &mut file,
+        path.as_ref(),
+        data_start,
+        &header,
+        &selected_names,
+        &mut weights,
+    )?;
     Ok(weights)
 }
 
@@ -120,6 +169,40 @@ fn load_sharded_weights<P: AsRef<Path>>(model_dir: P, index_path: P) -> Result<W
     Ok(weights)
 }
 
+fn load_sharded_weights_filtered<P, F>(model_dir: P, index_path: P, keep: &F) -> Result<WeightMap>
+where
+    P: AsRef<Path>,
+    F: Fn(&str) -> bool,
+{
+    let index_content = fs::read_to_string(index_path.as_ref())?;
+    let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
+
+    let mut shard_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, shard_file) in index.weight_map {
+        if keep(&name) {
+            shard_map.entry(shard_file).or_default().insert(name);
+        }
+    }
+
+    let mut weights = HashMap::new();
+    for (shard_file, selected_names) in shard_map {
+        let shard_path = model_dir.as_ref().join(&shard_file);
+        let mut file = fs::File::open(&shard_path)?;
+        let (data_start, header) = read_safetensors_header(&mut file, &shard_path)?;
+        let selected_names: Vec<String> = selected_names.into_iter().collect();
+        load_selected_tensors(
+            &mut file,
+            &shard_path,
+            data_start,
+            &header,
+            &selected_names,
+            &mut weights,
+        )?;
+    }
+
+    Ok(weights)
+}
+
 /// 将 SafeTensors 的原始数据转换为 Tensor
 fn convert_tensor(
     shape: &[usize],
@@ -136,6 +219,105 @@ fn convert_tensor(
         safetensors::Dtype::BF16 => Tensor::from_bf16_bytes(shape, data).map(LoadedTensor::Tensor),
         _ => Err(RsinferError::Unsupported(format!(
             "Unsupported dtype {:?} for tensor '{}'",
+            dtype, name
+        ))),
+    }
+}
+
+fn read_safetensors_header(
+    file: &mut fs::File,
+    path: &Path,
+) -> Result<(u64, HashMap<String, SafetensorsHeaderEntry>)> {
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes)?;
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    let header_len_usize = usize::try_from(header_len).map_err(|_| {
+        RsinferError::WeightError(format!(
+            "Safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    let mut header_bytes = vec![0u8; header_len_usize];
+    file.read_exact(&mut header_bytes)?;
+
+    let header_value: serde_json::Value = serde_json::from_slice(&header_bytes)?;
+    let header_object = header_value.as_object().ok_or_else(|| {
+        RsinferError::SafeTensors(format!(
+            "Invalid safetensors header object in {}",
+            path.display()
+        ))
+    })?;
+
+    let mut header = HashMap::new();
+    for (name, value) in header_object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let entry: SafetensorsHeaderEntry = serde_json::from_value(value.clone())?;
+        header.insert(name.clone(), entry);
+    }
+
+    Ok((8 + header_len, header))
+}
+
+fn load_selected_tensors(
+    file: &mut fs::File,
+    path: &Path,
+    data_start: u64,
+    header: &HashMap<String, SafetensorsHeaderEntry>,
+    selected_names: &[String],
+    weights: &mut WeightMap,
+) -> Result<()> {
+    let mut selected_entries = Vec::with_capacity(selected_names.len());
+    for name in selected_names {
+        let entry = header.get(name).ok_or_else(|| {
+            RsinferError::WeightError(format!(
+                "Tensor '{}' not found in safetensors header {}",
+                name,
+                path.display()
+            ))
+        })?;
+        selected_entries.push((name.as_str(), entry));
+    }
+    selected_entries.sort_by_key(|(_, entry)| entry.data_offsets[0]);
+
+    for (name, entry) in selected_entries {
+        let start = data_start + entry.data_offsets[0];
+        let len = entry.data_offsets[1]
+            .checked_sub(entry.data_offsets[0])
+            .ok_or_else(|| {
+                RsinferError::SafeTensors(format!(
+                    "Invalid data offsets for tensor '{}' in {}",
+                    name,
+                    path.display()
+                ))
+            })?;
+        let len = usize::try_from(len).map_err(|_| {
+            RsinferError::WeightError(format!(
+                "Tensor '{}' is too large to load on this platform",
+                name
+            ))
+        })?;
+
+        file.seek(SeekFrom::Start(start))?;
+        let mut data = vec![0u8; len];
+        file.read_exact(&mut data)?;
+
+        let dtype = parse_safetensors_dtype(&entry.dtype, name)?;
+        let tensor = convert_tensor(&entry.shape, dtype, &data, name)?;
+        weights.insert(name.to_string(), tensor);
+    }
+
+    Ok(())
+}
+
+fn parse_safetensors_dtype(dtype: &str, name: &str) -> Result<safetensors::Dtype> {
+    match dtype {
+        "F16" => Ok(safetensors::Dtype::F16),
+        "F32" => Ok(safetensors::Dtype::F32),
+        "BF16" => Ok(safetensors::Dtype::BF16),
+        _ => Err(RsinferError::Unsupported(format!(
+            "Unsupported dtype '{}' for tensor '{}'",
             dtype, name
         ))),
     }

@@ -181,6 +181,71 @@ impl KVCache {
         Ok(())
     }
 
+    pub fn append_decode_one_raw(
+        &mut self,
+        layer_idx: usize,
+        num_heads: usize,
+        head_dim: usize,
+        new_k: &[f32],
+        new_v: &[f32],
+    ) -> Result<()> {
+        if layer_idx >= self.layers.len() {
+            return Err(RsinferError::DimensionError(format!(
+                "Layer index {} out of range (max {})",
+                layer_idx,
+                self.layers.len()
+            )));
+        }
+        let expected = num_heads * head_dim;
+        if new_k.len() != expected || new_v.len() != expected {
+            return Err(RsinferError::ShapeMismatch {
+                expected: vec![expected],
+                actual: vec![new_k.len(), new_v.len()],
+            });
+        }
+
+        let layer = self.layers[layer_idx].get_or_insert_with(|| KVCacheLayer {
+            key: Vec::new(),
+            value: Vec::new(),
+            num_heads,
+            head_dim,
+            current_len: 0,
+            capacity_len: 0,
+        });
+
+        if layer.num_heads != num_heads || layer.head_dim != head_dim {
+            return Err(RsinferError::ShapeMismatch {
+                expected: vec![layer.num_heads, layer.current_len, layer.head_dim],
+                actual: vec![num_heads, 1, head_dim],
+            });
+        }
+        if layer.current_len + 1 > self.max_len {
+            return Err(RsinferError::DimensionError(format!(
+                "KV cache length {} exceeds max_len {}",
+                layer.current_len + 1,
+                self.max_len
+            )));
+        }
+        layer.ensure_capacity(layer.current_len + 1, self.max_len)?;
+
+        let cache_head_len = layer.capacity_len * head_dim;
+        let dst_seq_offset = layer.current_len * head_dim;
+        for h in 0..num_heads {
+            let src_start = h * head_dim;
+            let dst_start = h * cache_head_len + dst_seq_offset;
+            layer.key[dst_start..dst_start + head_dim]
+                .copy_from_slice(&new_k[src_start..src_start + head_dim]);
+            layer.value[dst_start..dst_start + head_dim]
+                .copy_from_slice(&new_v[src_start..src_start + head_dim]);
+        }
+
+        layer.current_len += 1;
+        if layer_idx == 0 {
+            self.current_len = layer.current_len;
+        }
+        Ok(())
+    }
+
     pub fn get_cached(&self, layer_idx: usize) -> Result<CachedKV<'_>> {
         let layer = self
             .layers

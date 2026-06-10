@@ -8,12 +8,17 @@ use ndarray::{ArrayD, Axis, IxDyn};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 use super::Tensor;
 use crate::error::{Result, RsinferError};
 
 /// 行级对称 Q8 线性权重。
 ///
-/// 每个输出行独立 scale：`w ~= q * scale`，q 存 i8 行主序 `[out_features, in_features]`。
+/// 每个输出行独立 scale：`w ~= q * scale`，q 以 i8 行主序保存 `[out_features, in_features]`。
 #[derive(Clone, Debug)]
 pub struct Q8LinearWeight {
     pub qweight: Vec<i8>,
@@ -291,6 +296,7 @@ pub fn linear_forward_q8_profiled(
 /// 让编译器自动生成 AVX/FMA 向量指令，比朴素 `.sum()` 快数倍。
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
     const LANES: usize = 8;
     let mut acc = [0f32; LANES];
     let mut ca = a.chunks_exact(LANES);
@@ -311,6 +317,25 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline]
 fn dot_q8(x: &[f32], q: &[i8], scale: f32) -> f32 {
+    debug_assert_eq!(x.len(), q.len());
+    dot_q8_inner(x, q) * scale
+}
+
+#[inline]
+fn dot_q8_inner(x: &[f32], q: &[i8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2/FMA availability is checked above, and the slices share the same length.
+            return unsafe { dot_q8_avx2_fma(x, q) };
+        }
+    }
+
+    dot_q8_scalar(x, q)
+}
+
+#[inline]
+fn dot_q8_scalar(x: &[f32], q: &[i8]) -> f32 {
     const LANES: usize = 8;
     let mut acc = [0f32; LANES];
     let mut cx = x.chunks_exact(LANES);
@@ -326,7 +351,36 @@ fn dot_q8(x: &[f32], q: &[i8], scale: f32) -> f32 {
         .zip(cq.remainder())
         .map(|(&x, &q)| x * q as f32)
         .sum();
-    (acc.iter().sum::<f32>() + tail) * scale
+    acc.iter().sum::<f32>() + tail
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q8_avx2_fma(x: &[f32], q: &[i8]) -> f32 {
+    let len = x.len();
+    let simd_end = len / 8 * 8;
+    let mut acc = _mm256_setzero_ps();
+    let mut idx = 0usize;
+    while idx < simd_end {
+        // SAFETY: idx advances in chunks of 8 and simd_end is rounded down to a valid bound.
+        let x_vec = unsafe { _mm256_loadu_ps(x.as_ptr().add(idx)) };
+        // SAFETY: reading 8 signed bytes from a valid slice range.
+        let q_vec = unsafe { _mm_loadl_epi64(q.as_ptr().add(idx) as *const __m128i) };
+        let q_i32 = _mm256_cvtepi8_epi32(q_vec);
+        let q_f32 = _mm256_cvtepi32_ps(q_i32);
+        acc = _mm256_fmadd_ps(x_vec, q_f32, acc);
+        idx += 8;
+    }
+
+    let mut lanes = [0f32; 8];
+    // SAFETY: `lanes` is a properly sized writable buffer for eight f32 values.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    let mut total = lanes.iter().sum::<f32>();
+    while idx < len {
+        total += x[idx] * q[idx] as f32;
+        idx += 1;
+    }
+    total
 }
 
 /// Softmax 操作
@@ -419,6 +473,36 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     Ok(Tensor { data: result })
 }
 
+pub fn rms_norm_per_head_inplace(
+    data: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) -> Result<()> {
+    if data.len() != num_heads * head_dim {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![num_heads * head_dim],
+            actual: vec![data.len()],
+        });
+    }
+    if weight.len() != head_dim {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![head_dim],
+            actual: vec![weight.len()],
+        });
+    }
+
+    for row in data.chunks_exact_mut(head_dim) {
+        let mean_sq = row.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
+        let scale = 1.0 / (mean_sq + eps).sqrt();
+        for (value, &weight) in row.iter_mut().zip(weight) {
+            *value *= scale * weight;
+        }
+    }
+    Ok(())
+}
+
 /// SiLU 激活函数 (Swish)
 ///
 /// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
@@ -484,6 +568,41 @@ pub fn rope_with_inv_freq(
     let k_rotated = apply_rope_to_tensor(&k.data, inv_freq, pos, seq_len, half_dim)?;
 
     Ok((Tensor { data: q_rotated }, Tensor { data: k_rotated }))
+}
+
+pub fn rope_single_token_inplace(
+    data: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    inv_freq: &[f32],
+) -> Result<()> {
+    let half_dim = head_dim / 2;
+    if data.len() != num_heads * head_dim {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![num_heads * head_dim],
+            actual: vec![data.len()],
+        });
+    }
+    if inv_freq.len() != half_dim {
+        return Err(RsinferError::ShapeMismatch {
+            expected: vec![half_dim],
+            actual: vec![inv_freq.len()],
+        });
+    }
+
+    for (freq_idx, &inv_f) in inv_freq.iter().enumerate() {
+        let angle = pos as f32 * inv_f;
+        let cos_val = angle.cos();
+        let sin_val = angle.sin();
+        for row in data.chunks_exact_mut(head_dim) {
+            let x1 = row[freq_idx];
+            let x2 = row[freq_idx + half_dim];
+            row[freq_idx] = x1 * cos_val - x2 * sin_val;
+            row[freq_idx + half_dim] = x1 * sin_val + x2 * cos_val;
+        }
+    }
+    Ok(())
 }
 
 /// 对单个张量应用 RoPE
@@ -822,56 +941,72 @@ fn scaled_dot_product_attention_gqa_cached_decode_one(
     head_dim: usize,
     scale: f32,
 ) -> Result<Tensor> {
-    let mut output = vec![0f32; num_heads * head_dim];
-    let cache_head_stride = cache.max_len * head_dim;
-
-    output
-        .par_chunks_mut(head_dim)
-        .enumerate()
-        .for_each(|(h, out_row)| {
-            let kv_head_idx = h / kv_group_size;
-            let q_row = &qs[h * head_dim..(h + 1) * head_dim];
-            let k_head =
-                &cache.key[kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
-            let v_head = &cache.value
-                [kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
-
-            let mut max_score = f32::NEG_INFINITY;
-            let mut sum_exp = 0f32;
-            for j in 0..cache.seq_len_k {
-                let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
-                let score = dot(q_row, k_row) * scale;
-                if score <= max_score {
-                    let weight = (score - max_score).exp();
-                    sum_exp += weight;
-                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
-                    for d in 0..head_dim {
-                        out_row[d] += weight * v_row[d];
-                    }
-                } else {
-                    let rescale = (max_score - score).exp();
-                    for value in out_row.iter_mut() {
-                        *value *= rescale;
-                    }
-                    let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
-                    for d in 0..head_dim {
-                        out_row[d] += v_row[d];
-                    }
-                    sum_exp = sum_exp * rescale + 1.0;
-                    max_score = score;
-                }
-            }
-
-            let inv_sum = 1.0 / sum_exp;
-            for value in out_row.iter_mut() {
-                *value *= inv_sum;
-            }
-        });
-
+    let output = scaled_dot_product_attention_gqa_cached_decode_one_raw(
+        qs,
+        cache,
+        num_heads,
+        kv_group_size,
+        head_dim,
+        scale,
+    )?;
     Ok(Tensor {
         data: ArrayD::from_shape_vec(IxDyn(&[num_heads, 1, head_dim]), output)
             .map_err(|e| RsinferError::DimensionError(e.to_string()))?,
     })
+}
+
+pub fn scaled_dot_product_attention_gqa_cached_decode_one_raw(
+    qs: &[f32],
+    cache: CachedAttention<'_>,
+    num_heads: usize,
+    kv_group_size: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    let mut output = vec![0f32; num_heads * head_dim];
+    let cache_head_stride = cache.max_len * head_dim;
+
+    for (h, out_row) in output.chunks_exact_mut(head_dim).enumerate() {
+        let kv_head_idx = h / kv_group_size;
+        let q_row = &qs[h * head_dim..(h + 1) * head_dim];
+        let k_head =
+            &cache.key[kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+        let v_head =
+            &cache.value[kv_head_idx * cache_head_stride..(kv_head_idx + 1) * cache_head_stride];
+
+        let mut max_score = f32::NEG_INFINITY;
+        let mut sum_exp = 0f32;
+        for j in 0..cache.seq_len_k {
+            let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+            let score = dot(q_row, k_row) * scale;
+            if score <= max_score {
+                let weight = (score - max_score).exp();
+                sum_exp += weight;
+                let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                for d in 0..head_dim {
+                    out_row[d] += weight * v_row[d];
+                }
+            } else {
+                let rescale = (max_score - score).exp();
+                for value in out_row.iter_mut() {
+                    *value *= rescale;
+                }
+                let v_row = &v_head[j * head_dim..(j + 1) * head_dim];
+                for d in 0..head_dim {
+                    out_row[d] += v_row[d];
+                }
+                sum_exp = sum_exp * rescale + 1.0;
+                max_score = score;
+            }
+        }
+
+        let inv_sum = 1.0 / sum_exp;
+        for value in out_row.iter_mut() {
+            *value *= inv_sum;
+        }
+    }
+
+    Ok(output)
 }
 
 /// GQA (Grouped Query Attention) 的 KV 头扩展

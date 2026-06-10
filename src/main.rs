@@ -110,7 +110,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
 
-    /// 计划放到 GPU 的 Transformer 层数；Q8 hybrid 省略时默认 0，显式传参会覆盖
+    /// 计划放到 GPU 的 Transformer 层数；省略时按模式保守选择，当前本机 Q8 hybrid 默认 35
     #[arg(long)]
     gpu_layers: Option<usize>,
 

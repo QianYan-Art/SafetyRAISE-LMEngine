@@ -2,7 +2,6 @@
 //!
 //! 目前实现单行 matvec 和 decode MLP 的 SwiGLU+down projection GPU 路径。
 //! 初始化或执行失败时上层会回退 CPU。
-
 use std::borrow::Cow;
 use std::sync::{mpsc, Arc};
 
@@ -289,7 +288,7 @@ pub struct GpuMatVec {
 
 pub struct GpuQ8MatVec {
     context: GpuContext,
-    input_buffer: wgpu::Buffer,
+    input_buffer: Option<wgpu::Buffer>,
     chunks: Vec<GpuQ8MatVecChunk>,
     in_features: usize,
     out_features: usize,
@@ -311,6 +310,9 @@ pub struct GpuSwiGluDown {
 
 pub struct GpuQ8SwiGluDown {
     context: GpuContext,
+    shared_input_buffer: wgpu::Buffer,
+    gate_bind_groups: Vec<wgpu::BindGroup>,
+    up_bind_groups: Vec<wgpu::BindGroup>,
     bind_groups: Vec<GpuSwiGluBindGroup>,
     _params_buffers: Vec<wgpu::Buffer>,
 }
@@ -331,16 +333,16 @@ struct GpuMatVecChunk {
 }
 
 struct GpuQ8MatVecChunk {
-    bind_group: wgpu::BindGroup,
-    argmax_bind_group: wgpu::BindGroup,
+    bind_group: Option<wgpu::BindGroup>,
+    argmax_bind_group: Option<wgpu::BindGroup>,
     _qweight_buffer: wgpu::Buffer,
     _scales_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
-    argmax_buffer: wgpu::Buffer,
-    argmax_readback_buffer: wgpu::Buffer,
+    readback_buffer: Option<wgpu::Buffer>,
+    argmax_buffer: Option<wgpu::Buffer>,
+    argmax_readback_buffer: Option<wgpu::Buffer>,
     _params_buffer: wgpu::Buffer,
-    _argmax_params_buffer: wgpu::Buffer,
+    _argmax_params_buffer: Option<wgpu::Buffer>,
     argmax_results: usize,
     out_offset: usize,
     out_features: usize,
@@ -756,24 +758,15 @@ impl GpuQ8MatVec {
         context: &GpuContext,
         weight: &Q8LinearWeight,
     ) -> Result<Self, String> {
-        let expected = weight.out_features * weight.in_features;
-        if weight.qweight.len() != expected {
-            return Err(format!(
-                "GPU Q8 matvec qweight length mismatch: got {}, expected {}",
-                weight.qweight.len(),
-                expected
-            ));
-        }
-        if weight.scales.len() != weight.out_features {
-            return Err(format!(
-                "GPU Q8 matvec scale length mismatch: got {}, expected {}",
-                weight.scales.len(),
-                weight.out_features
-            ));
-        }
-        if weight.in_features == 0 || weight.out_features == 0 {
-            return Err("GPU Q8 matvec requires non-empty dimensions".to_string());
-        }
+        Self::from_q8_weight_with_context_and_argmax(context, weight, true)
+    }
+
+    pub fn from_q8_weight_with_context_and_argmax(
+        context: &GpuContext,
+        weight: &Q8LinearWeight,
+        enable_argmax: bool,
+    ) -> Result<Self, String> {
+        validate_q8_weight(weight)?;
 
         let input_buffer = context.inner.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rsinfer-q8-matvec-input"),
@@ -803,17 +796,34 @@ impl GpuQ8MatVec {
                 words_per_row,
                 out_offset,
                 rows,
+                enable_argmax,
             ));
             out_offset += rows;
         }
 
         Ok(Self {
             context: context.clone(),
-            input_buffer,
+            input_buffer: Some(input_buffer),
             chunks,
             in_features: weight.in_features,
             out_features: weight.out_features,
         })
+    }
+
+    pub fn supports_argmax(&self) -> bool {
+        self.chunks
+            .iter()
+            .all(|chunk| chunk.argmax_bind_group.is_some())
+    }
+
+    pub fn release_standalone_forward_resources(&mut self, keep_readback: bool) {
+        self.input_buffer = None;
+        for chunk in &mut self.chunks {
+            chunk.bind_group = None;
+            if !keep_readback {
+                chunk.readback_buffer = None;
+            }
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, String> {
@@ -821,6 +831,13 @@ impl GpuQ8MatVec {
         outputs
             .pop()
             .ok_or_else(|| "GPU Q8 matvec returned no output".to_string())
+    }
+
+    pub fn forward_raw(&self, input: &[f32]) -> Result<Vec<f32>, String> {
+        let mut outputs = Self::forward_many_same_input_raw(&[self], input)?;
+        outputs
+            .pop()
+            .ok_or_else(|| "GPU Q8 matvec returned no raw output".to_string())
     }
 
     pub fn forward_argmax(&self, x: &Tensor) -> Result<u32, String> {
@@ -836,10 +853,14 @@ impl GpuQ8MatVec {
         let input = x_std
             .as_slice()
             .ok_or_else(|| "GPU Q8 argmax input is not contiguous".to_string())?;
+        let input_buffer = self
+            .input_buffer
+            .as_ref()
+            .ok_or_else(|| "GPU Q8 argmax input buffer was released".to_string())?;
         self.context
             .inner
             .queue
-            .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(input));
+            .write_buffer(input_buffer, 0, bytemuck::cast_slice(input));
 
         let mut encoder =
             self.context
@@ -855,13 +876,28 @@ impl GpuQ8MatVec {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.context.inner.argmax_pipeline);
-                pass.set_bind_group(0, &chunk.argmax_bind_group, &[]);
+                pass.set_bind_group(
+                    0,
+                    chunk
+                        .argmax_bind_group
+                        .as_ref()
+                        .ok_or_else(|| "GPU Q8 argmax bind group was not attached".to_string())?,
+                    &[],
+                );
                 pass.dispatch_workgroups(chunk.argmax_results as u32, 1, 1);
             }
+            let argmax_buffer = chunk
+                .argmax_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 argmax output buffer was not attached".to_string())?;
+            let argmax_readback = chunk
+                .argmax_readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 argmax readback buffer was not attached".to_string())?;
             encoder.copy_buffer_to_buffer(
-                &chunk.argmax_buffer,
+                argmax_buffer,
                 0,
-                &chunk.argmax_readback_buffer,
+                argmax_readback,
                 0,
                 argmax_bytes_len(chunk.argmax_results),
             );
@@ -870,7 +906,11 @@ impl GpuQ8MatVec {
 
         let mut receivers = Vec::new();
         for (chunk_idx, chunk) in self.chunks.iter().enumerate() {
-            let slice = chunk.argmax_readback_buffer.slice(..);
+            let slice = chunk
+                .argmax_readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 argmax readback buffer was not attached".to_string())?
+                .slice(..);
             let (tx, rx) = mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send((chunk_idx, result.map_err(|e| e.to_string())));
@@ -890,7 +930,11 @@ impl GpuQ8MatVec {
 
         let mut best: Option<GpuArgmaxResult> = None;
         for chunk in &self.chunks {
-            let slice = chunk.argmax_readback_buffer.slice(..);
+            let argmax_readback = chunk
+                .argmax_readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 argmax readback buffer was not attached".to_string())?;
+            let slice = argmax_readback.slice(..);
             let mapped = slice.get_mapped_range();
             let results = bytemuck::cast_slice::<u8, GpuArgmaxResult>(&mapped);
             for &result in results {
@@ -902,7 +946,7 @@ impl GpuQ8MatVec {
                 }
             }
             drop(mapped);
-            chunk.argmax_readback_buffer.unmap();
+            argmax_readback.unmap();
         }
         best.map(|result| result.index)
             .ok_or_else(|| "GPU Q8 argmax has no chunks".to_string())
@@ -940,12 +984,45 @@ impl GpuQ8MatVec {
         let input = x_std
             .as_slice()
             .ok_or_else(|| "GPU Q8 matvec input is not contiguous".to_string())?;
-        for matvec in matvecs {
-            matvec.context.inner.queue.write_buffer(
-                &matvec.input_buffer,
-                0,
-                bytemuck::cast_slice(input),
+        let outputs = Self::forward_many_same_input_raw(matvecs, input)?;
+        let mut tensors = Vec::with_capacity(matvecs.len());
+        for (matvec, output) in matvecs.iter().zip(outputs) {
+            tensors.push(
+                Tensor::from_f32_vec(&[1, matvec.out_features], output)
+                    .map_err(|e| e.to_string())?,
             );
+        }
+        Ok(tensors)
+    }
+
+    pub fn forward_many_same_input_raw(
+        matvecs: &[&GpuQ8MatVec],
+        input: &[f32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if matvecs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = matvecs[0];
+        if input.len() != first.in_features {
+            return Err(format!(
+                "GPU Q8 matvec raw input expects {} values, got {}",
+                first.in_features,
+                input.len()
+            ));
+        }
+        if matvecs.iter().any(|matvec| matvec.input_buffer.is_none()) {
+            return Err("GPU Q8 matvec batch requires standalone input buffers".to_string());
+        }
+        for matvec in matvecs {
+            let input_buffer = matvec
+                .input_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 matvec input buffer was released".to_string())?;
+            matvec
+                .context
+                .inner
+                .queue
+                .write_buffer(input_buffer, 0, bytemuck::cast_slice(input));
         }
 
         let mut encoder =
@@ -964,13 +1041,24 @@ impl GpuQ8MatVec {
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(&first.context.inner.q8_matvec_pipeline);
-                    pass.set_bind_group(0, &chunk.bind_group, &[]);
+                    pass.set_bind_group(
+                        0,
+                        chunk
+                            .bind_group
+                            .as_ref()
+                            .ok_or_else(|| "GPU Q8 matvec bind group was released".to_string())?,
+                        &[],
+                    );
                     pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
                 }
+                let readback_buffer = chunk
+                    .readback_buffer
+                    .as_ref()
+                    .ok_or_else(|| "GPU Q8 matvec readback buffer was released".to_string())?;
                 encoder.copy_buffer_to_buffer(
                     &chunk.output_buffer,
                     0,
-                    &chunk.readback_buffer,
+                    readback_buffer,
                     0,
                     bytes_len(chunk.out_features),
                 );
@@ -981,7 +1069,11 @@ impl GpuQ8MatVec {
         let mut receivers = Vec::new();
         for (matvec_idx, matvec) in matvecs.iter().enumerate() {
             for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
-                let slice = chunk.readback_buffer.slice(..);
+                let slice = chunk
+                    .readback_buffer
+                    .as_ref()
+                    .ok_or_else(|| "GPU Q8 matvec readback buffer was released".to_string())?
+                    .slice(..);
                 let (tx, rx) = mpsc::channel();
                 slice.map_async(wgpu::MapMode::Read, move |result| {
                     let _ = tx.send((matvec_idx, chunk_idx, result.map_err(|e| e.to_string())));
@@ -1005,18 +1097,19 @@ impl GpuQ8MatVec {
         for matvec in matvecs {
             let mut output = vec![0f32; matvec.out_features];
             for chunk in &matvec.chunks {
-                let slice = chunk.readback_buffer.slice(..);
+                let readback_buffer = chunk
+                    .readback_buffer
+                    .as_ref()
+                    .ok_or_else(|| "GPU Q8 matvec readback buffer was released".to_string())?;
+                let slice = readback_buffer.slice(..);
                 let mapped = slice.get_mapped_range();
                 let values = bytemuck::cast_slice::<u8, f32>(&mapped);
                 output[chunk.out_offset..chunk.out_offset + chunk.out_features]
                     .copy_from_slice(values);
                 drop(mapped);
-                chunk.readback_buffer.unmap();
+                readback_buffer.unmap();
             }
-            outputs.push(
-                Tensor::from_f32_vec(&[1, matvec.out_features], output)
-                    .map_err(|e| e.to_string())?,
-            );
+            outputs.push(output);
         }
         Ok(outputs)
     }
@@ -1117,6 +1210,36 @@ impl GpuQ8SameInputBatch {
         let input = x_std
             .as_slice()
             .ok_or_else(|| "GPU Q8 shared-input batch input is not contiguous".to_string())?;
+        let outputs = self.forward_raw(matvecs, input)?;
+        let mut tensors = Vec::with_capacity(matvecs.len());
+        for (matvec, output) in matvecs.iter().zip(outputs) {
+            tensors.push(
+                Tensor::from_f32_vec(&[1, matvec.out_features], output)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(tensors)
+    }
+
+    pub fn forward_raw(
+        &self,
+        matvecs: &[&GpuQ8MatVec],
+        input: &[f32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if matvecs.len() != self.bind_groups.len() {
+            return Err(format!(
+                "GPU Q8 shared-input batch expected {} matvecs, got {}",
+                self.bind_groups.len(),
+                matvecs.len()
+            ));
+        }
+        if input.len() != self.in_features {
+            return Err(format!(
+                "GPU Q8 shared-input batch raw input expects {} values, got {}",
+                self.in_features,
+                input.len()
+            ));
+        }
         self.context
             .inner
             .queue
@@ -1144,10 +1267,13 @@ impl GpuQ8SameInputBatch {
         }
         for matvec in matvecs {
             for chunk in &matvec.chunks {
+                let readback_buffer = chunk.readback_buffer.as_ref().ok_or_else(|| {
+                    "GPU Q8 shared-input batch readback buffer was released".to_string()
+                })?;
                 encoder.copy_buffer_to_buffer(
                     &chunk.output_buffer,
                     0,
-                    &chunk.readback_buffer,
+                    readback_buffer,
                     0,
                     bytes_len(chunk.out_features),
                 );
@@ -1158,7 +1284,13 @@ impl GpuQ8SameInputBatch {
         let mut receivers = Vec::new();
         for (matvec_idx, matvec) in matvecs.iter().enumerate() {
             for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
-                let slice = chunk.readback_buffer.slice(..);
+                let slice = chunk
+                    .readback_buffer
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "GPU Q8 shared-input batch readback buffer was released".to_string()
+                    })?
+                    .slice(..);
                 let (tx, rx) = mpsc::channel();
                 slice.map_async(wgpu::MapMode::Read, move |result| {
                     let _ = tx.send((matvec_idx, chunk_idx, result.map_err(|e| e.to_string())));
@@ -1181,18 +1313,18 @@ impl GpuQ8SameInputBatch {
         for matvec in matvecs {
             let mut output = vec![0f32; matvec.out_features];
             for chunk in &matvec.chunks {
-                let slice = chunk.readback_buffer.slice(..);
+                let readback_buffer = chunk.readback_buffer.as_ref().ok_or_else(|| {
+                    "GPU Q8 shared-input batch readback buffer was released".to_string()
+                })?;
+                let slice = readback_buffer.slice(..);
                 let mapped = slice.get_mapped_range();
                 let values = bytemuck::cast_slice::<u8, f32>(&mapped);
                 output[chunk.out_offset..chunk.out_offset + chunk.out_features]
                     .copy_from_slice(values);
                 drop(mapped);
-                chunk.readback_buffer.unmap();
+                readback_buffer.unmap();
             }
-            outputs.push(
-                Tensor::from_f32_vec(&[1, matvec.out_features], output)
-                    .map_err(|e| e.to_string())?,
-            );
+            outputs.push(output);
         }
         Ok(outputs)
     }
@@ -1353,9 +1485,45 @@ impl GpuQ8SwiGluDown {
         validate_q8_swiglu_down_matvecs(gate, up, down)?;
 
         let device = &gate.context.inner.device;
+        let shared_input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rsinfer-q8-swiglu-shared-input"),
+            size: bytes_len(gate.in_features),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let down_input_buffer = down
+            .input_buffer
+            .as_ref()
+            .ok_or_else(|| "GPU Q8 fused MLP down input buffer was released".to_string())?;
         let mut bind_groups = Vec::with_capacity(gate.chunks.len());
+        let mut gate_bind_groups = Vec::with_capacity(gate.chunks.len());
+        let mut up_bind_groups = Vec::with_capacity(up.chunks.len());
         let mut params_buffers = Vec::with_capacity(gate.chunks.len());
-        for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
+        for ((gate_chunk, up_chunk), down_chunk) in
+            gate.chunks.iter().zip(&up.chunks).zip(&down.chunks)
+        {
+            gate_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rsinfer-q8-swiglu-gate-bind-group"),
+                layout: &gate.context.inner.q8_matvec_bind_group_layout,
+                entries: &[
+                    buffer_entry(0, &shared_input_buffer),
+                    buffer_entry(1, &gate_chunk._qweight_buffer),
+                    buffer_entry(2, &gate_chunk._scales_buffer),
+                    buffer_entry(3, &gate_chunk.output_buffer),
+                    buffer_entry(4, &gate_chunk._params_buffer),
+                ],
+            }));
+            up_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rsinfer-q8-swiglu-up-bind-group"),
+                layout: &gate.context.inner.q8_matvec_bind_group_layout,
+                entries: &[
+                    buffer_entry(0, &shared_input_buffer),
+                    buffer_entry(1, &up_chunk._qweight_buffer),
+                    buffer_entry(2, &up_chunk._scales_buffer),
+                    buffer_entry(3, &up_chunk.output_buffer),
+                    buffer_entry(4, &up_chunk._params_buffer),
+                ],
+            }));
             let params = [
                 gate_chunk.out_offset as u32,
                 gate_chunk.out_features as u32,
@@ -1373,19 +1541,22 @@ impl GpuQ8SwiGluDown {
                 entries: &[
                     buffer_entry(0, &gate_chunk.output_buffer),
                     buffer_entry(1, &up_chunk.output_buffer),
-                    buffer_entry(2, &down.input_buffer),
+                    buffer_entry(2, down_input_buffer),
                     buffer_entry(3, &params_buffer),
                 ],
             });
             params_buffers.push(params_buffer);
             bind_groups.push(GpuSwiGluBindGroup {
                 bind_group,
-                out_features: gate_chunk.out_features,
+                out_features: down_chunk.out_features,
             });
         }
 
         Ok(Self {
             context: gate.context.clone(),
+            shared_input_buffer,
+            gate_bind_groups,
+            up_bind_groups,
             bind_groups,
             _params_buffers: params_buffers,
         })
@@ -1399,37 +1570,53 @@ impl GpuQ8SwiGluDown {
         x: &Tensor,
     ) -> Result<Tensor, String> {
         validate_q8_swiglu_down_inputs(gate, up, down, x)?;
+        let x_std = x.data.as_standard_layout();
+        let input = x_std
+            .as_slice()
+            .ok_or_else(|| "GPU Q8 fused MLP input is not contiguous".to_string())?;
+        let output = self.forward_raw(gate, up, down, input)?;
+        Tensor::from_f32_vec(&[1, down.out_features], output).map_err(|e| e.to_string())
+    }
+
+    pub fn forward_raw(
+        &self,
+        gate: &GpuQ8MatVec,
+        up: &GpuQ8MatVec,
+        down: &GpuQ8MatVec,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        validate_q8_swiglu_down_matvecs(gate, up, down)?;
         if !Arc::ptr_eq(&self.context.inner, &gate.context.inner) {
             return Err(
                 "GPU Q8 fused MLP cached resources require the original GpuContext".to_string(),
             );
         }
-
-        let x_std = x.data.as_standard_layout();
-        let input = x_std
-            .as_slice()
-            .ok_or_else(|| "GPU Q8 fused MLP input is not contiguous".to_string())?;
-        for matvec in [gate, up] {
-            matvec.context.inner.queue.write_buffer(
-                &matvec.input_buffer,
-                0,
-                bytemuck::cast_slice(input),
-            );
+        if input.len() != gate.in_features {
+            return Err(format!(
+                "GPU Q8 fused MLP raw input expects {} values, got {}",
+                gate.in_features,
+                input.len()
+            ));
         }
+        self.context.inner.queue.write_buffer(
+            &self.shared_input_buffer,
+            0,
+            bytemuck::cast_slice(input),
+        );
 
         let device = &self.context.inner.device;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rsinfer-q8-fused-mlp-encoder"),
         });
-        for matvec in [gate, up] {
-            for chunk in &matvec.chunks {
+        for bind_groups in [&self.gate_bind_groups, &self.up_bind_groups] {
+            for (chunk_idx, bind_group) in bind_groups.iter().enumerate() {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("rsinfer-q8-fused-mlp-gate-up-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
-                pass.set_bind_group(0, &chunk.bind_group, &[]);
-                pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(gate.chunks[chunk_idx].out_features as u32, 1, 1);
             }
         }
         for cached in &self.bind_groups {
@@ -1449,13 +1636,23 @@ impl GpuQ8SwiGluDown {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
-                pass.set_bind_group(0, &chunk.bind_group, &[]);
+                pass.set_bind_group(
+                    0,
+                    chunk.bind_group.as_ref().ok_or_else(|| {
+                        "GPU Q8 fused MLP down bind group was released".to_string()
+                    })?,
+                    &[],
+                );
                 pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
             }
+            let readback_buffer = chunk
+                .readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 fused MLP down readback buffer was released".to_string())?;
             encoder.copy_buffer_to_buffer(
                 &chunk.output_buffer,
                 0,
-                &chunk.readback_buffer,
+                readback_buffer,
                 0,
                 bytes_len(chunk.out_features),
             );
@@ -1464,7 +1661,11 @@ impl GpuQ8SwiGluDown {
 
         let mut receivers = Vec::new();
         for (chunk_idx, chunk) in down.chunks.iter().enumerate() {
-            let slice = chunk.readback_buffer.slice(..);
+            let slice = chunk
+                .readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 fused MLP down readback buffer was released".to_string())?
+                .slice(..);
             let (tx, rx) = mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send((chunk_idx, result.map_err(|e| e.to_string())));
@@ -1484,15 +1685,19 @@ impl GpuQ8SwiGluDown {
 
         let mut output = vec![0f32; down.out_features];
         for chunk in &down.chunks {
-            let slice = chunk.readback_buffer.slice(..);
+            let readback_buffer = chunk
+                .readback_buffer
+                .as_ref()
+                .ok_or_else(|| "GPU Q8 fused MLP down readback buffer was released".to_string())?;
+            let slice = readback_buffer.slice(..);
             let mapped = slice.get_mapped_range();
             let values = bytemuck::cast_slice::<u8, f32>(&mapped);
             output[chunk.out_offset..chunk.out_offset + chunk.out_features].copy_from_slice(values);
             drop(mapped);
-            chunk.readback_buffer.unmap();
+            readback_buffer.unmap();
         }
 
-        Tensor::from_f32_vec(&[1, down.out_features], output).map_err(|e| e.to_string())
+        Ok(output)
     }
 }
 
@@ -1706,23 +1911,34 @@ fn create_q8_chunk(
     words_per_row: usize,
     out_offset: usize,
     out_features: usize,
+    enable_argmax: bool,
 ) -> GpuQ8MatVecChunk {
     let device = &context.device;
-    let mut packed = vec![0u32; out_features * words_per_row];
-    for row in 0..out_features {
-        let src_row = out_offset + row;
-        let src_start = src_row * weight.in_features;
-        let dst_start = row * words_per_row;
-        pack_i8_row_to_u32(
-            &weight.qweight[src_start..src_start + weight.in_features],
-            &mut packed[dst_start..dst_start + words_per_row],
-        );
-    }
-    let qweight_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("rsinfer-q8-matvec-weight-chunk"),
-        contents: bytemuck::cast_slice(&packed),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let qweight_buffer = if weight.in_features.is_multiple_of(4) {
+        let src_start = out_offset * weight.in_features;
+        let src_end = src_start + out_features * weight.in_features;
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rsinfer-q8-matvec-weight-chunk"),
+            contents: bytemuck::cast_slice(&weight.qweight[src_start..src_end]),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    } else {
+        let mut packed = vec![0u32; out_features * words_per_row];
+        for row in 0..out_features {
+            let src_row = out_offset + row;
+            let src_start = src_row * weight.in_features;
+            let dst_start = row * words_per_row;
+            pack_i8_row_to_u32(
+                &weight.qweight[src_start..src_start + weight.in_features],
+                &mut packed[dst_start..dst_start + words_per_row],
+            );
+        }
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rsinfer-q8-matvec-weight-chunk"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
     let scales_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("rsinfer-q8-matvec-scales-chunk"),
         contents: bytemuck::cast_slice(&weight.scales[out_offset..out_offset + out_features]),
@@ -1740,19 +1956,11 @@ fn create_q8_chunk(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let argmax_results = (out_features as u32).div_ceil(WORKGROUP_SIZE) as usize;
-    let argmax_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rsinfer-q8-argmax-result-chunk"),
-        size: argmax_bytes_len(argmax_results),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let argmax_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rsinfer-q8-argmax-readback-chunk"),
-        size: argmax_bytes_len(argmax_results),
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let argmax_results = if enable_argmax {
+        (out_features as u32).div_ceil(WORKGROUP_SIZE) as usize
+    } else {
+        0
+    };
     let params = [
         weight.in_features as u32,
         out_features as u32,
@@ -1762,17 +1970,6 @@ fn create_q8_chunk(
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("rsinfer-q8-matvec-params-chunk"),
         contents: bytemuck::cast_slice(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let argmax_params = [
-        weight.in_features as u32,
-        out_features as u32,
-        words_per_row as u32,
-        out_offset as u32,
-    ];
-    let argmax_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("rsinfer-q8-argmax-params-chunk"),
-        contents: bytemuck::cast_slice(&argmax_params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1786,25 +1983,60 @@ fn create_q8_chunk(
             buffer_entry(4, &params_buffer),
         ],
     });
-    let argmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("rsinfer-q8-argmax-bind-group-chunk"),
-        layout: &context.argmax_bind_group_layout,
-        entries: &[
-            buffer_entry(0, input_buffer),
-            buffer_entry(1, &qweight_buffer),
-            buffer_entry(2, &scales_buffer),
-            buffer_entry(3, &argmax_buffer),
-            buffer_entry(4, &argmax_params_buffer),
-        ],
-    });
+    let (argmax_bind_group, argmax_buffer, argmax_readback_buffer, argmax_params_buffer) =
+        if argmax_results > 0 {
+            let argmax_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rsinfer-q8-argmax-result-chunk"),
+                size: argmax_bytes_len(argmax_results),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let argmax_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rsinfer-q8-argmax-readback-chunk"),
+                size: argmax_bytes_len(argmax_results),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let argmax_params = [
+                weight.in_features as u32,
+                out_features as u32,
+                words_per_row as u32,
+                out_offset as u32,
+            ];
+            let argmax_params_buffer =
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rsinfer-q8-argmax-params-chunk"),
+                    contents: bytemuck::cast_slice(&argmax_params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let argmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rsinfer-q8-argmax-bind-group-chunk"),
+                layout: &context.argmax_bind_group_layout,
+                entries: &[
+                    buffer_entry(0, input_buffer),
+                    buffer_entry(1, &qweight_buffer),
+                    buffer_entry(2, &scales_buffer),
+                    buffer_entry(3, &argmax_buffer),
+                    buffer_entry(4, &argmax_params_buffer),
+                ],
+            });
+            (
+                Some(argmax_bind_group),
+                Some(argmax_buffer),
+                Some(argmax_readback_buffer),
+                Some(argmax_params_buffer),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     GpuQ8MatVecChunk {
-        bind_group,
+        bind_group: Some(bind_group),
         argmax_bind_group,
         _qweight_buffer: qweight_buffer,
         _scales_buffer: scales_buffer,
         output_buffer,
-        readback_buffer,
+        readback_buffer: Some(readback_buffer),
         argmax_buffer,
         argmax_readback_buffer,
         _params_buffer: params_buffer,
@@ -1815,12 +2047,34 @@ fn create_q8_chunk(
     }
 }
 
+fn validate_q8_weight(weight: &Q8LinearWeight) -> Result<(), String> {
+    let expected = weight.out_features * weight.in_features;
+    if weight.qweight.len() != expected {
+        return Err(format!(
+            "GPU Q8 matvec qweight length mismatch: got {}, expected {}",
+            weight.qweight.len(),
+            expected
+        ));
+    }
+    if weight.scales.len() != weight.out_features {
+        return Err(format!(
+            "GPU Q8 matvec scale length mismatch: got {}, expected {}",
+            weight.scales.len(),
+            weight.out_features
+        ));
+    }
+    if weight.in_features == 0 || weight.out_features == 0 {
+        return Err("GPU Q8 matvec requires non-empty dimensions".to_string());
+    }
+    Ok(())
+}
+
 fn pack_i8_row_to_u32(input: &[i8], output: &mut [u32]) {
     output.fill(0);
     for (idx, &value) in input.iter().enumerate() {
         let word_idx = idx / 4;
         let shift = (idx % 4) * 8;
-        output[word_idx] |= (value as u8 as u32) << shift;
+        output[word_idx] |= ((value as u8) as u32) << shift;
     }
 }
 
@@ -2003,6 +2257,48 @@ mod tests {
     }
 
     #[test]
+    fn q8_shared_input_batch_survives_released_standalone_resources_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("shared-input GPU Q8 release test skipped: no usable wgpu adapter");
+            return;
+        };
+        let weight_a = [
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ];
+        let weight_b = [
+            f16::from_f32(-1.0),
+            f16::from_f32(0.5),
+            f16::from_f32(2.0),
+            f16::from_f32(-0.25),
+        ];
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.75, -1.25]).unwrap();
+        let q8_a = Q8LinearWeight::from_f16(&weight_a, 2, 2).unwrap();
+        let q8_b = Q8LinearWeight::from_f16(&weight_b, 2, 2).unwrap();
+        let cpu_a = linear_forward_q8(&x, &q8_a).unwrap();
+        let cpu_b = linear_forward_q8(&x, &q8_b).unwrap();
+        let mut gpu_a =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(&context, &q8_a, false).unwrap();
+        let mut gpu_b =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(&context, &q8_b, false).unwrap();
+        let batch = GpuQ8SameInputBatch::new(&[&gpu_a, &gpu_b]).unwrap();
+        gpu_a.release_standalone_forward_resources(true);
+        gpu_b.release_standalone_forward_resources(true);
+
+        assert!(GpuQ8MatVec::forward_many_same_input(&[&gpu_a], &x).is_err());
+        let outputs = batch.forward(&[&gpu_a, &gpu_b], &x).unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        for (expected, actual) in cpu_a.as_slice().iter().zip(outputs[0].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+        for (expected, actual) in cpu_b.as_slice().iter().zip(outputs[1].as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+    }
+    #[test]
     fn shared_context_can_drive_multiple_matvecs_when_available() {
         let Ok(context) = GpuContext::new() else {
             eprintln!("shared GPU context test skipped: no usable wgpu adapter");
@@ -2166,6 +2462,63 @@ mod tests {
         let up_gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &up_q8).unwrap();
         let down_gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &down_q8).unwrap();
         let fused = GpuQ8SwiGluDown::new(&gate_gpu, &up_gpu, &down_gpu).unwrap();
+        let got = fused.forward(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
+
+        for (expected, actual) in cpu.as_slice().iter().zip(got.as_slice()) {
+            assert!((expected - actual).abs() <= 1e-4);
+        }
+    }
+
+    #[test]
+    fn q8_fused_swiglu_down_survives_released_gate_up_resources_when_available() {
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("fused GPU Q8 release test skipped: no usable wgpu adapter");
+            return;
+        };
+        let gate_weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-1.0),
+            f16::from_f32(1.5),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.75),
+            f16::from_f32(0.5),
+        ];
+        let up_weight = [
+            f16::from_f32(1.0),
+            f16::from_f32(0.25),
+            f16::from_f32(-0.5),
+            f16::from_f32(0.75),
+            f16::from_f32(1.25),
+            f16::from_f32(-1.0),
+        ];
+        let down_weight = [
+            f16::from_f32(0.5),
+            f16::from_f32(-0.25),
+            f16::from_f32(1.0),
+            f16::from_f32(-1.5),
+            f16::from_f32(0.75),
+            f16::from_f32(0.25),
+        ];
+        let gate_q8 = Q8LinearWeight::from_f16(&gate_weight, 3, 2).unwrap();
+        let up_q8 = Q8LinearWeight::from_f16(&up_weight, 3, 2).unwrap();
+        let down_q8 = Q8LinearWeight::from_f16(&down_weight, 2, 3).unwrap();
+        let x = Tensor::from_f32_slice(&[1, 2], &[0.6, -1.4]).unwrap();
+        let gate = linear_forward_q8(&x, &gate_q8).unwrap();
+        let up = linear_forward_q8(&x, &up_q8).unwrap();
+        let hidden = silu(&gate).mul(&up).unwrap();
+        let cpu = linear_forward_q8(&hidden, &down_q8).unwrap();
+
+        let mut gate_gpu =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(&context, &gate_q8, false).unwrap();
+        let mut up_gpu =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(&context, &up_q8, false).unwrap();
+        let down_gpu =
+            GpuQ8MatVec::from_q8_weight_with_context_and_argmax(&context, &down_q8, false).unwrap();
+        let fused = GpuQ8SwiGluDown::new(&gate_gpu, &up_gpu, &down_gpu).unwrap();
+        gate_gpu.release_standalone_forward_resources(false);
+        up_gpu.release_standalone_forward_resources(false);
+
+        assert!(gate_gpu.forward(&x).is_err());
         let got = fused.forward(&gate_gpu, &up_gpu, &down_gpu, &x).unwrap();
 
         for (expected, actual) in cpu.as_slice().iter().zip(got.as_slice()) {
