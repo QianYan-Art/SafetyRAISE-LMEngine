@@ -4,6 +4,8 @@ param(
     [string]$SafetensorsModelDir,
 
     [string]$RsinferExe = "",
+    [string]$AExe = "",
+    [string]$BExe = "",
     [string]$AName = "hybrid-q8",
     [string]$BName = "resident-hybrid-q8",
     [switch]$AResident,
@@ -193,6 +195,16 @@ if ($RsinferExe) {
     }
     $resolvedRsinferExe = (Resolve-Path -LiteralPath $candidate).Path
 }
+$resolvedAExe = if ($AExe) {
+    Resolve-ExistingPath -Path $AExe -Name "AExe"
+} else {
+    $resolvedRsinferExe
+}
+$resolvedBExe = if ($BExe) {
+    Resolve-ExistingPath -Path $BExe -Name "BExe"
+} else {
+    $resolvedRsinferExe
+}
 
 $outputFull = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDir))
 if (Test-IsUnderPath -Candidate $outputFull -Parent $safetensorsDir) {
@@ -218,6 +230,8 @@ $bArgs = $commonArgs + $BExtraArgs
 Write-Host "A/B decode benchmark protocol:"
 Write-Host "  model: $safetensorsDir"
 Write-Host "  exe:   $resolvedRsinferExe"
+Write-Host "  A exe: $resolvedAExe"
+Write-Host "  B exe: $resolvedBExe"
 Write-Host "  prompt: $Prompt"
 Write-Host "  runs: $Runs each, interleaved; discard first run per variant"
 Write-Host "  decision: median avg_decode_forward_per_token; <= $TiePercent% is TIE"
@@ -236,8 +250,8 @@ if (-not $SkipGpuIdleCheck) {
 if ($DryRun) {
     Write-Host ""
     Write-Host "DryRun commands:"
-    Write-Host "  A: $(Format-Command -FilePath $resolvedRsinferExe -Arguments $aArgs)"
-    Write-Host "  B: $(Format-Command -FilePath $resolvedRsinferExe -Arguments $bArgs)"
+    Write-Host "  A: $(Format-Command -FilePath $resolvedAExe -Arguments $aArgs)"
+    Write-Host "  B: $(Format-Command -FilePath $resolvedBExe -Arguments $bArgs)"
     exit 0
 }
 
@@ -248,14 +262,14 @@ $results = New-Object System.Collections.Generic.List[object]
 for ($i = 1; $i -le $Runs; $i++) {
     $results.Add((Invoke-RsinferVariant `
         -Variant "$AName-$i" `
-        -FilePath $resolvedRsinferExe `
+        -FilePath $resolvedAExe `
         -Arguments $aArgs `
         -Resident ([bool]$AResident) `
         -LogPath (Join-Path $outputFull "$runStamp-A-$i-$AName.log")))
 
     $results.Add((Invoke-RsinferVariant `
         -Variant "$BName-$i" `
-        -FilePath $resolvedRsinferExe `
+        -FilePath $resolvedBExe `
         -Arguments $bArgs `
         -Resident ([bool]$BResident) `
         -LogPath (Join-Path $outputFull "$runStamp-B-$i-$BName.log")))
@@ -282,6 +296,8 @@ $summary = [pscustomobject]@{
     repo_root = $repoRoot
     safetensors_model_dir = $safetensorsDir
     rsinfer_exe = $resolvedRsinferExe
+    a_exe = $resolvedAExe
+    b_exe = $resolvedBExe
     prompt = $Prompt
     max_tokens = $MaxTokens
     temperature = $Temperature

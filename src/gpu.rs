@@ -384,6 +384,135 @@ var<uniform> static_params: StaticParams;
 @group(0) @binding(5)
 var<uniform> dynamic_params: DynamicParams;
 
+var<workgroup> scores: array<f32, 2048>;
+var<workgroup> partial: array<f32, 64>;
+var<workgroup> shared_max: f32;
+var<workgroup> shared_sum: f32;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {
+    let head = workgroup_id.x;
+    if (head >= static_params.num_heads) {
+        return;
+    }
+
+    let lane = local_id.x;
+    let kv_head = head / static_params.kv_group_size;
+    let q_base = head * static_params.head_dim;
+    let cache_head_stride = static_params.max_len * static_params.head_dim;
+    let k_base = kv_head * cache_head_stride;
+    let v_base = kv_head * cache_head_stride;
+    let out_base = head * static_params.head_dim;
+    let seq_len_k = dynamic_params.position + 1u;
+
+    var local_max = -3.4028234663852886e38;
+    for (var pos = lane; pos < seq_len_k; pos = pos + 64u) {
+        let kv_row_base = pos * static_params.head_dim;
+        var score = 0.0;
+        for (var d = 0u; d < static_params.head_dim; d = d + 1u) {
+            score = score + q[q_base + d] * key[k_base + kv_row_base + d];
+        }
+        score = score * static_params.scale;
+        scores[pos] = score;
+        local_max = max(local_max, score);
+    }
+
+    partial[lane] = local_max;
+    workgroupBarrier();
+
+    var stride = 32u;
+    loop {
+        if (lane < stride) {
+            partial[lane] = max(partial[lane], partial[lane + stride]);
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+        shared_max = partial[0];
+    }
+    workgroupBarrier();
+
+    var local_sum = 0.0;
+    for (var pos = lane; pos < seq_len_k; pos = pos + 64u) {
+        let weight = exp(scores[pos] - shared_max);
+        scores[pos] = weight;
+        local_sum = local_sum + weight;
+    }
+    partial[lane] = local_sum;
+    workgroupBarrier();
+
+    stride = 32u;
+    loop {
+        if (lane < stride) {
+            partial[lane] = partial[lane] + partial[lane + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+        shared_sum = partial[0];
+    }
+    workgroupBarrier();
+
+    let inv_sum = 1.0 / shared_sum;
+    for (var d = lane; d < static_params.head_dim; d = d + 64u) {
+        var acc = 0.0;
+        for (var pos = 0u; pos < seq_len_k; pos = pos + 1u) {
+            acc = acc + scores[pos] * value[v_base + pos * static_params.head_dim + d];
+        }
+        output[out_base + d] = acc * inv_sum;
+    }
+}
+"#;
+
+const DECODE_GQA_ATTENTION_SERIAL_SHADER: &str = r#"
+struct StaticParams {
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_len: u32,
+    kv_group_size: u32,
+    scale: f32,
+    _pad0: u32,
+};
+
+struct DynamicParams {
+    position: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0)
+var<storage, read> q: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> key: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read> value: array<f32>;
+
+@group(0) @binding(3)
+var<storage, read_write> output: array<f32>;
+
+@group(0) @binding(4)
+var<uniform> static_params: StaticParams;
+
+@group(0) @binding(5)
+var<uniform> dynamic_params: DynamicParams;
+
 @compute @workgroup_size(1)
 fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
     let head = workgroup_id.x;
@@ -435,6 +564,8 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
     }
 }
 "#;
+
+const DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN: usize = 2048;
 
 const RESIDUAL_ADD_SHADER: &str = r#"
 struct Params {
@@ -759,6 +890,7 @@ struct GpuContextInner {
     kv_append_pipeline: wgpu::ComputePipeline,
     kv_append_bind_group_layout: wgpu::BindGroupLayout,
     decode_gqa_attention_pipeline: wgpu::ComputePipeline,
+    decode_gqa_attention_serial_pipeline: wgpu::ComputePipeline,
     decode_gqa_attention_bind_group_layout: wgpu::BindGroupLayout,
     residual_add_pipeline: wgpu::ComputePipeline,
     residual_add_bind_group_layout: wgpu::BindGroupLayout,
@@ -1205,6 +1337,11 @@ impl GpuContext {
                 label: Some("rsinfer-decode-gqa-attention"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DECODE_GQA_ATTENTION_SHADER)),
             });
+        let decode_gqa_attention_serial_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rsinfer-decode-gqa-attention-serial"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DECODE_GQA_ATTENTION_SERIAL_SHADER)),
+            });
         let decode_gqa_attention_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rsinfer-decode-gqa-attention-bind-layout"),
@@ -1246,6 +1383,15 @@ impl GpuContext {
                 label: Some("rsinfer-decode-gqa-attention-pipeline"),
                 layout: Some(&decode_gqa_attention_pipeline_layout),
                 module: &decode_gqa_attention_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let decode_gqa_attention_serial_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rsinfer-decode-gqa-attention-serial-pipeline"),
+                layout: Some(&decode_gqa_attention_pipeline_layout),
+                module: &decode_gqa_attention_serial_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -1436,6 +1582,7 @@ impl GpuContext {
                 kv_append_pipeline,
                 kv_append_bind_group_layout,
                 decode_gqa_attention_pipeline,
+                decode_gqa_attention_serial_pipeline,
                 decode_gqa_attention_bind_group_layout,
                 residual_add_pipeline,
                 residual_add_bind_group_layout,
@@ -3242,7 +3389,12 @@ impl GpuDecodeGqaAttention {
                 label: Some("rsinfer-decode-gqa-attention-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.context.inner.decode_gqa_attention_pipeline);
+            let pipeline = if seq_len_k <= DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN {
+                &self.context.inner.decode_gqa_attention_pipeline
+            } else {
+                &self.context.inner.decode_gqa_attention_serial_pipeline
+            };
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
         }
@@ -3479,7 +3631,12 @@ impl GpuDecodeGqaAttention {
                 "GPU decode GQA attention resident path requires shared GpuContext".to_string(),
             );
         }
-        pass.set_pipeline(&self.context.inner.decode_gqa_attention_pipeline);
+        let pipeline = if position < DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN {
+            &self.context.inner.decode_gqa_attention_pipeline
+        } else {
+            &self.context.inner.decode_gqa_attention_serial_pipeline
+        };
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &cache.bind_group, &[]);
         pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
         Ok(())
@@ -6126,6 +6283,72 @@ mod tests {
         assert!(
             max_abs <= 1e-4,
             "GPU decode GQA attention max abs diff {max_abs} exceeded tolerance"
+        );
+    }
+
+    #[test]
+    fn gpu_decode_gqa_attention_long_context_uses_serial_fallback_when_available() {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("GPU decode GQA attention long-context test skipped: no usable wgpu adapter");
+            return;
+        };
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 2usize;
+        let max_len = DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN + 2;
+        let seq_len_k = DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN + 1;
+        let q = vec![0.2, -0.4, 0.7, 0.1];
+
+        let mut key = vec![0.0f32; num_kv_heads * max_len * head_dim];
+        let mut value = vec![0.0f32; num_kv_heads * max_len * head_dim];
+        for pos in 0..seq_len_k {
+            let base = pos * head_dim;
+            key[base] = ((pos % 17) as f32 - 8.0) * 0.01;
+            key[base + 1] = ((pos % 23) as f32 - 11.0) * 0.01;
+            value[base] = ((pos % 29) as f32 - 14.0) * 0.02;
+            value[base + 1] = ((pos % 31) as f32 - 15.0) * 0.02;
+        }
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let expected = scaled_dot_product_attention_gqa_cached_decode_one_raw(
+            &q,
+            CachedAttention {
+                key: &key,
+                value: &value,
+                num_kv_heads,
+                seq_len_k,
+                head_dim,
+                max_len,
+            },
+            num_heads,
+            num_heads / num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        let gpu = GpuDecodeGqaAttention::with_context(
+            &context,
+            GpuDecodeGqaAttentionConfig {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_len,
+                scale,
+            },
+        )
+        .unwrap();
+        let got = gpu.forward_raw(&q, &key, &value, seq_len_k).unwrap();
+
+        let max_abs = expected
+            .iter()
+            .zip(&got)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs <= 1e-4,
+            "GPU decode GQA attention long-context fallback max abs diff {max_abs} exceeded tolerance"
         );
     }
 
