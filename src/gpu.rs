@@ -558,6 +558,71 @@ fn main(
 }
 "#;
 
+const Q8_MATVEC_VEC4_SHADER: &str = r#"
+struct Params {
+    in_features: u32,
+    out_features: u32,
+    words_per_row: u32,
+    _pad0: u32,
+};
+
+@group(0) @binding(0)
+var<storage, read> input: array<vec4<f32>>;
+
+@group(0) @binding(1)
+var<storage, read> qweight: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> scales: array<f32>;
+
+@group(0) @binding(3)
+var<storage, read_write> output: array<f32>;
+
+@group(0) @binding(4)
+var<uniform> params: Params;
+
+var<workgroup> partial_sum: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {
+    let out_idx = workgroup_id.x;
+    if (out_idx >= params.out_features) {
+        return;
+    }
+
+    var sum = 0.0;
+    let base = out_idx * params.words_per_row;
+    let lane = local_id.x;
+    let full_words = params.in_features / 4u;
+    for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
+        let weights = unpack4x8snorm(qweight[base + word_idx]) * 127.0;
+        sum = sum + dot(input[word_idx], weights);
+    }
+
+    partial_sum[lane] = sum;
+    workgroupBarrier();
+
+    var stride = 32u;
+    loop {
+        if (lane < stride) {
+            partial_sum[lane] = partial_sum[lane] + partial_sum[lane + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+        output[out_idx] = partial_sum[0] * scales[out_idx];
+    }
+}
+"#;
+
 const ARGMAX_SHADER: &str = r#"
 struct Params {
     in_features: u32,
@@ -698,6 +763,7 @@ struct GpuContextInner {
     residual_add_pipeline: wgpu::ComputePipeline,
     residual_add_bind_group_layout: wgpu::BindGroupLayout,
     q8_matvec_pipeline: wgpu::ComputePipeline,
+    q8_matvec_vec4_pipeline: wgpu::ComputePipeline,
     q8_matvec_bind_group_layout: wgpu::BindGroupLayout,
     argmax_pipeline: wgpu::ComputePipeline,
     argmax_bind_group_layout: wgpu::BindGroupLayout,
@@ -1228,6 +1294,10 @@ impl GpuContext {
             label: Some("rsinfer-q8-matvec"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(Q8_MATVEC_SHADER)),
         });
+        let q8_matvec_vec4_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rsinfer-q8-matvec-vec4"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(Q8_MATVEC_VEC4_SHADER)),
+        });
         let q8_matvec_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rsinfer-q8-matvec-bind-layout"),
@@ -1262,6 +1332,15 @@ impl GpuContext {
             compilation_options: Default::default(),
             cache: None,
         });
+        let q8_matvec_vec4_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rsinfer-q8-matvec-vec4-pipeline"),
+                layout: Some(&q8_matvec_pipeline_layout),
+                module: &q8_matvec_vec4_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         let argmax_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rsinfer-argmax"),
@@ -1361,6 +1440,7 @@ impl GpuContext {
                 residual_add_pipeline,
                 residual_add_bind_group_layout,
                 q8_matvec_pipeline,
+                q8_matvec_vec4_pipeline,
                 q8_matvec_bind_group_layout,
                 argmax_pipeline,
                 argmax_bind_group_layout,
@@ -3859,6 +3939,14 @@ impl GpuQ8MatVec {
             .all(|chunk| chunk.argmax_bind_group.is_some())
     }
 
+    fn matvec_pipeline(&self) -> &wgpu::ComputePipeline {
+        if self.in_features.is_multiple_of(4) {
+            &self.context.inner.q8_matvec_vec4_pipeline
+        } else {
+            &self.context.inner.q8_matvec_pipeline
+        }
+    }
+
     pub fn shared_context(&self) -> GpuContext {
         self.context.clone()
     }
@@ -4088,7 +4176,7 @@ impl GpuQ8MatVec {
                     label: Some("rsinfer-q8-matvec-resident-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+                pass.set_pipeline(self.matvec_pipeline());
                 pass.set_bind_group(0, &cache.bind_groups[chunk_idx], &[]);
                 pass.dispatch_workgroups(chunk.out_features as u32, 1, 1);
             }
@@ -4191,7 +4279,7 @@ impl GpuQ8MatVec {
                         label: Some("rsinfer-q8-matvec-pass"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&first.context.inner.q8_matvec_pipeline);
+                    pass.set_pipeline(matvec.matvec_pipeline());
                     pass.set_bind_group(
                         0,
                         chunk
@@ -4272,6 +4360,14 @@ impl GpuQ8MatVec {
 impl GpuQ8SameInputBatch {
     pub fn input_buffer(&self) -> &wgpu::Buffer {
         &self.input_buffer
+    }
+
+    fn matvec_pipeline(&self) -> &wgpu::ComputePipeline {
+        if self.in_features.is_multiple_of(4) {
+            &self.context.inner.q8_matvec_vec4_pipeline
+        } else {
+            &self.context.inner.q8_matvec_pipeline
+        }
     }
 
     pub fn encode_resident_input_copy(
@@ -4441,7 +4537,7 @@ impl GpuQ8SameInputBatch {
                 label: Some("rsinfer-q8-shared-input-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+            pass.set_pipeline(self.matvec_pipeline());
             for (matvec_idx, matvec) in matvecs.iter().enumerate() {
                 for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
                     pass.set_bind_group(0, &self.bind_groups[matvec_idx][chunk_idx], &[]);
@@ -4747,7 +4843,7 @@ impl GpuQ8SameInputBatch {
             }
         }
 
-        pass.set_pipeline(&self.context.inner.q8_matvec_pipeline);
+        pass.set_pipeline(self.matvec_pipeline());
         for (matvec_idx, matvec) in matvecs.iter().enumerate() {
             for (chunk_idx, chunk) in matvec.chunks.iter().enumerate() {
                 pass.set_bind_group(0, &cache.bind_groups[matvec_idx][chunk_idx], &[]);
@@ -5042,7 +5138,7 @@ impl GpuQ8SwiGluDown {
                     label: Some("rsinfer-q8-fused-mlp-gate-up-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+                pass.set_pipeline(gate.matvec_pipeline());
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(gate.chunks[chunk_idx].out_features as u32, 1, 1);
             }
@@ -5063,7 +5159,7 @@ impl GpuQ8SwiGluDown {
                     label: Some("rsinfer-q8-fused-mlp-down-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+                pass.set_pipeline(down.matvec_pipeline());
                 pass.set_bind_group(
                     0,
                     chunk.bind_group.as_ref().ok_or_else(|| {
@@ -5411,7 +5507,7 @@ impl GpuQ8SwiGluDown {
             ));
         }
 
-        pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+        pass.set_pipeline(gate.matvec_pipeline());
         for bind_groups in [&cache.gate_bind_groups, &cache.up_bind_groups] {
             for (chunk_idx, bind_group) in bind_groups.iter().enumerate() {
                 pass.set_bind_group(0, bind_group, &[]);
@@ -5424,7 +5520,7 @@ impl GpuQ8SwiGluDown {
             let workgroups = (cached.out_features as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        pass.set_pipeline(&gate.context.inner.q8_matvec_pipeline);
+        pass.set_pipeline(down.matvec_pipeline());
         for (chunk_idx, bind_group) in cache.down_bind_groups.iter().enumerate() {
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(down.chunks[chunk_idx].out_features as u32, 1, 1);

@@ -477,17 +477,26 @@ impl Qwen3Model {
                 state.resident_position.buffer(),
             )?;
         }
+        let prefix_encode_elapsed = prefix_start.elapsed();
+        let prefix_submit_start = std::time::Instant::now();
         context.submit(encoder);
+        let prefix_submit_elapsed = prefix_submit_start.elapsed();
         kv_cache.set_current_len(position_offset + 1)?;
         let resident_output = if gpu_prefix_len.is_multiple_of(2) {
             &state.resident_hidden_a
         } else {
             &state.resident_hidden_b
         };
+        let prefix_readback_start = std::time::Instant::now();
         hidden = resident_output
             .read_back()
             .map_err(RsinferError::DimensionError)?;
-        layer_profiles[gpu_prefix_len - 1].total += prefix_start.elapsed();
+        let prefix_readback_elapsed = prefix_readback_start.elapsed();
+        let profile = &mut layer_profiles[gpu_prefix_len - 1];
+        profile.resident_prefix_encode += prefix_encode_elapsed;
+        profile.resident_prefix_submit += prefix_submit_elapsed;
+        profile.resident_prefix_readback += prefix_readback_elapsed;
+        profile.total += prefix_start.elapsed();
 
         for (layer_idx, layer) in self.layers.iter().enumerate().skip(gpu_prefix_len) {
             hidden = layer.forward_profiled(

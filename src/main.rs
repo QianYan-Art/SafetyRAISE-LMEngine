@@ -455,7 +455,7 @@ fn generate_and_print(
     if profile_layers {
         for (idx, layer) in profile.layer_profiles.iter().enumerate() {
             println!(
-                "profile.layer_ms layer={} total={:.3} input_norm={:.3} attention={:.3} post_norm={:.3} mlp={:.3} mlp_gate_up={:.3} mlp_silu_mul={:.3} mlp_down_proj={:.3} mlp_q8_gate_up_prep={:.3} mlp_q8_gate_up_dot={:.3} mlp_q8_gate_up_writeback={:.3} mlp_q8_down_prep={:.3} mlp_q8_down_dot={:.3} mlp_q8_down_writeback={:.3} residual={:.3}",
+                "profile.layer_ms layer={} total={:.3} input_norm={:.3} attention={:.3} post_norm={:.3} mlp={:.3} mlp_gate_up={:.3} mlp_silu_mul={:.3} mlp_down_proj={:.3} mlp_q8_gate_up_prep={:.3} mlp_q8_gate_up_dot={:.3} mlp_q8_gate_up_writeback={:.3} mlp_q8_down_prep={:.3} mlp_q8_down_dot={:.3} mlp_q8_down_writeback={:.3} residual={:.3} resident_prefix_encode={:.3} resident_prefix_submit={:.3} resident_prefix_readback={:.3}",
                 idx,
                 layer.total.as_secs_f64() * 1000.0,
                 layer.input_norm.as_secs_f64() * 1000.0,
@@ -472,6 +472,9 @@ fn generate_and_print(
                 layer.mlp_q8_down_proj_dot.as_secs_f64() * 1000.0,
                 layer.mlp_q8_down_proj_writeback.as_secs_f64() * 1000.0,
                 layer.residual.as_secs_f64() * 1000.0,
+                layer.resident_prefix_encode.as_secs_f64() * 1000.0,
+                layer.resident_prefix_submit.as_secs_f64() * 1000.0,
+                layer.resident_prefix_readback.as_secs_f64() * 1000.0,
             );
         }
     }

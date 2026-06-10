@@ -1903,6 +1903,9 @@ pub struct TransformerBlockProfile {
     pub mlp_q8_down_proj_dot: Duration,
     pub mlp_q8_down_proj_writeback: Duration,
     pub residual: Duration,
+    pub resident_prefix_encode: Duration,
+    pub resident_prefix_submit: Duration,
+    pub resident_prefix_readback: Duration,
     pub total: Duration,
 }
 

@@ -180,6 +180,15 @@ fn diff_transformer_block_profile(
             .mlp_q8_down_proj_writeback
             .saturating_sub(before.mlp_q8_down_proj_writeback),
         residual: after.residual.saturating_sub(before.residual),
+        resident_prefix_encode: after
+            .resident_prefix_encode
+            .saturating_sub(before.resident_prefix_encode),
+        resident_prefix_submit: after
+            .resident_prefix_submit
+            .saturating_sub(before.resident_prefix_submit),
+        resident_prefix_readback: after
+            .resident_prefix_readback
+            .saturating_sub(before.resident_prefix_readback),
         total: after.total.saturating_sub(before.total),
     }
 }
