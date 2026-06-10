@@ -41,6 +41,8 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 cargo run --release -- --model-path <模型目录> --chat --interactive --device hybrid --quantization q8
 ```
 
+在 `--device auto|hybrid --quantization q8` 下，resident decode 默认开启；如需回到普通 hybrid 路径，可加 `--no-resident`。当前接受态是降级 V1：本机最终 A/B 中位数 `37.893 ms/token`（约 `26.39 tok/s`），已快于本项目普通 hybrid q8，但未达到原性能线 `<=33 ms/token`。64-token resident 精确等价仍有已记录差异，因此这里不宣称完整原 V1 达标。
+
 交互命令：`reset` 清空历史，`exit`/`quit` 退出。
 
 ### 修改模型路径
@@ -52,10 +54,10 @@ cargo run --release -- --model-path <模型目录> --chat --interactive --device
 3. 脚本内置的本机常用路径
 
 ```bat
-"%~dp0target\release\rsinfer.exe" --model-path "你的模型目录" --chat --interactive --max-tokens 1024 --device hybrid --quantization q8
+"%~dp0target\release\rsinfer.exe" --model-path "你的模型目录" --chat --interactive --max-tokens 1024 --device hybrid --quantization q8 --verbose
 ```
 
-脚本还会在缺少 `target\release\rsinfer.exe` 时自动执行 `cargo build --release`，并在 hybrid + q8 启动失败时允许一键回退到 CPU 模式。
+脚本还会在缺少 `target\release\rsinfer.exe` 时自动执行 `cargo build --release`，默认使用 hybrid + q8 + resident，并在启动失败时允许一键回退到 CPU 模式。需要关闭 resident 时可设置 `RSINFER_EXTRA_ARGS=--no-resident`。
 
 模型目录需包含 `config.json`、`tokenizer.json` 和 `model.safetensors`（或分片 + index.json）。
 
@@ -78,10 +80,11 @@ cargo run --release -- --model-path <模型目录> --chat --interactive --device
 | `--quantization` | 权重量化路径：`none` / `q8` | `none` |
 | `--q8-cache` | Q8 sidecar 缓存：`auto` / `off` | `auto` |
 | `--q8-cache-dir` | Q8 sidecar 目录；默认在模型目录同级创建 `<model>.rsinfer-q8` | — |
+| `--resident` / `--no-resident` | 强制开启 / 关闭 resident decode；hybrid+q8 默认开启 | 自动 |
 
 采样默认值对齐 Qwen3-Thinking 官方推荐（temp 0.6 / top-k 20 / top-p 0.95）。
 
-`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。对 `--quantization q8`，未显式传 `--gpu-layers` 时默认 offload 35 个 Transformer decode 层，这是基于本机 token profile 对 GPU+CPU 混合 decode 路径的选择；显式传 `--gpu-layers 0` 可回到只保留 `lm_head` GPU 路径。输出中的 `runtime.transformer_decode_gpu_layers` 和 `runtime.lm_head` 会标明实际 GPU/fallback 状态，尚未接入的 attention/KV/prefill 不会被误报成加速。
+`--device auto` / `--device hybrid` 会在 Windows 上通过 `nvidia-smi` 探测 NVIDIA GPU，并在 `--verbose` 模式打印 CPU/GPU 分层计划。`--gpu-layers` 会让前 N 个 Transformer 层的 decode 单 token 线性层通过共享 wgpu context 尝试 GPU matvec：`q/k/v` 同输入批量提交，MLP decode 在可用时把 `gate/up -> SwiGLU -> down_proj` 留在 GPU 路径中，只回读最终 MLP 输出；prefill 多 token 仍回退 CPU。`lm_head` 也复用同一个 wgpu context 做 GPU matvec。对 `--quantization q8`，未显式传 `--gpu-layers` 时默认 offload 35 个 Transformer decode 层，并默认开启 resident decode prefix：35 个 GPU 层的 decode RMSNorm/RoPE/KV append/attention/MLP 前缀留在 GPU resident 链里，最后 1 层仍走 CPU。显式传 `--gpu-layers 0` 或 `--no-resident` 可回到普通 hybrid 路径。输出中的 `runtime.transformer_decode_gpu_layers`、`runtime.lm_head` 和 `runtime.note` 会标明实际 GPU/fallback/resident 状态。
 
 `--quantization q8` 会在 safetensors 权重加载后，为 bias-free 线性层构建行级 Q8 权重；它不会修改原始模型文件。默认 `--q8-cache auto` 会在模型目录同级创建 sidecar 目录（例如 `TS-Qwen3.rsinfer-q8`），后续运行若模型 fingerprint 匹配就直接读取 Q8 sidecar，减少重复量化加载成本。当前 warm sidecar 路径还会尽量跳过 Transformer / `lm_head` 线性权重的大块原始 safetensors 读取，只保留 embedding 与各类 norm 的必要加载。`--q8-cache off` 会关闭 sidecar 并每次在内存中派生 Q8 权重。若同一个线性层已接入 Q8 GPU matvec 或 f16 GPU matvec，GPU 路径仍优先，Q8 CPU linear 是 fallback。
 
@@ -118,10 +121,10 @@ src/
 
 ## 已知限制与后续方向
 
-- 当前 prefill、attention 与 KV cache 仍走 CPU；选中 Transformer 层的 decode 线性 matvec、MLP fused SwiGLU/down 路径与 `lm_head` 可在 `auto`/`hybrid` 模式下尝试 wgpu GPU offload。
-- 无 batch、无 prompt 缓存复用；已支持显式 `--quantization q8` 的行级 Q8 权重、Q8 GPU matvec 原型和只读模型的 sidecar 缓存，但短基准中 Q8 路径仍未快过默认 f16/CPU 路径。
+- 当前 prefill、embedding 与采样仍走 CPU；hybrid+q8 默认 resident decode 只覆盖 decode 单 token 的 35 层 GPU 前缀，最后 1 层仍为 CPU fallback。
+- 无 batch、无 prompt 缓存复用；已支持 `--quantization q8` 的行级 Q8 权重、Q8 GPU matvec、resident decode 前缀和只读模型 sidecar 缓存。当前降级 V1 性能仍低于 llama.cpp F16/Q8_0 参考，后续优化应列入 V1.1+。
 - KV cache 用简单拼接（短序列下非瓶颈）。
-- 已有 GPU/CPU 运行时规划入口、decode 线性层 GPU matvec 和 `lm_head` GPU matvec；还没有 attention/KV/prefill GPU kernel。要生产级 GPU 推理仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
+- 已有 GPU/CPU 运行时规划入口、decode resident 前缀和 `lm_head` GPU matvec；还没有 prefill GPU kernel。要最高性能仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 
 ## 许可证
 

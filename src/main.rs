@@ -125,6 +125,14 @@ struct Args {
     /// Q8 sidecar 目录；默认使用模型目录旁的 <model>.rsinfer-q8
     #[arg(long = "q8-cache-dir")]
     q8_cache_dir: Option<PathBuf>,
+
+    /// 强制开启 resident decode；hybrid+q8 默认已开启
+    #[arg(long)]
+    resident: bool,
+
+    /// 显式关闭 resident decode，回到普通 hybrid/CPU 回退链
+    #[arg(long = "no-resident")]
+    no_resident: bool,
 }
 
 const IM_START: &str = "\x3c|im_start|>";
@@ -163,11 +171,18 @@ fn unescape(s: &str) -> String {
         .replace("\\\\", "\\")
 }
 
-fn internal_resident_decode_enabled() -> bool {
-    matches!(
-        std::env::var("RSINFER_INTERNAL_RESIDENT_DECODE_PROTOTYPE"),
-        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON")
-    )
+fn resident_decode_enabled(args: &Args) -> bool {
+    if args.no_resident {
+        return false;
+    }
+    if args.resident {
+        return true;
+    }
+    if let Ok(value) = std::env::var("RSINFER_INTERNAL_RESIDENT_DECODE_PROTOTYPE") {
+        return matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON");
+    }
+    matches!(args.device, DeviceArg::Auto | DeviceArg::Hybrid)
+        && matches!(args.quantization, QuantizationArg::Q8)
 }
 
 fn main() -> rsinfer::Result<()> {
@@ -181,7 +196,7 @@ fn main() -> rsinfer::Result<()> {
         quantization: args.quantization.into(),
         quantization_cache: args.q8_cache.into(),
         q8_cache_dir: args.q8_cache_dir.clone(),
-        internal_resident_decode_prototype: internal_resident_decode_enabled(),
+        internal_resident_decode_prototype: resident_decode_enabled(&args),
     };
     let generator = Generator::from_pretrained_with_options(&args.model_path, &runtime_options)?;
     println!("模型加载完成，耗时: {:.2}s", start.elapsed().as_secs_f32());

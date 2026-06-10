@@ -224,8 +224,10 @@ $commonArgs = @(
     "--profile-tokens",
     "--verbose"
 )
-$aArgs = $commonArgs + $AExtraArgs
-$bArgs = $commonArgs + $BExtraArgs
+$aResidentArgs = if ($AResident) { @("--resident") } else { @("--no-resident") }
+$bResidentArgs = if ($BResident) { @("--resident") } else { @("--no-resident") }
+$aArgs = $commonArgs + $aResidentArgs + $AExtraArgs
+$bArgs = $commonArgs + $bResidentArgs + $BExtraArgs
 
 Write-Host "A/B decode benchmark protocol:"
 Write-Host "  model: $safetensorsDir"

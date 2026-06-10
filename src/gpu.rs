@@ -565,7 +565,7 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
 }
 "#;
 
-const DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN: usize = 2048;
+const DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN: usize = 64;
 
 const RESIDUAL_ADD_SHADER: &str = r#"
 struct Params {

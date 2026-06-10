@@ -37,6 +37,8 @@ struct ResidentQwen3RuntimeState {
     hidden_size: usize,
 }
 
+const RESIDENT_DECODE_MAX_POSITION_EXCLUSIVE: usize = 48;
+
 impl Qwen3Model {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
         Self::from_pretrained_with_options(model_dir, &RuntimeOptions::default())
@@ -281,10 +283,22 @@ impl Qwen3Model {
             }
         }
 
+        let resident_decode_prototype = runtime_options.internal_resident_decode_prototype
+            && use_q8
+            && gpu_context.is_some()
+            && runtime_plan.transformer_decode_gpu_layers > 0;
         if runtime_options.internal_resident_decode_prototype {
-            runtime_plan
-                .notes
-                .push("Internal resident decode prototype path is enabled for decode-one GPU layers; default behavior remains unchanged when this flag is off.".to_string());
+            if resident_decode_prototype {
+                runtime_plan.notes.push(
+                    "Resident decode path is enabled for hybrid+q8 early decode-one GPU layers; later positions use regular hybrid fallback for long-generation stability."
+                        .to_string(),
+                );
+            } else {
+                runtime_plan.notes.push(
+                    "Resident decode requested but unavailable; using regular hybrid/CPU fallback path."
+                        .to_string(),
+                );
+            }
         }
 
         Ok(Self {
@@ -294,7 +308,7 @@ impl Qwen3Model {
             norm,
             lm_head,
             runtime_plan,
-            resident_decode_prototype: runtime_options.internal_resident_decode_prototype,
+            resident_decode_prototype,
             resident_runtime_state: RefCell::new(None),
         })
     }
@@ -303,8 +317,11 @@ impl Qwen3Model {
         self.lm_head.has_q8_gpu_argmax()
     }
 
-    fn resident_gpu_prefix_len(&self, input_ids: &[u32]) -> usize {
-        if !self.resident_decode_prototype || input_ids.len() != 1 {
+    fn resident_gpu_prefix_len(&self, input_ids: &[u32], position_offset: usize) -> usize {
+        if !self.resident_decode_prototype
+            || input_ids.len() != 1
+            || position_offset >= RESIDENT_DECODE_MAX_POSITION_EXCLUSIVE
+        {
             return 0;
         }
         self.runtime_plan
@@ -344,7 +361,7 @@ impl Qwen3Model {
         kv_cache: &mut KVCache,
         position_offset: usize,
     ) -> Result<Tensor> {
-        let gpu_prefix_len = self.resident_gpu_prefix_len(input_ids);
+        let gpu_prefix_len = self.resident_gpu_prefix_len(input_ids, position_offset);
         let mut hidden = self.embedding(input_ids)?;
         if gpu_prefix_len == 0 {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -365,7 +382,15 @@ impl Qwen3Model {
             })?;
         let context = q_proj.shared_context();
         let hidden_size = hidden.shape()[1];
-        self.ensure_resident_runtime_state(&context, hidden_size)?;
+        if self
+            .ensure_resident_runtime_state(&context, hidden_size)
+            .is_err()
+        {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward(&hidden, kv_cache, layer_idx, position_offset)?;
+            }
+            return Ok(hidden);
+        }
         let state_slot = self.resident_runtime_state.borrow();
         let state = state_slot
             .as_ref()
@@ -419,7 +444,7 @@ impl Qwen3Model {
         position_offset: usize,
         layer_profiles: &mut [TransformerBlockProfile],
     ) -> Result<Tensor> {
-        let gpu_prefix_len = self.resident_gpu_prefix_len(input_ids);
+        let gpu_prefix_len = self.resident_gpu_prefix_len(input_ids, position_offset);
         let mut hidden = self.embedding(input_ids)?;
         if gpu_prefix_len == 0 {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -446,7 +471,21 @@ impl Qwen3Model {
             })?;
         let context = q_proj.shared_context();
         let hidden_size = hidden.shape()[1];
-        self.ensure_resident_runtime_state(&context, hidden_size)?;
+        if self
+            .ensure_resident_runtime_state(&context, hidden_size)
+            .is_err()
+        {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward_profiled(
+                    &hidden,
+                    kv_cache,
+                    layer_idx,
+                    position_offset,
+                    &mut layer_profiles[layer_idx],
+                )?;
+            }
+            return Ok(hidden);
+        }
         let state_slot = self.resident_runtime_state.borrow();
         let state = state_slot
             .as_ref()
