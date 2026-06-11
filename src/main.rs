@@ -176,6 +176,8 @@ fn resident_decode_enabled(args: &Args) -> bool {
         return false;
     }
     args.resident
+        || (matches!(args.device, DeviceArg::Auto | DeviceArg::Hybrid)
+            && matches!(args.quantization, QuantizationArg::Q8))
 }
 
 fn main() -> rsinfer::Result<()> {

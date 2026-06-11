@@ -10,7 +10,7 @@ use std::process::Command;
 use crate::model::Qwen3Config;
 
 const MAX_ACTIVE_TRANSFORMER_GPU_LAYERS: usize = 35;
-const MAX_AUTO_TRANSFORMER_GPU_LAYERS: usize = 35;
+const MAX_AUTO_TRANSFORMER_GPU_LAYERS: usize = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevicePreference {
@@ -225,7 +225,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             if options.gpu_layers.is_none() {
                 if options.quantization == QuantizationMode::Q8 {
                     notes.push(
-                        "Q8 hybrid defaults transformer decode GPU layers to 35 on this local decode profile; pass --gpu-layers to override for explicit GPU+CPU decode testing."
+                        "Q8 hybrid defaults transformer decode GPU layers to 30 on this local decode profile to keep the verified resident path under the 7.5GiB VRAM gate; pass --gpu-layers to override for explicit GPU+CPU decode testing."
                             .to_string(),
                     );
                 } else {
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn q8_auto_estimate_uses_thirty_five_transformer_gpu_layers() {
+    fn q8_auto_estimate_uses_thirty_transformer_gpu_layers() {
         let mut config = test_config();
         config.num_hidden_layers = 36;
         let gpu = GpuInfo {
@@ -524,6 +524,6 @@ mod tests {
             driver_version: Some("1.0".to_string()),
         };
 
-        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 35);
+        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 30);
     }
 }

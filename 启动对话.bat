@@ -29,8 +29,8 @@ if errorlevel 1 (
 )
 
 echo [信息] 模型目录: "%MODEL_PATH%"
-echo [信息] 首选模式: chat + interactive + hybrid + q8 ^(resident 默认关闭^)
-echo [提示] 如需启用实验 resident，可设置 RSINFER_EXTRA_ARGS=--resident
+echo [信息] 首选模式: chat + interactive + hybrid + q8 ^(resident 默认开启^)
+echo [提示] 如需对照普通 hybrid，可设置 RSINFER_EXTRA_ARGS=--no-resident
 if defined RSINFER_EXTRA_ARGS (
     echo [信息] 额外参数: %RSINFER_EXTRA_ARGS%
 ) else (
