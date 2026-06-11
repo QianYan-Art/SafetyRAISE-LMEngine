@@ -60,6 +60,7 @@ impl FinalLayerTokenProfile {
 pub struct GenerationProfile {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    pub generated_token_ids: Vec<u32>,
     pub prefill_forward: Duration,
     pub prefill_sample: Duration,
     pub prefill_gpu_sync: GpuSyncStats,
@@ -361,6 +362,7 @@ impl Generator {
         }
 
         profile.generated_tokens = tokens.len();
+        profile.generated_token_ids = tokens.clone();
         let decode_start = Instant::now();
         let text = self.decode(&tokens)?;
         profile.text_decode += decode_start.elapsed();

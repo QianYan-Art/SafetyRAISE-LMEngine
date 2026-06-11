@@ -455,6 +455,15 @@ fn generate_and_print(
             profile.text_decode.as_secs_f64() * 1000.0,
             profile.avg_decode_forward_ms(),
         );
+        println!(
+            "profile.generated_token_ids {}",
+            profile
+                .generated_token_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
     if profile_token_trace {
         print_decode_forward_trace_summary(&profile);
