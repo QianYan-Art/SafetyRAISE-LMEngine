@@ -15,9 +15,9 @@ HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。当前已验
 
 ## 当前发布状态
 
-当前主线状态是 **V1.1 resident KV 修复后重定基线窗口**：`hybrid + q8` 默认开启 resident decode，并把本机默认 GPU offload 调整为 30 个 Transformer 层，以满足 7.5GiB VRAM 门槛。V1.1 Step 4 默认配置 256-token 协议 v2 A/B 显示 no-resident 中位数 `71.633 ms/token`，resident 中位数 `53.123 ms/token`，resident 胜出 `25.840%`；同配置 256-token `nvidia-smi` 采样峰值 `6983 MiB`。
+当前主线状态是 **V1.1 终验收留档窗口**：`hybrid + q8` 默认开启 resident decode，并把本机默认 GPU offload 调整为 30 个 Transformer 层，以满足 7.5GiB VRAM 门槛。V1.1 Step 5 后最终默认配置 256-token 协议 v2 A/B 显示 no-resident 中位数 `58.880 ms/token`，resident 中位数 `44.100 ms/token`，resident 胜出 `25.102%`；同配置 256-token `nvidia-smi` 采样峰值 `6983 MiB`。
 
-这个版本不是完整原始 V1：原计划 `<=33 ms/token` 尚未达成，后续 V1.1 提速刀仍以 256-token 协议 v2 长测为准。resident 的 48/64 KV 边界缺陷已修复；`--no-resident` 可用于对照普通 hybrid 路径，显式 `--gpu-layers` 可用于复现实验层数。
+这个版本不是完整原始 V1：原计划 `<=33 ms/token` 尚未达成，且终验收 `44.100 ms/token` 高于 V1.1 文档的 `>38 ms/token` 停止线。resident 的 48/64 KV 边界缺陷已修复；`--no-resident` 可用于对照普通 hybrid 路径，显式 `--gpu-layers` 可用于复现实验层数。
 
 ## 构建
 
@@ -47,7 +47,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 cargo run --release -- --model-path <模型目录> --chat --interactive --device hybrid --quantization q8
 ```
 
-在 `--device auto|hybrid --quantization q8` 下，默认使用 resident decode 路径；如需对照普通 hybrid，可显式加 `--no-resident`。当前接受态是 V1.1 Step 4 重定基线：默认 resident q8 256-token 中位数 `53.123 ms/token`，普通 hybrid q8 同配置中位数 `71.633 ms/token`，sentinel 全 PASS，VRAM 峰值 `6983 MiB`。这里不宣称完整原 V1 `<=33 ms/token` 达标。
+在 `--device auto|hybrid --quantization q8` 下，默认使用 resident decode 路径；如需对照普通 hybrid，可显式加 `--no-resident`。当前接受态是 V1.1 终验收留档：默认 resident q8 256-token 中位数 `44.100 ms/token`，普通 hybrid q8 同配置中位数 `58.880 ms/token`，sentinel 全 PASS，VRAM 峰值 `6983 MiB`。这里不宣称完整原 V1 `<=33 ms/token` 达标。
 
 交互命令：`reset` 清空历史，`exit`/`quit` 退出。
 
@@ -128,7 +128,7 @@ src/
 ## 已知限制与后续方向
 
 - 当前 prefill、embedding 与采样仍走 CPU；resident decode 覆盖 decode 单 token 的 GPU offload 前缀，默认 30 层 GPU + 6 层 CPU fallback。
-- 无 batch、无 prompt 缓存复用；已支持 `--quantization q8` 的行级 Q8 权重、Q8 GPU matvec、resident decode 前缀和只读模型 sidecar 缓存。当前 V1.1 重定基线性能仍低于 llama.cpp F16/Q8_0 参考，后续优化应继续按 V1.1 计划推进。
+- 无 batch、无 prompt 缓存复用；已支持 `--quantization q8` 的行级 Q8 权重、Q8 GPU matvec、resident decode 前缀和只读模型 sidecar 缓存。当前 V1.1 终验收性能仍低于 llama.cpp F16/Q8_0 参考，且超过 `>38 ms/token` 停止线。
 - KV cache 用简单拼接（短序列下非瓶颈）。
 - 已有 GPU/CPU 运行时规划入口、decode resident 前缀和 `lm_head` GPU matvec；还没有 prefill GPU kernel。要最高性能仍建议用 llama.cpp + 量化 GGUF 作为参考基线。
 
