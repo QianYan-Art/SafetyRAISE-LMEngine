@@ -565,7 +565,7 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
 }
 "#;
 
-const DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN: usize = 64;
+const DECODE_GQA_ATTENTION_PARALLEL_MAX_SEQ_LEN: usize = 2048;
 
 const RESIDUAL_ADD_SHADER: &str = r#"
 struct Params {
@@ -3395,6 +3395,90 @@ impl GpuDecodeGqaAttention {
                 &self.context.inner.decode_gqa_attention_serial_pipeline
             };
             pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.readback_buffer,
+            0,
+            bytes_len(q_expected),
+        );
+        self.context.inner.queue.submit(Some(encoder.finish()));
+        record_submit();
+
+        let slice = self.readback_buffer.slice(..);
+        let (tx, rx) = mpsc::channel();
+        record_map_read();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        record_poll_wait();
+        self.context
+            .inner
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("device poll failed: {e}"))?;
+        rx.recv()
+            .map_err(|e| format!("map callback failed: {e}"))??;
+
+        let mapped = slice.get_mapped_range();
+        let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+        drop(mapped);
+        self.readback_buffer.unmap();
+        Ok(values)
+    }
+
+    #[cfg(test)]
+    fn forward_raw_forced_parallel(
+        &self,
+        q: &[f32],
+        key: &[f32],
+        value: &[f32],
+        seq_len_k: usize,
+    ) -> Result<Vec<f32>, String> {
+        if seq_len_k == 0 || seq_len_k > self.max_len {
+            return Err(format!(
+                "GPU decode GQA attention seq_len_k {} exceeds max_len {}",
+                seq_len_k, self.max_len
+            ));
+        }
+        let q_expected = self.num_heads * self.head_dim;
+        let cache_expected = self.num_kv_heads * self.max_len * self.head_dim;
+        if q.len() != q_expected {
+            return Err(format!(
+                "GPU decode GQA attention q length mismatch: got {}, expected {}",
+                q.len(),
+                q_expected
+            ));
+        }
+        if key.len() != cache_expected || value.len() != cache_expected {
+            return Err(format!(
+                "GPU decode GQA attention cache length mismatch: got key={}, value={}, expected {}",
+                key.len(),
+                value.len(),
+                cache_expected
+            ));
+        }
+        write_buffer(&self.context.inner.queue, &self.q_buffer, 0, q);
+        write_buffer(&self.context.inner.queue, &self.key_buffer, 0, key);
+        write_buffer(&self.context.inner.queue, &self.value_buffer, 0, value);
+        self.write_position_buffer(&self.position_buffer, seq_len_k - 1);
+
+        let mut encoder =
+            self.context
+                .inner
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rsinfer-decode-gqa-attention-forced-parallel-encoder"),
+                });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsinfer-decode-gqa-attention-forced-parallel-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.context.inner.decode_gqa_attention_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
         }
@@ -6348,6 +6432,81 @@ mod tests {
             max_abs <= 1e-4,
             "GPU decode GQA attention long-context fallback max abs diff {max_abs} exceeded tolerance"
         );
+    }
+
+    #[test]
+    fn gpu_decode_gqa_attention_parallel_matches_cpu_for_long_contexts_when_available() {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("GPU decode GQA attention parallel long-context test skipped: no usable wgpu adapter");
+            return;
+        };
+        let num_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        for seq_len_k in [65usize, 128, 512, 2048] {
+            let max_len = seq_len_k;
+            let q = (0..num_heads * head_dim)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.03)
+                .collect::<Vec<_>>();
+
+            let mut key = vec![0.0f32; num_kv_heads * max_len * head_dim];
+            let mut value = vec![0.0f32; num_kv_heads * max_len * head_dim];
+            for kv_head in 0..num_kv_heads {
+                for pos in 0..seq_len_k {
+                    for dim in 0..head_dim {
+                        let idx = kv_head * max_len * head_dim + pos * head_dim + dim;
+                        key[idx] = (((pos + dim * 3 + kv_head * 5) % 31) as f32 - 15.0) * 0.01;
+                        value[idx] =
+                            (((pos * 2 + dim * 7 + kv_head * 11) % 37) as f32 - 18.0) * 0.015;
+                    }
+                }
+            }
+
+            let expected = scaled_dot_product_attention_gqa_cached_decode_one_raw(
+                &q,
+                CachedAttention {
+                    key: &key,
+                    value: &value,
+                    num_kv_heads,
+                    seq_len_k,
+                    head_dim,
+                    max_len,
+                },
+                num_heads,
+                num_heads / num_kv_heads,
+                head_dim,
+                scale,
+            )
+            .unwrap();
+
+            let gpu = GpuDecodeGqaAttention::with_context(
+                &context,
+                GpuDecodeGqaAttentionConfig {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    max_len,
+                    scale,
+                },
+            )
+            .unwrap();
+            let got = gpu
+                .forward_raw_forced_parallel(&q, &key, &value, seq_len_k)
+                .unwrap();
+
+            let max_abs = expected
+                .iter()
+                .zip(&got)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs <= 1e-4,
+                "GPU decode GQA attention forced-parallel seq_len_k={seq_len_k} max abs diff {max_abs} exceeded tolerance"
+            );
+        }
     }
 
     #[test]
