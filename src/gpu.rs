@@ -5179,9 +5179,7 @@ impl GpuQ8SwiGluDown {
         let mut gate_bind_groups = Vec::with_capacity(gate.chunks.len());
         let mut up_bind_groups = Vec::with_capacity(up.chunks.len());
         let mut params_buffers = Vec::with_capacity(gate.chunks.len());
-        for ((gate_chunk, up_chunk), down_chunk) in
-            gate.chunks.iter().zip(&up.chunks).zip(&down.chunks)
-        {
+        for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
             gate_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rsinfer-q8-swiglu-gate-bind-group"),
                 layout: &gate.context.inner.q8_matvec_bind_group_layout,
@@ -5228,7 +5226,7 @@ impl GpuQ8SwiGluDown {
             params_buffers.push(params_buffer);
             bind_groups.push(GpuSwiGluBindGroup {
                 bind_group,
-                out_features: down_chunk.out_features,
+                out_features: gate_chunk.out_features,
             });
         }
 
@@ -5486,9 +5484,7 @@ impl GpuQ8SwiGluDown {
         let mut swiglu_bind_groups = Vec::with_capacity(gate.chunks.len());
         let mut swiglu_params = Vec::with_capacity(gate.chunks.len());
         let mut down_bind_groups = Vec::with_capacity(down.chunks.len());
-        for ((gate_chunk, up_chunk), down_chunk) in
-            gate.chunks.iter().zip(&up.chunks).zip(&down.chunks)
-        {
+        for (gate_chunk, up_chunk) in gate.chunks.iter().zip(&up.chunks) {
             gate_bind_groups.push(self.context.inner.device.create_bind_group(
                 &wgpu::BindGroupDescriptor {
                     label: Some("rsinfer-q8-resident-cache-gate-bind-group"),
@@ -5547,8 +5543,10 @@ impl GpuQ8SwiGluDown {
             swiglu_params.push(params_buffer);
             swiglu_bind_groups.push(GpuSwiGluBindGroup {
                 bind_group,
-                out_features: down_chunk.out_features,
+                out_features: gate_chunk.out_features,
             });
+        }
+        for down_chunk in &down.chunks {
             down_bind_groups.push(self.context.inner.device.create_bind_group(
                 &wgpu::BindGroupDescriptor {
                     label: Some("rsinfer-q8-matvec-resident-output-bind-group"),
