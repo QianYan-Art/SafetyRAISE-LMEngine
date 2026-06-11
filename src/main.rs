@@ -126,7 +126,7 @@ struct Args {
     #[arg(long = "q8-cache-dir")]
     q8_cache_dir: Option<PathBuf>,
 
-    /// 强制开启 resident decode；hybrid+q8 默认已开启
+    /// 强制开启实验性的 resident decode
     #[arg(long)]
     resident: bool,
 
@@ -175,14 +175,7 @@ fn resident_decode_enabled(args: &Args) -> bool {
     if args.no_resident {
         return false;
     }
-    if args.resident {
-        return true;
-    }
-    if let Ok(value) = std::env::var("RSINFER_INTERNAL_RESIDENT_DECODE_PROTOTYPE") {
-        return matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON");
-    }
-    matches!(args.device, DeviceArg::Auto | DeviceArg::Hybrid)
-        && matches!(args.quantization, QuantizationArg::Q8)
+    args.resident
 }
 
 fn main() -> rsinfer::Result<()> {

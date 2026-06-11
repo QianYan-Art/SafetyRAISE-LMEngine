@@ -29,8 +29,8 @@ if errorlevel 1 (
 )
 
 echo [信息] 模型目录: "%MODEL_PATH%"
-echo [信息] 首选模式: chat + interactive + hybrid + q8 + resident
-echo [提示] 如需关闭 resident，可设置 RSINFER_EXTRA_ARGS=--no-resident
+echo [信息] 首选模式: chat + interactive + hybrid + q8 ^(resident 默认关闭^)
+echo [提示] 如需启用实验 resident，可设置 RSINFER_EXTRA_ARGS=--resident
 if defined RSINFER_EXTRA_ARGS (
     echo [信息] 额外参数: %RSINFER_EXTRA_ARGS%
 ) else (
@@ -43,7 +43,7 @@ set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="0" goto :finish
 
 echo.
-echo [警告] hybrid + q8 + resident 启动失败，退出码 %EXIT_CODE%。
+echo [警告] hybrid + q8 启动失败，退出码 %EXIT_CODE%。
 choice /c YN /n /m "是否自动回退到 CPU 模式重试? [Y/N] "
 if errorlevel 2 goto :finish
 
