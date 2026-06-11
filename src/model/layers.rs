@@ -481,6 +481,34 @@ impl ResidentAttentionRuntimeState {
             max_len,
         })
     }
+
+    fn copy_resident_kv_prefix_from(
+        &self,
+        context: &GpuContext,
+        old: &ResidentAttentionRuntimeState,
+        prefix_len: usize,
+        head_dim: usize,
+    ) -> std::result::Result<(), String> {
+        let copy_len = prefix_len.min(old.max_len).min(self.max_len);
+        if copy_len == 0 {
+            return Ok(());
+        }
+        let mut encoder = context.create_command_encoder("rsinfer-resident-kv-cache-grow-copy");
+        old.resident_key_cache.encode_copy_kv_prefix_to(
+            &mut encoder,
+            &self.resident_key_cache,
+            copy_len,
+            head_dim,
+        )?;
+        old.resident_value_cache.encode_copy_kv_prefix_to(
+            &mut encoder,
+            &self.resident_value_cache,
+            copy_len,
+            head_dim,
+        )?;
+        context.submit(encoder);
+        Ok(())
+    }
 }
 
 impl ResidentTransformerBlockRuntimeState {
@@ -1373,10 +1401,10 @@ impl Attention {
         position_offset: usize,
         position_buffer: &wgpu::Buffer,
     ) -> Result<()> {
-        let desired_max_len = cached_prefix
-            .as_ref()
-            .map(|cached| cached.capacity_len.max(position_offset + 1))
-            .unwrap_or_else(|| (position_offset + 1).max(64))
+        let required_len = (position_offset + 1).min(kv_cache.max_len());
+        let desired_max_len = required_len
+            .max(64)
+            .next_power_of_two()
             .min(kv_cache.max_len());
         let mut state_slot = self.resident_runtime_state.borrow_mut();
         let needs_rebuild = state_slot
@@ -1384,22 +1412,33 @@ impl Attention {
             .map(|state| state.max_len < desired_max_len)
             .unwrap_or(true);
         if needs_rebuild {
-            *state_slot = Some(
-                ResidentAttentionRuntimeState::new(
-                    context,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    desired_max_len,
-                    position_buffer,
-                    &self.q_norm.weight,
-                    &self.k_norm.weight,
-                    &self.rope_inv_freq,
-                    self.q_norm.eps,
-                    self.k_norm.eps,
-                )
-                .map_err(Self::gpu_error)?,
-            );
+            let old_state = state_slot.take();
+            let mut new_state = ResidentAttentionRuntimeState::new(
+                context,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                desired_max_len,
+                position_buffer,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                &self.rope_inv_freq,
+                self.q_norm.eps,
+                self.k_norm.eps,
+            )
+            .map_err(Self::gpu_error)?;
+            if let Some(old) = old_state.as_ref() {
+                if old.synced_cache_id == kv_cache.cache_id()
+                    && old.synced_cache_revision == kv_cache.revision()
+                {
+                    new_state
+                        .copy_resident_kv_prefix_from(context, old, position_offset, self.head_dim)
+                        .map_err(Self::gpu_error)?;
+                    new_state.synced_cache_id = old.synced_cache_id;
+                    new_state.synced_cache_revision = old.synced_cache_revision;
+                }
+            }
+            *state_slot = Some(new_state);
         }
         let state = state_slot
             .as_mut()

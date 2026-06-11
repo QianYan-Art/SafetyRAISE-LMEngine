@@ -37,8 +37,6 @@ struct ResidentQwen3RuntimeState {
     hidden_size: usize,
 }
 
-const RESIDENT_DECODE_MAX_POSITION_EXCLUSIVE: usize = 48;
-
 impl Qwen3Model {
     pub fn from_pretrained<P: AsRef<Path>>(model_dir: P) -> Result<Self> {
         Self::from_pretrained_with_options(model_dir, &RuntimeOptions::default())
@@ -290,7 +288,7 @@ impl Qwen3Model {
         if runtime_options.internal_resident_decode_prototype {
             if resident_decode_prototype {
                 runtime_plan.notes.push(
-                    "Resident decode path is enabled for hybrid+q8 early decode-one GPU layers; later positions use regular hybrid fallback for long-generation stability."
+                    "Resident decode path is enabled for hybrid+q8 decode-one GPU prefix layers across the full KV cache range."
                         .to_string(),
                 );
             } else {
@@ -317,11 +315,8 @@ impl Qwen3Model {
         self.lm_head.has_q8_gpu_argmax()
     }
 
-    fn resident_gpu_prefix_len(&self, input_ids: &[u32], position_offset: usize) -> usize {
-        if !self.resident_decode_prototype
-            || input_ids.len() != 1
-            || position_offset >= RESIDENT_DECODE_MAX_POSITION_EXCLUSIVE
-        {
+    fn resident_gpu_prefix_len(&self, input_ids: &[u32], _position_offset: usize) -> usize {
+        if !self.resident_decode_prototype || input_ids.len() != 1 {
             return 0;
         }
         self.runtime_plan

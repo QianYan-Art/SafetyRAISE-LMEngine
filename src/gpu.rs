@@ -4041,6 +4041,54 @@ impl GpuResidentBuffer {
         Ok(())
     }
 
+    pub fn encode_copy_kv_prefix_to(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        dest: &GpuResidentBuffer,
+        prefix_len: usize,
+        head_dim: usize,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.context.inner, &dest.context.inner) {
+            return Err("GPU resident KV copy requires shared GpuContext".to_string());
+        }
+        if self.shape.len() != 3 || dest.shape.len() != 3 {
+            return Err(format!(
+                "GPU resident KV copy expects [heads, max_len, head_dim], got src={:?}, dst={:?}",
+                self.shape, dest.shape
+            ));
+        }
+        if self.shape[0] != dest.shape[0] || self.shape[2] != head_dim || dest.shape[2] != head_dim
+        {
+            return Err(format!(
+                "GPU resident KV copy shape mismatch: src={:?}, dst={:?}, head_dim={head_dim}",
+                self.shape, dest.shape
+            ));
+        }
+        if prefix_len > self.shape[1] || prefix_len > dest.shape[1] {
+            return Err(format!(
+                "GPU resident KV copy prefix_len {prefix_len} exceeds src/dst max_len {}/{}",
+                self.shape[1], dest.shape[1]
+            ));
+        }
+        if prefix_len == 0 {
+            return Ok(());
+        }
+
+        let src_head_stride = self.shape[1] * head_dim;
+        let dst_head_stride = dest.shape[1] * head_dim;
+        let copy_elements = prefix_len * head_dim;
+        for head in 0..self.shape[0] {
+            encoder.copy_buffer_to_buffer(
+                &self.buffer,
+                bytes_len(head * src_head_stride),
+                &dest.buffer,
+                bytes_len(head * dst_head_stride),
+                bytes_len(copy_elements),
+            );
+        }
+        Ok(())
+    }
+
     pub fn read_back(&self) -> Result<Tensor, String> {
         let readback_buffer = self
             .context
@@ -6595,6 +6643,48 @@ mod tests {
             max_abs <= 1e-4,
             "GPU resident chain max abs diff {max_abs} exceeded tolerance"
         );
+    }
+
+    #[test]
+    fn resident_kv_prefix_copy_preserves_rows_when_capacity_grows() {
+        let _guard = gpu_test_guard();
+        let Ok(context) = GpuContext::new() else {
+            eprintln!("resident KV prefix copy test skipped: no usable wgpu adapter");
+            return;
+        };
+        let heads = 2usize;
+        let old_len = 64usize;
+        let new_len = 128usize;
+        let head_dim = 3usize;
+        let prefix_len = old_len;
+        let old_shape = [heads, old_len, head_dim];
+        let new_shape = [heads, new_len, head_dim];
+        let old_values = (0..heads * old_len * head_dim)
+            .map(|i| i as f32 * 0.25 - 7.0)
+            .collect::<Vec<_>>();
+        let old_tensor = Tensor::from_f32_vec(&old_shape, old_values).unwrap();
+        let old_buffer = GpuResidentBuffer::from_tensor(&context, &old_tensor).unwrap();
+        let new_buffer = GpuResidentBuffer::with_context(&context, &new_shape).unwrap();
+
+        let mut encoder = context.create_command_encoder("rsinfer-test-kv-prefix-grow-copy");
+        old_buffer
+            .encode_copy_kv_prefix_to(&mut encoder, &new_buffer, prefix_len, head_dim)
+            .unwrap();
+        context.submit(encoder);
+
+        let copied = new_buffer.read_back().unwrap();
+        let old_slice = old_tensor.as_slice();
+        let copied_slice = copied.as_slice();
+        for head in 0..heads {
+            let old_head_start = head * old_len * head_dim;
+            let new_head_start = head * new_len * head_dim;
+            let count = prefix_len * head_dim;
+            assert_eq!(
+                &copied_slice[new_head_start..new_head_start + count],
+                &old_slice[old_head_start..old_head_start + count],
+                "copied KV prefix mismatch for head {head}"
+            );
+        }
     }
 
     #[test]
