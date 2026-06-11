@@ -768,7 +768,7 @@ struct ArgmaxResult {
 };
 
 @group(0) @binding(0)
-var<storage, read> input: array<f32>;
+var<storage, read> input: array<vec4<f32>>;
 
 @group(0) @binding(1)
 var<storage, read> qweight: array<u32>;
@@ -782,39 +782,26 @@ var<storage, read_write> result: array<ArgmaxResult>;
 @group(0) @binding(4)
 var<uniform> params: Params;
 
-fn unpack_i8(word: u32, lane: u32) -> i32 {
-    let byte = (word >> (lane * 8u)) & 0xffu;
-    var signed = i32(byte);
-    if (byte >= 128u) {
-        signed = signed - 256;
-    }
-    return signed;
-}
-
-var<workgroup> local_idx: array<u32, 64>;
 var<workgroup> local_value: array<f32, 64>;
 
 @compute @workgroup_size(64)
 fn main(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {
-    let idx = global_id.x;
+    let idx = workgroup_id.x;
     let lane = local_id.x;
     if (idx < params.out_features) {
         var sum = 0.0;
         let base = idx * params.words_per_row;
-        for (var i = 0u; i < params.in_features; i = i + 1u) {
-            let word = qweight[base + (i / 4u)];
-            let q = unpack_i8(word, i & 3u);
-            sum = sum + input[i] * f32(q);
+        let full_words = params.in_features / 4u;
+        for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
+            let weights = unpack4x8snorm(qweight[base + word_idx]) * 127.0;
+            sum = sum + dot(input[word_idx], weights);
         }
-        local_idx[lane] = params.out_offset + idx;
-        local_value[lane] = sum * scales[idx];
+        local_value[lane] = sum;
     } else {
-        local_idx[lane] = params.out_offset;
-        local_value[lane] = -3.4028234663852886e38;
+        local_value[lane] = 0.0;
     }
     workgroupBarrier();
 
@@ -822,10 +809,7 @@ fn main(
     loop {
         if (lane < stride) {
             let other_lane = lane + stride;
-            if (local_value[other_lane] > local_value[lane]) {
-                local_value[lane] = local_value[other_lane];
-                local_idx[lane] = local_idx[other_lane];
-            }
+            local_value[lane] = local_value[lane] + local_value[other_lane];
         }
         workgroupBarrier();
         if (stride == 1u) {
@@ -835,8 +819,8 @@ fn main(
     }
 
     if (lane == 0u) {
-        result[workgroup_id.x].index = local_idx[0];
-        result[workgroup_id.x].value = local_value[0];
+        result[idx].index = params.out_offset + idx;
+        result[idx].value = local_value[0] * scales[idx];
     }
 }
 "#;
@@ -6071,11 +6055,7 @@ fn create_q8_chunk(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let argmax_results = if enable_argmax {
-        (out_features as u32).div_ceil(WORKGROUP_SIZE) as usize
-    } else {
-        0
-    };
+    let argmax_results = if enable_argmax { out_features } else { 0 };
     let params = [
         weight.in_features as u32,
         out_features as u32,
