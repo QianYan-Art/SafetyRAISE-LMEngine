@@ -15,9 +15,9 @@ HuggingFace `safetensors` 格式的 Qwen3（`Qwen3ForCausalLM`）。当前已验
 
 ## 当前发布状态
 
-当前主线状态是 **downgraded resident V1**：`hybrid + q8` 默认开启 resident decode，目标是给本机交互对话提供更快的默认路径。最终本机 A/B 中，普通 hybrid q8 中位数为 `47.886 ms/token`，resident q8 中位数为 `37.893 ms/token`（约 `26.39 tok/s`），性能提升约 `20.868%`。
+当前主线状态是 **downgraded resident V1**：`hybrid + q8` 默认开启 resident decode，目标是给本机交互对话提供更快的默认路径。2026-06-10 在修复 Q8 fused MLP chunk bug 后重新跑本机 A/B：普通 hybrid q8 中位数为 `43.777 ms/token`，resident q8 中位数为 `42.799 ms/token`（约 `23.37 tok/s`），resident 小幅胜出 `2.234%`。
 
-这个版本不是完整原始 V1：原计划 `<=33 ms/token` 尚未达成，且 64-token resident 与 `--no-resident` 贪心输出精确等价仍有已记录差异。需要严格回归普通 hybrid 行为时，请显式传 `--no-resident`。
+这个版本不是完整原始 V1：原计划 `<=33 ms/token` 尚未达成；最新 `你好` smoke 已确认 hybrid q8 no-resident / resident 不再重复循环，但需要严格回归普通 hybrid 行为时，请显式传 `--no-resident`。
 
 ## 构建
 
@@ -47,7 +47,7 @@ cargo run --release -- --model-path <模型目录> --chat --interactive
 cargo run --release -- --model-path <模型目录> --chat --interactive --device hybrid --quantization q8
 ```
 
-在 `--device auto|hybrid --quantization q8` 下，resident decode 默认开启；如需回到普通 hybrid 路径，可加 `--no-resident`。当前接受态是降级 V1：本机最终 A/B 中位数 `37.893 ms/token`（约 `26.39 tok/s`），已快于本项目普通 hybrid q8，但未达到原性能线 `<=33 ms/token`。64-token resident 精确等价仍有已记录差异，因此这里不宣称完整原 V1 达标。
+在 `--device auto|hybrid --quantization q8` 下，resident decode 默认开启；如需回到普通 hybrid 路径，可加 `--no-resident`。当前接受态是降级 V1：修复 Q8 fused MLP chunk bug 后，本机 A/B 中位数 `42.799 ms/token`（约 `23.37 tok/s`），小幅快于普通 hybrid q8 的 `43.777 ms/token`，但未达到原性能线 `<=33 ms/token`。这里不宣称完整原 V1 达标。
 
 交互命令：`reset` 清空历史，`exit`/`quit` 退出。
 
