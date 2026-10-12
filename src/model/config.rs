@@ -85,8 +85,23 @@ fn default_eos_token_id() -> u32 {
 impl Qwen3Config {
     /// 从 config.json 文件加载配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        if fs::metadata(path.as_ref())?.len() > 2 * 1024 * 1024 {
+            return Err(crate::RsinferError::ConfigError(
+                "模型配置超过大小上限".into(),
+            ));
+        }
         let content = fs::read_to_string(path.as_ref())?;
-        let mut config: Qwen3Config = serde_json::from_str(&content)?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)?;
+        let spec = super::spec::ModelSpec::from_hf(&value)?;
+        if spec.family != super::spec::ModelFamily::Qwen3 || spec.eos_token_ids.len() > 1 {
+            return Err(crate::RsinferError::Unsupported(
+                "旧本机执行器只支持单 EOS 的 Qwen3；请使用 run/serve 统一入口".into(),
+            ));
+        }
+        if let Some(eos) = spec.eos_token_ids.first() {
+            value["eos_token_id"] = serde_json::json!(eos);
+        }
+        let mut config: Qwen3Config = serde_json::from_value(value)?;
 
         // 未指定（或为 0）时回退为 num_attention_heads（标准 MHA）
         if config.num_key_value_heads == 0 {

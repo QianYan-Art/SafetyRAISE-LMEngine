@@ -2,7 +2,7 @@
 name = "rsinfer"
 version = "0.1.0"
 edition = "2021"
-description = "A minimal LLM inference engine written in Rust (SafetyRAISE-LMEngine)"
+description = "SafetyRAISE 的 Rust 本地 Qwen 模型推理框架"
 license = "Apache-2.0"
 repository = "https://github.com/QianYan-Art/SafetyRAISE-LMEngine"
 
@@ -20,11 +20,23 @@ rayon = "1"
 wgpu = "29.0.3"
 pollster = "0.4.0"
 bytemuck = "1.25.0"
+memmap2 = "0.9"
+libloading = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+axum = { version = "0.8", features = ["json"] }
+tokio-stream = "0.1"
+base64 = "0.22"
+minijinja = { version = "2", features = ["builtins", "json", "loop_controls", "fuel"] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lib]
 name = "rsinfer"

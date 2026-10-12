@@ -1,0 +1,16 @@
+{
+  "model": "safetyraise-expert",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请用一句话说明杭州在哪里。"
+    }
+  ],
+  "stream": false,
+  "n": 1,
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "enable_thinking": false
+}

@@ -58,18 +58,32 @@ pub fn f16_slice_to_f32(values: &[f16]) -> Vec<f32> {
 
 /// 将 bf16 字节切片转换为 f32 向量
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let bf16_slice =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const bf16, bytes.len() / 2) };
-    if bf16_slice.len() >= PARALLEL_CONVERT_THRESHOLD {
-        bf16_slice.par_iter().map(|x| x.to_f32()).collect()
+    debug_assert_eq!(bytes.len() % 2, 0);
+    let convert = |b: &[u8]| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+    if bytes.len() / 2 >= PARALLEL_CONVERT_THRESHOLD {
+        bytes.par_chunks_exact(2).map(convert).collect()
     } else {
-        bf16_slice.iter().map(|x| x.to_f32()).collect()
+        bytes.chunks_exact(2).map(convert).collect()
     }
 }
 
 /// 将 f32 字节切片转换为 f32 向量
 pub fn f32_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let f32_slice =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) };
-    f32_slice.to_vec()
+    debug_assert_eq!(bytes.len() % 4, 0);
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unaligned_little_endian_weights_are_safe() {
+        let f32_data = [0xff, 0, 0, 0x80, 0x3f, 0, 0, 0, 0xc0];
+        assert_eq!(f32_bytes_to_f32(&f32_data[1..]), vec![1.0, -2.0]);
+        let bf16_data = [0xff, 0x80, 0x3f, 0, 0xc0];
+        assert_eq!(bf16_bytes_to_f32(&bf16_data[1..]), vec![1.0, -2.0]);
+    }
 }

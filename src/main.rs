@@ -55,7 +55,7 @@ impl From<QuantizationCacheArg> for QuantizationCacheMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, after_help="新部署入口：rsinfer serve/run/inspect/benchmark --help；本组参数保留旧本机性能调试接口。")]
 struct Args {
     /// 模型目录 (含 config.json, model.safetensors, tokenizer.json)
     #[arg(short, long)]
@@ -110,7 +110,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DeviceArg::Cpu)]
     device: DeviceArg,
 
-    /// 计划放到 GPU 的 Transformer 层数；省略时按模式保守选择，当前本机 Q8 hybrid 默认 35
+    /// 计划放到 GPU 的 Transformer 层数；省略时按模型和可见显存保守估算
     #[arg(long)]
     gpu_layers: Option<usize>,
 
@@ -181,6 +181,9 @@ fn resident_decode_enabled(args: &Args) -> bool {
 }
 
 fn main() -> rsinfer::Result<()> {
+    if rsinfer::cli::selected() {
+        return rsinfer::cli::run();
+    }
     let args = Args::parse();
 
     println!("正在加载模型: {:?}", args.model_path);

@@ -7,6 +7,10 @@ use thiserror::Error;
 /// 推理引擎的统一错误类型
 #[derive(Error, Debug)]
 pub enum RsinferError {
+    #[error("资源容量不足：{0}")]
+    ResourceExhausted(String),
+    #[error("推理服务不可用：{0}")]
+    Unavailable(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -7,13 +7,18 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The repository default uses target-cpu=native for this workstation's
-  # release binary. CI must stay portable across GitHub-hosted runners.
-  CARGO_BUILD_RUSTFLAGS: "-C target-cpu=x86-64"
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plugin: target/native/bin/libsafetyraise_cpu.so
+          - os: windows-latest
+            plugin: target/native/bin/Release/safetyraise_cpu.dll
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -27,3 +32,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --release
+      - name: Native CPU plugin
+        run: |
+          cmake -S native -B target/native -DSAFETYRAISE_BUILD_CUDA=OFF
+          cmake --build target/native --config Release
+      - name: Native ABI roundtrip
+        env:
+          RSINFER_NATIVE_CPU_PLUGIN: ${{ github.workspace }}/${{ matrix.plugin }}
+        run: cargo test --release --lib backend::tests::native_cpu_plugin_roundtrip_caches_weight_and_propagates_error -- --ignored --exact

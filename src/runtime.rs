@@ -9,9 +9,6 @@ use std::process::Command;
 
 use crate::model::Qwen3Config;
 
-const MAX_ACTIVE_TRANSFORMER_GPU_LAYERS: usize = 35;
-const MAX_AUTO_TRANSFORMER_GPU_LAYERS: usize = 30;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevicePreference {
     Cpu,
@@ -197,9 +194,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             let estimated = estimate_gpu_layers(config, &gpu, options.quantization);
             let requested = options.gpu_layers;
             let requested_or_estimated = requested.unwrap_or(estimated);
-            let gpu_layers = requested_or_estimated
-                .min(config.num_hidden_layers)
-                .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS);
+            let gpu_layers = requested_or_estimated.min(config.num_hidden_layers);
             let mut layer_devices = vec![LayerDevice::Cpu; config.num_hidden_layers];
             for device in layer_devices.iter_mut().take(gpu_layers) {
                 *device = LayerDevice::Gpu;
@@ -225,7 +220,7 @@ pub fn build_runtime_plan(config: &Qwen3Config, options: &RuntimeOptions) -> Run
             if options.gpu_layers.is_none() {
                 if options.quantization == QuantizationMode::Q8 {
                     notes.push(
-                        "Q8 hybrid defaults transformer decode GPU layers to 30 on this local decode profile to keep the verified resident path under the 7.5GiB VRAM gate; pass --gpu-layers to override for explicit GPU+CPU decode testing."
+                        "Q8 GPU 层数按当前模型权重和可见显存保守估算；可用 --gpu-layers 明确覆盖，历史 30 层配置仅作为专项实验记录。"
                             .to_string(),
                     );
                 } else {
@@ -360,12 +355,8 @@ impl RuntimePlan {
 fn estimate_gpu_layers(
     config: &Qwen3Config,
     gpu: &GpuInfo,
-    quantization: QuantizationMode,
+    _quantization: QuantizationMode,
 ) -> usize {
-    if quantization == QuantizationMode::Q8 {
-        return MAX_AUTO_TRANSFORMER_GPU_LAYERS.min(config.num_hidden_layers);
-    }
-
     let Some(memory_mib) = gpu.memory_total_mib else {
         return 0;
     };
@@ -383,8 +374,6 @@ fn estimate_gpu_layers(
 
     let fit = (usable_mib * 1024 * 1024) / bytes_per_layer;
     fit.min(config.num_hidden_layers)
-        .min(MAX_ACTIVE_TRANSFORMER_GPU_LAYERS)
-        .min(MAX_AUTO_TRANSFORMER_GPU_LAYERS)
 }
 
 fn estimate_transformer_layer_bytes(config: &Qwen3Config) -> usize {
@@ -515,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn q8_auto_estimate_uses_thirty_transformer_gpu_layers() {
+    fn q8_auto_estimate_requires_visible_memory_and_respects_model_depth() {
         let mut config = test_config();
         config.num_hidden_layers = 36;
         let gpu = GpuInfo {
@@ -524,6 +513,14 @@ mod tests {
             driver_version: Some("1.0".to_string()),
         };
 
-        assert_eq!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8), 30);
+        assert!(estimate_gpu_layers(&config, &gpu, QuantizationMode::Q8) <= 36);
+        let unknown = GpuInfo {
+            memory_total_mib: None,
+            ..gpu
+        };
+        assert_eq!(
+            estimate_gpu_layers(&config, &unknown, QuantizationMode::Q8),
+            0
+        );
     }
 }

@@ -1,4 +1,2 @@
-# 针对本机 CPU 编译，启用 AVX2/FMA 等指令集，显著加速矩阵乘法。
-# 注意：这样编译出的二进制只保证在本机（或同架构 CPU）上运行。
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# 默认按 Rust 目标平台编译，避免把笔记本的 CPU 指令集带到其他机器。
+# 本机专项性能实验可显式设置 RUSTFLAGS="-C target-cpu=native"；该产物不用于跨机分发。

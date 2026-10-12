@@ -1,0 +1,28 @@
+{
+  "model_path": "../../models/report-qwen3.5",
+  "tokenizer_path": null,
+  "chat_template_file": null,
+  "model_name": "safetyraise-report",
+  "backend": "cpu",
+  "native_library": null,
+  "gpu_memory_bytes": 1073741824,
+  "max_body_bytes": 8388608,
+  "max_output_bytes": 1048576,
+  "vision_max_tokens": 256,
+  "max_preparing": 1,
+  "preparation_memory_bytes": 536870912,
+  "engine": {
+    "max_context": 8192,
+    "max_active": 1,
+    "queue_capacity": 4,
+    "prefill_chunk": 16,
+    "event_capacity": 16,
+    "working_memory_bytes": 4294967296,
+    "prefix_cache_bytes": 0,
+    "max_input_bytes": 33554432,
+    "max_request_ms": 300000,
+    "max_stall_ms": 10000,
+    "max_draft_tokens": 0,
+    "draft_vocab": null
+  }
+}
