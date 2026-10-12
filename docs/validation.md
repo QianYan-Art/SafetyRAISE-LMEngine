@@ -20,7 +20,9 @@
 | TS-Qwen3 tokenizer | 使用本机真实 tokenizer 与外部固定版本 Qwen3 模板，thinking 开关、中文逐 token 解码通过 |
 | 统一 CLI | `serve --help`、`run --help` 与真实 TS-Qwen3 `inspect` 通过；未通过该 CLI 运行完整模型生成或性能基准 |
 
-CI 配置 Linux/Windows 的格式、Clippy、release 测试及原生 CPU 插件动态加载。上表记录本机结果；每个提交的跨平台结果以对应 GitHub Actions 运行记录为准，不由本机测试推定。
+CI 配置 Linux/Windows 的格式、Clippy、CPU/协议 release 测试及原生 CPU 插件动态加载。上表记录本机结果；每个提交的跨平台结果以对应 GitHub Actions 运行记录为准，不由本机测试推定。
+
+托管 CI 使用 `cargo test --release -- --skip gpu::tests:: --skip _when_available`，明确过滤旧 GPU 模块的 23 项设备测试及模型层的 5 项设备测试；其余 4 项资产/设备测试保持默认 ignored，CPU 插件测试在构建插件后单独显式运行。过滤项不计作通过。首次 Windows CI（运行 `38301260686`）在执行旧 GPU 测试期间以 `STATUS_ACCESS_VIOLATION` 异常退出，日志没有足够信息定位具体适配器或底层原因；本机完整测试通过不能消除此风险。GPU 验收需在指定设备上运行下面的完整测试与显式 wgpu 测试，不由托管 CPU CI 代替。
 
 ### 承重回归
 
