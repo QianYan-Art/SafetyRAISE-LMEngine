@@ -32,7 +32,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       # 托管运行器不提供本项目验收过的 GPU；硬件测试在目标设备显式执行。
       - name: CPU and protocol tests
-        run: cargo test --release -- --skip gpu::tests:: --skip _when_available
+        run: |
+          cargo test --release -- --skip gpu::tests:: --skip _when_available
       - name: Native CPU plugin
         run: |
           cmake -S native -B target/native -DSAFETYRAISE_BUILD_CUDA=OFF
