@@ -642,35 +642,35 @@ fn main(
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {
     let out_idx = workgroup_id.x;
-    if (out_idx >= params.out_features) {
-        return;
-    }
-
-    var sum = 0.0;
-    let base = out_idx * params.words_per_row;
+    let row_valid = out_idx < params.out_features;
     let lane = local_id.x;
-    let full_words = params.in_features / 4u;
-    for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
-        let word = qweight[base + word_idx];
-        let input_base = word_idx * 4u;
-        sum = sum + input[input_base] * f32(unpack_i8(word, 0u));
-        sum = sum + input[input_base + 1u] * f32(unpack_i8(word, 1u));
-        sum = sum + input[input_base + 2u] * f32(unpack_i8(word, 2u));
-        sum = sum + input[input_base + 3u] * f32(unpack_i8(word, 3u));
-    }
-
-    let tail = params.in_features & 3u;
-    if (tail != 0u && lane == 0u) {
-        let word = qweight[base + full_words];
-        let input_base = full_words * 4u;
-        if (tail >= 1u) {
+    var sum = 0.0;
+    // WARP JIT 会在此着色器的提前返回路径崩溃；统一经过归约和 barrier。
+    if (row_valid) {
+        let base = out_idx * params.words_per_row;
+        let full_words = params.in_features / 4u;
+        for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
+            let word = qweight[base + word_idx];
+            let input_base = word_idx * 4u;
             sum = sum + input[input_base] * f32(unpack_i8(word, 0u));
-        }
-        if (tail >= 2u) {
             sum = sum + input[input_base + 1u] * f32(unpack_i8(word, 1u));
-        }
-        if (tail >= 3u) {
             sum = sum + input[input_base + 2u] * f32(unpack_i8(word, 2u));
+            sum = sum + input[input_base + 3u] * f32(unpack_i8(word, 3u));
+        }
+
+        let tail = params.in_features & 3u;
+        if (tail != 0u && lane == 0u) {
+            let word = qweight[base + full_words];
+            let input_base = full_words * 4u;
+            if (tail >= 1u) {
+                sum = sum + input[input_base] * f32(unpack_i8(word, 0u));
+            }
+            if (tail >= 2u) {
+                sum = sum + input[input_base + 1u] * f32(unpack_i8(word, 1u));
+            }
+            if (tail >= 3u) {
+                sum = sum + input[input_base + 2u] * f32(unpack_i8(word, 2u));
+            }
         }
     }
     partial_sum[lane] = sum;
@@ -688,7 +688,7 @@ fn main(
         stride = stride / 2u;
     }
 
-    if (lane == 0u) {
+    if (lane == 0u && row_valid) {
         output[out_idx] = partial_sum[0] * scales[out_idx];
     }
 }
@@ -725,17 +725,17 @@ fn main(
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {
     let out_idx = workgroup_id.x;
-    if (out_idx >= params.out_features) {
-        return;
-    }
-
-    var sum = 0.0;
-    let base = out_idx * params.words_per_row;
+    let row_valid = out_idx < params.out_features;
     let lane = local_id.x;
-    let full_words = params.in_features / 4u;
-    for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
-        let weights = unpack4x8snorm(qweight[base + word_idx]) * 127.0;
-        sum = sum + dot(input[word_idx], weights);
+    var sum = 0.0;
+    // 与标量路径保持相同控制流，避免 WARP JIT 的提前返回编译故障。
+    if (row_valid) {
+        let base = out_idx * params.words_per_row;
+        let full_words = params.in_features / 4u;
+        for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
+            let weights = unpack4x8snorm(qweight[base + word_idx]) * 127.0;
+            sum = sum + dot(input[word_idx], weights);
+        }
     }
 
     partial_sum[lane] = sum;
@@ -753,7 +753,7 @@ fn main(
         stride = stride / 2u;
     }
 
-    if (lane == 0u) {
+    if (lane == 0u && row_valid) {
         output[out_idx] = partial_sum[0] * scales[out_idx];
     }
 }
@@ -7137,33 +7137,32 @@ mod tests {
     )]
     fn gpu_q8_matvec_matches_cpu_q8() {
         let _guard = gpu_test_guard();
-        let weight = [
-            f16::from_f32(0.5),
-            f16::from_f32(-1.0),
-            f16::from_f32(1.5),
-            f16::from_f32(0.25),
-            f16::from_f32(-0.75),
-            f16::from_f32(0.5),
-            f16::from_f32(1.25),
-            f16::from_f32(-0.125),
-            f16::from_f32(0.875),
-            f16::from_f32(-1.5),
-        ];
-        let q8 = Q8LinearWeight::from_f16(&weight, 2, 5).unwrap();
-        let x = Tensor::from_f32_slice(&[1, 5], &[0.6, -1.4, 1.0, 0.25, -0.5]).unwrap();
-        let cpu = linear_forward_q8(&x, &q8).unwrap();
-        let gpu = GpuQ8MatVec::from_q8_weight(&q8).expect("GPU 测试初始化失败");
-        let got = gpu.forward(&x).unwrap();
-        let max_abs = cpu
-            .as_slice()
-            .iter()
-            .zip(got.as_slice())
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            max_abs <= 1e-4,
-            "GPU Q8 matvec max abs diff {max_abs} exceeded tolerance"
-        );
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
+        // 同时覆盖标量/vec4、空闲 lane、多轮累加及小于 16 字节的输出。
+        for in_features in [1, 4, 5, 255, 256, 257, 512] {
+            for out_features in [1, 2, 3, 65] {
+                let weight: Vec<f16> = (0..in_features * out_features)
+                    .map(|i| f16::from_f32(((i * 7 % 29) as f32 - 14.0) / 16.0))
+                    .collect();
+                let q8 = Q8LinearWeight::from_f16(&weight, out_features, in_features).unwrap();
+                let input: Vec<f32> = (0..in_features)
+                    .map(|i| ((i * 3 % 17) as f32 - 8.0) / 8.0)
+                    .collect();
+                let x = Tensor::from_f32_slice(&[1, in_features], &input).unwrap();
+                let cpu = linear_forward_q8(&x, &q8).unwrap();
+                let gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8).unwrap();
+                let got = gpu.forward(&x).unwrap();
+                assert_eq!(got.as_slice().len(), out_features);
+                for (row, (&expected, &actual)) in
+                    cpu.as_slice().iter().zip(got.as_slice()).enumerate()
+                {
+                    assert!(
+                        (expected - actual).abs() <= 1e-4 + expected.abs() * 1e-5,
+                        "Q8 {out_features}x{in_features} 第 {row} 行：CPU={expected}，GPU={actual}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

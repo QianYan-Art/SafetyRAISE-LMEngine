@@ -38,6 +38,12 @@ CI 配置 Linux/Windows 的格式、Clippy、CPU/协议 release 测试及原生 
 
 为定位软件驱动路径，`RSINFER_GPU_FORCE_FALLBACK=1` 会显式请求 wgpu 的 fallback 软件适配器；平台没有可用软件适配器时仍报错。Windows CI 失败后使用官方 Sysinternals ProcDump 重现首个 Q8 测试并收集异常 dump，保留原测试失败状态，不以诊断重试替代套件验收。诊断包含 Q8 输入写入、提交和等待阶段。
 
+提交 `13a1ea4` 的运行 `38343684659` 成功通过 ProcDump 捕获崩溃 dump，CDB 栈为 `d3d10warp!ComputeShaderTransformer::ConstructLoadStoreSets` → `TransformComputeShader` → `PixelJitOptimizer` → `Task_CompileShader`，确认故障发生在 Microsoft WARP 的 compute shader JIT 工作线程。该运行 Windows GPU 失败，Linux GPU 和两平台 CPU 作业通过。本机软件适配器驱动 `10.0.26100.9278` 同样复现 Q8 标量和 vec4 路径崩溃，而 RMSNorm 和 Q8 argmax 通过。
+
+单变量复现中，扩大输出缓冲区到 16 字节、将动态归约展开为固定六步都未消除崩溃。仅把两个 Q8 shader 的提前返回改为受 `row_valid` 保护的计算，让所有 lane 统一到达工作组 barrier，标量及 vec4 路径即通过，最小样例与 CPU 结果完全一致。正式修复保留原缓冲区大小、动态归约顺序和数值算法，输出也受行范围保护；没有切换编译器、升级驱动或绕过 DX12。该证据定位了这两段 shader 与 WARP JIT 的触发组合，不代表所有含提前返回的 WGSL 都非法或所有驱动均有缺陷。
+
+原 Q8 matvec 回归扩展为输入宽度 `1/4/5/255/256/257/512` 与输出行数 `1/2/3/65` 的 28 组 CPU 数值对照，覆盖标量、vec4、非对齐尾部、空闲 lane、多轮累加及小输出缓冲区。完整平台验收使用上面的严格 GPU 作业和下文复现命令，实际结果以对应提交的 GitHub Actions 运行记录为准。
+
 ### 承重回归
 
 - 权重资源：safetensors/GGUF 字节解析、分片索引、非法范围、量化块与共享 mmap 生命周期；F32/F16/BF16、Q4_0/Q8_0/Q4_K/Q6_K 的表示与必要反量化路径。
