@@ -161,8 +161,12 @@ impl WgpuQ8Backend {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "需要可用的 wgpu 设备，显式运行硬件验收"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
     fn real_q8_decode_matches_quantized_prefill_and_budget_fallback() {
+        let _guard = crate::gpu::gpu_test_guard();
         let weight = WeightTensor::from_f32(
             vec![3, 4],
             vec![

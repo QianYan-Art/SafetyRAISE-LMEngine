@@ -104,10 +104,15 @@ pub fn sync_stats() -> GpuSyncStats {
 #[cfg(test)]
 pub(crate) fn gpu_test_guard() -> MutexGuard<'static, ()> {
     static GPU_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    GPU_TEST_MUTEX
+    let guard = GPU_TEST_MUTEX
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap();
+    eprintln!(
+        "[rsinfer-gpu] stage=test_begin test={}",
+        std::thread::current().name().unwrap_or("未命名测试")
+    );
+    guard
 }
 
 const MATVEC_SHADER: &str = r#"
@@ -768,7 +773,7 @@ struct ArgmaxResult {
 };
 
 @group(0) @binding(0)
-var<storage, read> input: array<vec4<f32>>;
+var<storage, read> input: array<f32>;
 
 @group(0) @binding(1)
 var<storage, read> qweight: array<u32>;
@@ -797,7 +802,16 @@ fn main(
         let full_words = params.in_features / 4u;
         for (var word_idx = lane; word_idx < full_words; word_idx = word_idx + 64u) {
             let weights = unpack4x8snorm(qweight[base + word_idx]) * 127.0;
-            sum = sum + dot(input[word_idx], weights);
+            let offset = word_idx * 4u;
+            let values = vec4<f32>(input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+            sum = sum + dot(values, weights);
+        }
+        // 尾部不足四个元素时仅访问实际输入，不能读取 vec4 填充区。
+        if (lane == 0u && params.in_features % 4u != 0u) {
+            let weights = unpack4x8snorm(qweight[base + full_words]) * 127.0;
+            for (var tail = 0u; tail < params.in_features % 4u; tail = tail + 1u) {
+                sum = sum + input[full_words * 4u + tail] * weights[tail];
+            }
         }
         local_value[lane] = sum;
     } else {
@@ -1125,15 +1139,68 @@ struct GpuArgmaxResult {
 unsafe impl bytemuck::Zeroable for GpuArgmaxResult {}
 unsafe impl bytemuck::Pod for GpuArgmaxResult {}
 
+fn parse_gpu_backends(value: Option<&str>) -> Result<wgpu::Backends, String> {
+    let Some(value) = value else {
+        return Ok(wgpu::Backends::PRIMARY);
+    };
+    let mut backends = wgpu::Backends::empty();
+    for name in value.split(',') {
+        backends |= match name.trim().to_ascii_lowercase().as_str() {
+            "dx12" | "d3d12" => wgpu::Backends::DX12,
+            "vulkan" | "vk" => wgpu::Backends::VULKAN,
+            "metal" => wgpu::Backends::METAL,
+            "gl" | "gles" => wgpu::Backends::GL,
+            "primary" => wgpu::Backends::PRIMARY,
+            "all" => wgpu::Backends::all(),
+            _ => return Err(format!("WGPU_BACKEND 包含不支持的后端 {name:?}；可选 dx12/vulkan/metal/gl/primary/all，多个值用逗号分隔")),
+        };
+    }
+    Ok(backends)
+}
+
 impl GpuContext {
     pub fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let backend_env = std::env::var("WGPU_BACKEND")
+            .map(Some)
+            .or_else(|err| match err {
+                std::env::VarError::NotPresent => Ok(None),
+                _ => Err(format!("无法读取 WGPU_BACKEND: {err}")),
+            })?;
+        let backends = parse_gpu_backends(backend_env.as_deref())?;
+        let enabled = wgpu::Instance::enabled_backend_features();
+        if !backends.intersects(enabled) {
+            return Err(format!(
+                "请求的 GPU 后端 {backends:?} 在此构建中不可用；已编译后端: {enabled:?}"
+            ));
+        }
+        let diagnostics =
+            cfg!(test) || std::env::var("RSINFER_GPU_DIAGNOSTICS").as_deref() == Ok("1");
+        let started = std::time::Instant::now();
+        let diagnose = |stage: &str, detail: String| {
+            if diagnostics {
+                eprintln!(
+                    "[rsinfer-gpu] pid={} elapsed_ms={} stage={stage} {detail}",
+                    std::process::id(),
+                    started.elapsed().as_millis()
+                );
+            }
+        };
+        diagnose(
+            "instance_begin",
+            format!("requested={backends:?} compiled={enabled:?}"),
+        );
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        diagnose("instance_ready", String::new());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
         .map_err(|e| format!("request_adapter failed: {e}"))?;
+        diagnose("adapter_ready", format!("{:?}", adapter.get_info()));
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rsinfer-gpu-device"),
@@ -1142,6 +1209,7 @@ impl GpuContext {
             ..Default::default()
         }))
         .map_err(|e| format!("request_device failed: {e}"))?;
+        diagnose("device_ready", String::new());
 
         let matvec_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rsinfer-lm-head-matvec"),
@@ -1553,6 +1621,7 @@ impl GpuContext {
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size);
 
+        diagnose("pipelines_ready", String::new());
         Ok(Self {
             inner: Arc::new(GpuContextInner {
                 device,
@@ -4522,6 +4591,18 @@ impl GpuQ8MatVec {
                 input.len()
             ));
         }
+        if matvecs
+            .iter()
+            .any(|matvec| matvec.in_features != first.in_features)
+        {
+            return Err("GPU Q8 matvec batch requires the same input width".to_string());
+        }
+        if matvecs
+            .iter()
+            .any(|matvec| !Arc::ptr_eq(&matvec.context.inner, &first.context.inner))
+        {
+            return Err("GPU Q8 matvec batch requires a shared GpuContext".to_string());
+        }
         if matvecs.iter().any(|matvec| matvec.input_buffer.is_none()) {
             return Err("GPU Q8 matvec batch requires standalone input buffers".to_string());
         }
@@ -6185,12 +6266,96 @@ mod tests {
     };
 
     #[test]
-    fn gpu_rms_norm_matches_cpu_when_available() {
+    fn gpu_backend_selection_is_explicit() {
+        assert_eq!(
+            parse_gpu_backends(Some(" DX12, vulkan ")).unwrap(),
+            wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+        );
+        assert_eq!(
+            parse_gpu_backends(Some("all")).unwrap(),
+            wgpu::Backends::all()
+        );
+        let default = parse_gpu_backends(None).unwrap();
+        assert!(!default.contains(wgpu::Backends::GL));
+        assert_eq!(default, wgpu::Backends::PRIMARY);
+    }
+
+    #[test]
+    fn gpu_backend_selection_rejects_unknown_or_empty_names() {
+        for value in ["", " ", "vulakn", "vulkan,", "dx12,unknown"] {
+            assert!(parse_gpu_backends(Some(value))
+                .unwrap_err()
+                .contains("WGPU_BACKEND"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_q8_argmax_includes_every_tail_feature() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU RMSNorm test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
+        for width in 1..=9 {
+            let first_tail = width / 4 * 4;
+            // 对齐宽度也保留数值对照；非对齐宽度逐个验证每一个尾部元素。
+            for decisive in first_tail.min(width - 1)..width {
+                let mut weight = vec![f16::ZERO; 2 * width];
+                weight[decisive] = f16::from_f32(-1.0);
+                weight[width + decisive] = f16::from_f32(2.0);
+                let q8 = Q8LinearWeight::from_f16(&weight, 2, width).unwrap();
+                let mut values = vec![0.0; width];
+                values[decisive] = 1.0;
+                let x = Tensor::from_f32_vec(&[1, width], values).unwrap();
+                let cpu = linear_forward_q8(&x, &q8).unwrap();
+                assert!(cpu.as_slice()[1] > cpu.as_slice()[0]);
+                let gpu = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8).unwrap();
+                assert_eq!(
+                    gpu.forward_argmax(&x).unwrap(),
+                    1,
+                    "宽度 {width}，决定排名的元素 {decisive}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_q8_raw_batch_rejects_mismatched_width_and_context() {
+        let _guard = gpu_test_guard();
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
+        let other_context = GpuContext::new().expect("第二个 GPU 上下文初始化失败");
+        let q8 = Q8LinearWeight::from_f16(&[f16::ONE; 4], 1, 4).unwrap();
+        let narrow_q8 = Q8LinearWeight::from_f16(&[f16::ONE; 2], 1, 2).unwrap();
+        let first = GpuQ8MatVec::from_q8_weight_with_context(&context, &q8).unwrap();
+        let narrow = GpuQ8MatVec::from_q8_weight_with_context(&context, &narrow_q8).unwrap();
+        let other = GpuQ8MatVec::from_q8_weight_with_context(&other_context, &q8).unwrap();
+        assert!(
+            GpuQ8MatVec::forward_many_same_input_raw(&[&first, &narrow], &[1.0; 4])
+                .unwrap_err()
+                .contains("same input width")
+        );
+        assert!(
+            GpuQ8MatVec::forward_many_same_input_raw(&[&first, &other], &[1.0; 4])
+                .unwrap_err()
+                .contains("shared GpuContext")
+        );
+        let outputs = GpuQ8MatVec::forward_many_same_input_raw(&[&first], &[1.0; 4]).unwrap();
+        assert!((outputs[0][0] - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_rms_norm_matches_cpu() {
+        let _guard = gpu_test_guard();
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let x = Tensor::from_f32_slice(&[2, 4], &[0.25, -0.5, 2.0, 1.5, -1.0, 0.75, 0.5, -0.25])
             .unwrap();
         let weight = Tensor::from_f32_slice(&[4], &[1.0, 0.5, -0.75, 1.25]).unwrap();
@@ -6210,12 +6375,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_qk_rms_norm_rope_matches_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_qk_rms_norm_rope_matches_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU Q/K RMSNorm+RoPE test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let q = Tensor::from_f32_slice(
             &[1, 3, 4],
             &[
@@ -6278,12 +6444,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_kv_append_matches_cpu_layout_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_kv_append_matches_cpu_layout() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU KV append test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let mut gpu = GpuKvAppend::with_context(&context, 2, 2, 8).unwrap();
         gpu.append_decode_one_raw(0, &[1.0, 2.0, 10.0, 20.0], &[3.0, 4.0, 30.0, 40.0])
             .unwrap();
@@ -6305,12 +6472,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_kv_restore_len_truncates_without_losing_prior_cache_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_kv_restore_len_truncates_without_losing_prior_cache() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU KV restore test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let mut gpu = GpuKvAppend::with_context(&context, 1, 2, 8).unwrap();
         gpu.append_decode_one_raw(0, &[1.0, 2.0], &[3.0, 4.0])
             .unwrap();
@@ -6334,12 +6502,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_decode_gqa_attention_matches_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_decode_gqa_attention_matches_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU decode GQA attention test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let num_heads = 4usize;
         let num_kv_heads = 2usize;
         let head_dim = 2usize;
@@ -6397,12 +6566,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_decode_gqa_attention_long_context_uses_serial_fallback_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_decode_gqa_attention_long_context_uses_serial_fallback() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU decode GQA attention long-context test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let num_heads = 2usize;
         let num_kv_heads = 1usize;
         let head_dim = 2usize;
@@ -6463,12 +6633,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_decode_gqa_attention_parallel_matches_cpu_for_long_contexts_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_decode_gqa_attention_parallel_matches_cpu_for_long_contexts() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU decode GQA attention parallel long-context test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let num_heads = 4usize;
         let num_kv_heads = 2usize;
         let head_dim = 8usize;
@@ -6538,12 +6709,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_residual_add_matches_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_residual_add_matches_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU residual add test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let lhs = Tensor::from_f32_slice(&[1, 4], &[0.25, -0.5, 2.0, 1.5]).unwrap();
         let rhs = Tensor::from_f32_slice(&[1, 4], &[1.0, 0.75, -0.5, 0.25]).unwrap();
         let expected = lhs.add(&rhs).unwrap();
@@ -6562,12 +6734,13 @@ mod tests {
     }
 
     #[test]
-    fn resident_rmsnorm_then_residual_add_avoids_mid_readback_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_rmsnorm_then_residual_add_avoids_mid_readback() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU resident chain test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let input = Tensor::from_f32_slice(&[1, 4], &[0.25, -0.5, 2.0, 1.5]).unwrap();
         let residual = Tensor::from_f32_slice(&[1, 4], &[1.0, 0.75, -0.5, 0.25]).unwrap();
         let weight = Tensor::from_f32_slice(&[4], &[1.0, 0.5, -0.75, 1.25]).unwrap();
@@ -6626,12 +6799,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
     fn resident_kv_prefix_copy_preserves_rows_when_capacity_grows() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident KV prefix copy test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let heads = 2usize;
         let old_len = 64usize;
         let new_len = 128usize;
@@ -6668,12 +6842,13 @@ mod tests {
     }
 
     #[test]
-    fn resident_qk_kv_attention_chain_avoids_mid_readback_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_qk_kv_attention_chain_avoids_mid_readback() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU resident attention chain test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
 
         let q = Tensor::from_f32_slice(&[1, 2, 2], &[0.25, -0.5, 1.0, 0.75]).unwrap();
         let k = Tensor::from_f32_slice(&[1, 1, 2], &[0.6, -1.4]).unwrap();
@@ -6844,12 +7019,13 @@ mod tests {
     }
 
     #[test]
-    fn resident_q8_matvec_then_residual_add_avoids_mid_readback_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_q8_matvec_then_residual_add_avoids_mid_readback() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("GPU resident Q8 matvec chain test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
 
         let weight = [
             f16::from_f32(0.5),
@@ -6908,7 +7084,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_matvec_matches_cpu_for_small_tensor_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_matvec_matches_cpu_for_small_tensor() {
         let _guard = gpu_test_guard();
         let weight = [
             f16::from_f32(1.0),
@@ -6920,10 +7100,7 @@ mod tests {
         ];
         let x = Tensor::from_f32_slice(&[1, 3], &[0.25, -0.5, 2.0]).unwrap();
         let cpu = linear_forward_f16(&x, &weight, 2, 3).unwrap();
-        let Ok(gpu) = GpuMatVec::from_f16_weight(&weight, 2, 3) else {
-            eprintln!("GPU matvec test skipped: no usable wgpu adapter");
-            return;
-        };
+        let gpu = GpuMatVec::from_f16_weight(&weight, 2, 3).expect("GPU 测试初始化失败");
         let got = gpu.forward(&x).unwrap();
         let max_abs = cpu
             .as_slice()
@@ -6938,7 +7115,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_q8_matvec_matches_cpu_q8_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_q8_matvec_matches_cpu_q8() {
         let _guard = gpu_test_guard();
         let weight = [
             f16::from_f32(0.5),
@@ -6955,10 +7136,7 @@ mod tests {
         let q8 = Q8LinearWeight::from_f16(&weight, 2, 5).unwrap();
         let x = Tensor::from_f32_slice(&[1, 5], &[0.6, -1.4, 1.0, 0.25, -0.5]).unwrap();
         let cpu = linear_forward_q8(&x, &q8).unwrap();
-        let Ok(gpu) = GpuQ8MatVec::from_q8_weight(&q8) else {
-            eprintln!("GPU Q8 matvec test skipped: no usable wgpu adapter");
-            return;
-        };
+        let gpu = GpuQ8MatVec::from_q8_weight(&q8).expect("GPU 测试初始化失败");
         let got = gpu.forward(&x).unwrap();
         let max_abs = cpu
             .as_slice()
@@ -6973,7 +7151,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_q8_argmax_matches_cpu_q8_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn gpu_q8_argmax_matches_cpu_q8() {
         let _guard = gpu_test_guard();
         let weight = [
             f16::from_f32(0.5),
@@ -7002,21 +7184,19 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(idx, _)| idx as u32)
             .unwrap();
-        let Ok(gpu) = GpuQ8MatVec::from_q8_weight(&q8) else {
-            eprintln!("GPU Q8 argmax test skipped: no usable wgpu adapter");
-            return;
-        };
+        let gpu = GpuQ8MatVec::from_q8_weight(&q8).expect("GPU 测试初始化失败");
 
         assert_eq!(gpu.forward_argmax(&x).unwrap(), expected);
     }
 
     #[test]
-    fn q8_batched_same_input_matvecs_match_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn q8_batched_same_input_matvecs_match_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("batched GPU Q8 matvec test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let weight_a = [
             f16::from_f32(1.0),
             f16::from_f32(2.0),
@@ -7048,12 +7228,13 @@ mod tests {
     }
 
     #[test]
-    fn q8_shared_input_batch_matches_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn q8_shared_input_batch_matches_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("shared-input GPU Q8 batch test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let weight_a = [
             f16::from_f32(1.0),
             f16::from_f32(2.0),
@@ -7086,12 +7267,13 @@ mod tests {
     }
 
     #[test]
-    fn q8_shared_input_batch_survives_released_standalone_resources_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn q8_shared_input_batch_survives_released_standalone_resources() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("shared-input GPU Q8 release test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let weight_a = [
             f16::from_f32(1.0),
             f16::from_f32(2.0),
@@ -7129,12 +7311,13 @@ mod tests {
         }
     }
     #[test]
-    fn shared_context_can_drive_multiple_matvecs_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn shared_context_can_drive_multiple_matvecs() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("shared GPU context test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let weight_a = [
             f16::from_f32(1.0),
             f16::from_f32(0.0),
@@ -7168,12 +7351,13 @@ mod tests {
     }
 
     #[test]
-    fn batched_same_input_matvecs_match_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn batched_same_input_matvecs_match_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("batched GPU matvec test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let weight_a = [
             f16::from_f32(1.0),
             f16::from_f32(2.0),
@@ -7203,12 +7387,13 @@ mod tests {
     }
 
     #[test]
-    fn fused_swiglu_down_matches_cpu_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn fused_swiglu_down_matches_cpu() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("fused GPU MLP test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let gate_weight = [
             f16::from_f32(0.5),
             f16::from_f32(-1.0),
@@ -7253,12 +7438,13 @@ mod tests {
     }
 
     #[test]
-    fn q8_fused_swiglu_down_matches_cpu_q8_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn q8_fused_swiglu_down_matches_cpu_q8() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("fused GPU Q8 MLP test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let gate_weight = [
             f16::from_f32(0.5),
             f16::from_f32(-1.0),
@@ -7304,12 +7490,13 @@ mod tests {
     }
 
     #[test]
-    fn q8_fused_swiglu_down_survives_released_gate_up_resources_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn q8_fused_swiglu_down_survives_released_gate_up_resources() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("fused GPU Q8 release test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().expect("GPU 测试初始化失败");
         let gate_weight = [
             f16::from_f32(0.5),
             f16::from_f32(-1.0),

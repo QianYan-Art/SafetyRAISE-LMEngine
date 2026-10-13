@@ -6,6 +6,10 @@ description = "SafetyRAISE 的 Rust 本地 Qwen 模型推理框架"
 license = "Apache-2.0"
 repository = "https://github.com/QianYan-Art/SafetyRAISE-LMEngine"
 
+[features]
+# 仅控制设备测试是否默认执行；不改变生产 GPU 支持。
+gpu-tests = []
+
 [dependencies]
 ndarray = "0.16"
 safetensors = "0.4"

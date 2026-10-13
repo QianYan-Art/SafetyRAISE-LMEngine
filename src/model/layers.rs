@@ -2907,12 +2907,14 @@ mod tests {
     }
 
     #[test]
-    fn resident_decode_one_attention_prototype_matches_current_path_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_decode_one_attention_prototype_matches_current_path() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident attention prototype test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new()
+            .unwrap_or_else(|err| panic!("resident attention prototype GPU init failed: {err}"));
 
         let mut attention = build_test_attention();
         attention.try_enable_q8_weights(None).unwrap();
@@ -2963,12 +2965,15 @@ mod tests {
     }
 
     #[test]
-    fn resident_decode_one_transformer_block_prototype_matches_current_path_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_decode_one_transformer_block_prototype_matches_current_path() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident transformer block prototype test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().unwrap_or_else(|err| {
+            panic!("resident transformer block prototype GPU init failed: {err}")
+        });
 
         let mut block = build_test_transformer_block();
         block.try_enable_q8_weights(None).unwrap();
@@ -3019,13 +3024,15 @@ mod tests {
     }
 
     #[test]
-    fn resident_decode_one_transformer_block_runtime_keeps_gpu_kv_across_tokens_and_restore_when_available(
-    ) {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_decode_one_transformer_block_runtime_keeps_gpu_kv_across_tokens_and_restore() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident transformer block runtime test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new().unwrap_or_else(|err| {
+            panic!("resident transformer block runtime GPU init failed: {err}")
+        });
 
         let mut block = build_test_transformer_block();
         block.try_enable_q8_weights(None).unwrap();

@@ -72,6 +72,14 @@ TS-Qwen3 这类 tokenizer 目录若没有 `chat_template`，请将 `chat_templat
 
 非回环监听必须设置 `SAFETYRAISE_API_KEY`。服务端用 `Authorization: Bearer <key>` 校验；回环监听可以不设置 key，但生产部署仍应在反向代理或网络策略中限制访问。
 
-## 原生插件与 CUDA
+## 算子后端与诊断
+
+### wgpu 后端选择与诊断
+
+`wgpu-q8` 默认使用 wgpu PRIMARY 后端集合，保留 Vulkan/DX12/Metal 的平台适配器选择，不默认初始化 GL。可以在启动进程前通过 `WGPU_BACKEND` 选择 `dx12`、`vulkan`、`metal`、`gl`、`primary`、`all` 或逗号组合；别名 `d3d12`、`vk`、`gles` 也受支持。非法值或没有任何已编译后端的选择会报错，不会静默忽略。`all` 会恢复包含 GL 的多后端初始化，只用于明确需要的兼容性或故障复现。
+
+设置 `RSINFER_GPU_DIAGNOSTICS=1` 可在 stderr 记录初始化阶段、所选适配器、驱动和后端；正常推理 stdout 不受诊断影响。`gpu-tests` 是测试开关，生产程序启用 GPU 不需要该 feature。设备验收命令与托管软件适配器边界见 `docs/validation.md`。
+
+### 原生插件边界
 
 `native/CMakeLists.txt` 生成 CPU 动态库，并可在检测到 CUDA 编译器时尝试构建可选 CUDA 插件。当前仓库没有 CUDA 编译验收证据；配置示例不默认选择 CUDA，不能把插件存在或 `wgpu` adapter 存在解释为目标硬件已经通过验证。原生插件只通过固定 ABI 接收受约束的线性输入输出，能力不足时必须报错或走明确的 CPU 路径。

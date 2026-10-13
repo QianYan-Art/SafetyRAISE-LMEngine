@@ -4,6 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      gpu_backend:
+        description: "GPU 后端诊断范围（Windows 可选，Linux Vulkan 始终保留）"
+        required: true
+        default: dx12
+        type: choice
+        options:
+          - dx12
+          - vulkan
+          - all
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,10 +41,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      # 托管运行器不提供本项目验收过的 GPU；硬件测试在目标设备显式执行。
       - name: CPU and protocol tests
-        run: |
-          cargo test --release -- --skip gpu::tests:: --skip _when_available
+        run: cargo test --release --lib
       - name: Native CPU plugin
         run: |
           cmake -S native -B target/native -DSAFETYRAISE_BUILD_CUDA=OFF
@@ -42,3 +51,99 @@ jobs:
         env:
           RSINFER_NATIVE_CPU_PLUGIN: ${{ github.workspace }}/${{ matrix.plugin }}
         run: cargo test --release --lib backend::tests::native_cpu_plugin_roundtrip_caches_weight_and_propagates_error -- --ignored --exact
+
+  gpu-tests:
+    name: GPU functional tests (${{ matrix.os }} / ${{ matrix.backend }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: vulkan
+            adapter_scope: Mesa software (llvmpipe/lavapipe)
+          - os: windows-latest
+            backend: ${{ github.event_name == 'workflow_dispatch' && inputs.gpu_backend || 'dx12' }}
+            adapter_scope: runner adapter; functional only
+    runs-on: ${{ matrix.os }}
+    env:
+      WGPU_BACKEND: ${{ matrix.backend }}
+      RSINFER_GPU_DIAGNOSTICS: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare Mesa Vulkan software adapter
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes mesa-vulkan-drivers vulkan-tools
+          lvp_icd="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name '*lvp*.json' -print -quit)"
+          test -n "$lvp_icd"
+          echo "VK_ICD_FILENAMES=$lvp_icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+          echo "This is a Mesa software functional test; it is not a hardware performance result."
+      - name: Prepare Windows GPU diagnostics
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\gpu-ci-diagnostics.ps1 -Action Prepare -Backend "${{ matrix.backend }}"
+      - name: Capture Linux adapter diagnostics
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/rsinfer-gpu-diagnostics"
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "WGPU_BACKEND=$WGPU_BACKEND"
+            echo "RSINFER_GPU_DIAGNOSTICS=$RSINFER_GPU_DIAGNOSTICS"
+            echo "adapter_scope=${{ matrix.adapter_scope }}"
+          } | tee "$RUNNER_TEMP/rsinfer-gpu-diagnostics/adapter-environment.txt"
+          vulkaninfo --summary 2>&1 | tee "$RUNNER_TEMP/rsinfer-gpu-diagnostics/vulkaninfo-summary.txt"
+      - name: Capture Windows adapter diagnostics
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP "rsinfer-gpu-diagnostics"
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          @(
+            "runner_os=$env:RUNNER_OS"
+            "WGPU_BACKEND=$env:WGPU_BACKEND"
+            "RSINFER_GPU_DIAGNOSTICS=$env:RSINFER_GPU_DIAGNOSTICS"
+            "adapter_scope=${{ matrix.adapter_scope }}"
+          ) | Set-Content -Path (Join-Path $directory "adapter-environment.txt")
+      - name: Run GPU functional tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --features gpu-tests --lib -- --test-threads=1 --nocapture 2>&1 \
+            | tee "$RUNNER_TEMP/rsinfer-gpu-diagnostics/cargo-test.log"
+      - name: Run GPU functional tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "rsinfer-gpu-diagnostics\cargo-test.log"
+          & cargo test --release --features gpu-tests --lib -- --test-threads=1 --nocapture 2>&1 |
+            Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+      - name: Collect Windows GPU diagnostics
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\gpu-ci-diagnostics.ps1 -Action Collect -Backend "${{ matrix.backend }}"
+      - name: Upload GPU diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-diagnostics-${{ matrix.os }}-${{ matrix.backend }}
+          path: ${{ runner.temp }}/rsinfer-gpu-diagnostics
+          if-no-files-found: error
+          retention-days: 14

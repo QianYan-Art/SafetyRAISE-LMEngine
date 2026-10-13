@@ -6,7 +6,7 @@
 
 本轮验证包括独立小尺寸数学参考、实际解析器与微型合成权重执行器、请求调度和 HTTP/SSE 管线、本机原生 CPU 插件、实际 wgpu 设备、真实 tokenizer 与模型文件检查。没有完整大模型生成、工作站或 Orin 测试，也没有新版本吞吐、模型回答质量或稳定性成绩。旧 V1.1 的性能记录不能用于证明本轮性能。
 
-## 已执行的检查
+## 重构初次发布检查（GPU 验证修复前）
 
 | 检查 | 结果与范围 |
 | --- | --- |
@@ -22,7 +22,19 @@
 
 CI 配置 Linux/Windows 的格式、Clippy、CPU/协议 release 测试及原生 CPU 插件动态加载。上表记录本机结果；每个提交的跨平台结果以对应 GitHub Actions 运行记录为准，不由本机测试推定。
 
-托管 CI 使用 `cargo test --release -- --skip gpu::tests:: --skip _when_available`，明确过滤旧 GPU 模块的 23 项设备测试及模型层的 5 项设备测试；其余 4 项资产/设备测试保持默认 ignored，CPU 插件测试在构建插件后单独显式运行。过滤项不计作通过。首次 Windows CI（运行 `38301260686`）在执行旧 GPU 测试期间以 `STATUS_ACCESS_VIOLATION` 异常退出，日志没有足够信息定位具体适配器或底层原因；本机完整测试通过不能消除此风险。GPU 验收需在指定设备上运行下面的完整测试与显式 wgpu 测试，不由托管 CPU CI 代替。
+首次 Windows CI（运行 `38301260686`）在执行旧 GPU 测试期间以 `STATUS_ACCESS_VIOLATION` 异常退出，日志只记录了 59 项通过、4 项忽略，没有适配器信息或 dump；不能据此确定崩溃测试或底层原因。后续运行 `38303310043` 通过过滤 28 项设备测试恢复 CPU CI，不能视为 GPU 已修复。旧设备测试还会把初始化失败直接返回为通过，因此上表历史测试数本身不能证明所有设备算子实际执行。
+
+## GPU 验证修复
+
+`gpu-tests` Cargo feature 仅决定设备测试是否默认执行，不改变生产 GPU 支持。31 项设备测试默认明确标为 ignored；启用 feature 后必须完成设备初始化与算子断言，初始化失败保留完整错误并使测试失败。CPU/协议任务直接执行 `cargo test --release --lib`，不再依赖名称过滤。另有 CPU 插件和两个真实 tokenizer 资产测试保持独立 ignored。
+
+独立 GPU CI 每次执行 Linux Mesa Vulkan 软件适配器和 Windows DX12，两者均严格传递失败退出码。软件适配器验证算子正确性，不证明物理设备性能。手动触发时 `inputs.gpu_backend` 可选 `dx12`、`vulkan`、`all`；Linux 始终用 Vulkan，Windows 将选项原样传入 `WGPU_BACKEND`。其中 `all` 初始化全部可用后端，供重现旧行为使用，不代表逐个后端都得到测试。
+
+测试日志包含 `test_begin`、`instance_begin`、`instance_ready`、`adapter_ready`、`device_ready` 和 `pipelines_ready`。设备信息包含后端、驱动及设备类型。Windows 的 `scripts/gpu-ci-diagnostics.ps1` 仅在 GitHub Actions 临时运行器设置 WER dump 并在收集后恢复，另采集系统事件和显卡信息；诊断 artifact 保留 `adapter-environment.txt`、`cargo-test.log`，Linux 还保留 `vulkaninfo-summary.txt`。无 dump 时不宣称已有崩溃栈。
+
+修复还覆盖 Q8 argmax 的 1–3 个尾部输入元素，以及 raw 批量 matvec 的输入宽度和共享上下文检查。尾部回归逐个使非对齐元素决定排名，防止旧测试数据碰巧得到相同 argmax。这两项修复不作为原 Windows 访问冲突的因果证据。
+
+本次本机与托管执行结果在实际完成后补记；原访问冲突根因尚未证实。
 
 ### 承重回归
 
@@ -92,13 +104,23 @@ cmake -S native -B target/native-cpu -DSAFETYRAISE_BUILD_CUDA=OFF
 cmake --build target/native-cpu --config Release
 ```
 
-在具有对应资产和 wgpu 设备的机器显式执行补充测试；环境变量仅对当前终端有效，路径按实际位置调整：
+在具有 wgpu 设备的机器显式执行设备测试；环境变量仅对当前终端有效：
+
+```powershell
+$env:WGPU_BACKEND = 'dx12'
+$env:RSINFER_GPU_DIAGNOSTICS = '1'
+cargo test --release --features gpu-tests --lib -- --test-threads=1 --nocapture
+```
+
+生产默认 PRIMARY（Vulkan/DX12/Metal 等主后端，不默认初始化 GL），保留平台适配器自动选择；Windows CI 单独固定 DX12。本机 Vulkan 初始化明显快于 DX12，不能把托管验证后端直接强制为所有机器的生产默认。`WGPU_BACKEND` 可显式选择 `dx12`、`vulkan`、`metal`、`gl`、`primary`、`all` 或逗号组合；空值、拼写错误及没有任何已编译后端的选择均报错。生产诊断由 `RSINFER_GPU_DIAGNOSTICS=1` 开启，输出到 stderr；测试总是记录诊断。换后端成功只能证明该后端通过，不能证明旧崩溃原因。
+
+具有对应本地资产时，再执行资产测试；启用 feature 后 `--ignored` 只选取三个外部资产测试，不会重复执行 GPU 测试。路径按实际位置调整：
 
 ```powershell
 $env:RSINFER_NATIVE_CPU_PLUGIN = "$PWD/target/native-cpu/bin/Release/safetyraise_cpu.dll"
 $env:RSINFER_QWEN_TOKENIZER_DIR = 'C:/Users/lenovo/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1___5B'
 $env:RSINFER_QWEN3_TOKENIZER_DIR = 'D:/MCP_Server/root/autodl-tmp/TS-Qwen3'
-cargo test --release --lib -- --ignored
+cargo test --release --features gpu-tests --lib -- --ignored
 cargo run --release -- inspect --model-path 'D:/MCP_Server/root/autodl-tmp/TS-Qwen3' --context 4096
 ```
 

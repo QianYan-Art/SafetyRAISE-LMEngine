@@ -821,12 +821,14 @@ mod tests {
     }
 
     #[test]
-    fn resident_model_decode_matches_current_path_across_layers_and_restore_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_model_decode_matches_current_path_across_layers_and_restore() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident qwen3 model test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new()
+            .unwrap_or_else(|err| panic!("resident qwen3 model GPU init failed: {err}"));
 
         let config = test_config();
         let weights = test_weights();
@@ -971,12 +973,14 @@ mod tests {
     }
 
     #[test]
-    fn resident_model_decode_profiled_uses_shared_gpu_prefix_sync_structure_when_available() {
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "需要启用 gpu-tests 并提供可用 GPU 后端"
+    )]
+    fn resident_model_decode_profiled_uses_shared_gpu_prefix_sync_structure() {
         let _guard = gpu_test_guard();
-        let Ok(context) = GpuContext::new() else {
-            eprintln!("resident qwen3 profiled test skipped: no usable wgpu adapter");
-            return;
-        };
+        let context = GpuContext::new()
+            .unwrap_or_else(|err| panic!("resident qwen3 profiled GPU init failed: {err}"));
 
         let config = test_config();
         let weights = test_weights();
