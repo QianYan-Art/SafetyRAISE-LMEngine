@@ -80,6 +80,8 @@ TS-Qwen3 这类 tokenizer 目录若没有 `chat_template`，请将 `chat_templat
 
 设置 `RSINFER_GPU_DIAGNOSTICS=1` 可在 stderr 记录初始化阶段、所选适配器、驱动和后端；正常推理 stdout 不受诊断影响。`gpu-tests` 是测试开关，生产程序启用 GPU 不需要该 feature。设备验收命令与托管软件适配器边界见 `docs/validation.md`。
 
+排查软件驱动时，可设置 `RSINFER_GPU_FORCE_FALLBACK=1` 请求软件适配器；这不是性能优化选项，没有可用软件适配器会报错。取消该环境变量即可恢复默认适配器选择。
+
 ### 原生插件边界
 
 `native/CMakeLists.txt` 生成 CPU 动态库，并可在检测到 CUDA 编译器时尝试构建可选 CUDA 插件。当前仓库没有 CUDA 编译验收证据；配置示例不默认选择 CUDA，不能把插件存在或 `wgpu` adapter 存在解释为目标硬件已经通过验证。原生插件只通过固定 ABI 接收受约束的线性输入输出，能力不足时必须报错或走明确的 CPU 路径。

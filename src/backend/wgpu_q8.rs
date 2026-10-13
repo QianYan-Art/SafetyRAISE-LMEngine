@@ -175,7 +175,9 @@ mod tests {
         )
         .unwrap();
         let backend = WgpuQ8Backend::new(4 * 1024 * 1024).unwrap();
+        eprintln!("[rsinfer-gpu] stage=q8_backend_ready");
         let single = backend.linear(&weight, &[0.2, 0.4, -0.1, 0.8], 1).unwrap();
+        eprintln!("[rsinfer-gpu] stage=q8_single_ready");
         let batch = backend
             .linear(&weight, &[0.2, 0.4, -0.1, 0.8, 0.2, 0.4, -0.1, 0.8], 2)
             .unwrap();
@@ -184,6 +186,7 @@ mod tests {
         }
         assert_eq!(backend.stats().unwrap().prepared_weights, 1);
         assert_eq!(backend.stats().unwrap().gpu_calls, 1);
+        eprintln!("[rsinfer-gpu] stage=q8_prefill_ready");
         let limited = WgpuQ8Backend::new(1).unwrap();
         let expected = weight.matmul(&[0.2, 0.4, -0.1, 0.8], 1).unwrap();
         assert_eq!(

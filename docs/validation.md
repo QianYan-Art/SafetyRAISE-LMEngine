@@ -34,7 +34,9 @@ CI 配置 Linux/Windows 的格式、Clippy、CPU/协议 release 测试及原生 
 
 修复还覆盖 Q8 argmax 的 1–3 个尾部输入元素，以及 raw 批量 matvec 的输入宽度和共享上下文检查。尾部回归逐个使非对齐元素决定排名，防止旧测试数据碰巧得到相同 argmax。这两项修复不作为原 Windows 访问冲突的因果证据。
 
-本次本机与托管执行结果在实际完成后补记；原访问冲突根因尚未证实。
+提交 `9e8380b` 本机最终 Vulkan 套件为 143 通过、3 资产忽略，显式 3 项资产测试全部通过；无效后端负向测试退出 101。托管运行 `38341821022` 的 Linux llvmpipe/Mesa 25.2.8 套件同样 143 通过、3 忽略，CPU/协议及 CPU 插件在两平台通过。Windows DX12 与 `all` 对照运行 `38341882386` 均在首次 Q8 执行期间访问冲突，所选设备为 Microsoft Basic Render Driver 10.0.26100.33438。两个运行都完成了管线初始化，但没有 WER dump，不能根据这些证据断言具体底层根因。
+
+为定位软件驱动路径，`RSINFER_GPU_FORCE_FALLBACK=1` 会显式请求 wgpu 的 fallback 软件适配器；平台没有可用软件适配器时仍报错。Windows CI 失败后使用官方 Sysinternals ProcDump 重现首个 Q8 测试并收集异常 dump，保留原测试失败状态，不以诊断重试替代套件验收。诊断包含 Q8 输入写入、提交和等待阶段。
 
 ### 承重回归
 

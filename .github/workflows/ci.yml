@@ -135,6 +135,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+      - name: Reproduce first GPU failure with ProcDump
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\gpu-ci-diagnostics.ps1 -Action Reproduce -Backend "${{ matrix.backend }}"
       - name: Collect Windows GPU diagnostics
         if: always() && runner.os == 'Windows'
         shell: pwsh

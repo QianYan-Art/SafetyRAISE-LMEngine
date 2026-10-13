@@ -1139,6 +1139,16 @@ struct GpuArgmaxResult {
 unsafe impl bytemuck::Zeroable for GpuArgmaxResult {}
 unsafe impl bytemuck::Pod for GpuArgmaxResult {}
 
+fn gpu_diagnostics_enabled() -> bool {
+    cfg!(test) || std::env::var("RSINFER_GPU_DIAGNOSTICS").as_deref() == Ok("1")
+}
+
+fn gpu_trace(stage: &str) {
+    if gpu_diagnostics_enabled() {
+        eprintln!("[rsinfer-gpu] stage={stage}");
+    }
+}
+
 fn parse_gpu_backends(value: Option<&str>) -> Result<wgpu::Backends, String> {
     let Some(value) = value else {
         return Ok(wgpu::Backends::PRIMARY);
@@ -1173,8 +1183,9 @@ impl GpuContext {
                 "请求的 GPU 后端 {backends:?} 在此构建中不可用；已编译后端: {enabled:?}"
             ));
         }
-        let diagnostics =
-            cfg!(test) || std::env::var("RSINFER_GPU_DIAGNOSTICS").as_deref() == Ok("1");
+        let diagnostics = gpu_diagnostics_enabled();
+        let force_fallback_adapter =
+            std::env::var("RSINFER_GPU_FORCE_FALLBACK").as_deref() == Ok("1");
         let started = std::time::Instant::now();
         let diagnose = |stage: &str, detail: String| {
             if diagnostics {
@@ -1187,7 +1198,7 @@ impl GpuContext {
         };
         diagnose(
             "instance_begin",
-            format!("requested={backends:?} compiled={enabled:?}"),
+            format!("requested={backends:?} compiled={enabled:?} force_fallback={force_fallback_adapter}"),
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
@@ -1197,7 +1208,7 @@ impl GpuContext {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
-            force_fallback_adapter: false,
+            force_fallback_adapter,
         }))
         .map_err(|e| format!("request_adapter failed: {e}"))?;
         diagnose("adapter_ready", format!("{:?}", adapter.get_info()));
@@ -4618,6 +4629,7 @@ impl GpuQ8MatVec {
                 .write_buffer(input_buffer, 0, bytemuck::cast_slice(input));
         }
 
+        gpu_trace("q8_input_written");
         let mut encoder =
             first
                 .context
@@ -4657,7 +4669,9 @@ impl GpuQ8MatVec {
                 );
             }
         }
+        gpu_trace("q8_submit_begin");
         first.context.inner.queue.submit(Some(encoder.finish()));
+        gpu_trace("q8_submit_ready");
         record_submit();
 
         let mut receivers = Vec::new();
@@ -4676,6 +4690,7 @@ impl GpuQ8MatVec {
                 receivers.push(rx);
             }
         }
+        gpu_trace("q8_poll_begin");
         record_poll_wait();
         first
             .context
@@ -4684,6 +4699,7 @@ impl GpuQ8MatVec {
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| format!("device poll failed: {e}"))?;
 
+        gpu_trace("q8_poll_ready");
         for rx in receivers {
             let (_, _, result) = rx.recv().map_err(|e| format!("map callback failed: {e}"))?;
             result?;
